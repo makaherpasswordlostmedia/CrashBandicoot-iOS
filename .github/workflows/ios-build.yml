@@ -55,11 +55,14 @@ jobs:
         run: curl -sSL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel 10.0 --install-dir "$HOME/.dotnet"
 
       - name: Fetch disc image (private, provided by you)
+        env:
+          CUE_URL: ${{ inputs.cue_url }}
         run: |
           set -e
           mkdir -p "$RUNNER_TEMP/disc"
-          curl -fSL "${{ inputs.cue_url }}" -o "$RUNNER_TEMP/disc/game.cue"
-          curl -fSL "${{ inputs.cue_url%.cue}.bin" -o "$RUNNER_TEMP/disc/game.bin" || true
+          curl -fSL "$CUE_URL" -o "$RUNNER_TEMP/disc/game.cue"
+          BIN_URL="${CUE_URL%.cue}.bin"
+          curl -fSL "$BIN_URL" -o "$RUNNER_TEMP/disc/game.bin" || true
           ls -la "$RUNNER_TEMP/disc"
 
       - name: Pre-recompile (ELF -> C#, no Roslyn-in-app)
