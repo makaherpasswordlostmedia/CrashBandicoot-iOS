@@ -1,0 +1,136 @@
+name: iOS Host (TrollStore .ipa)
+
+# Modeled directly on a workflow that took ~70 iterations to get right on a
+# previous (C/SDL2) iOS port, applying the same lessons here even though
+# the underlying toolchain differs (.NET-for-iOS/Mono AOT, not a plain C
+# Xcode project):
+#   - Build for the SIMULATOR first. It catches the vast majority of
+#     compile errors in a fraction of the time a device/archive build
+#     takes, and needs no signing at all.
+#   - Only attempt the device build once the simulator build is green.
+#   - Package an unsigned .ipa by hand (zip Payload/) rather than an Xcode
+#     archive+export, since TrollStore re-signs on install anyway and
+#     archive/export requires a provisioning profile we don't have in CI.
+#   - Always upload build logs as artifacts (even on failure) so a failed
+#     run is actionable from the Actions tab without re-running locally.
+#
+# Manual trigger only: you must supply your own disc image out-of-band
+# (this workflow does NOT and cannot fetch a copyrighted game disc for you).
+on:
+  workflow_dispatch:
+    inputs:
+      cue_url:
+        description: "Authenticated URL to your own game.cue (bin must be alongside it, same URL prefix)"
+        required: true
+
+jobs:
+  build-ios:
+    runs-on: macos-14
+    env:
+      PROJECT_DIR: CrashBandicoot.IosHost
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          set -e
+          for v in 15.4 15.3 15.2; do
+            if [ -d "/Applications/Xcode_${v}.app" ]; then
+              sudo xcode-select -s "/Applications/Xcode_${v}.app/Contents/Developer"
+              echo "Selected Xcode ${v}"
+              break
+            fi
+          done
+          xcodebuild -version
+
+      - name: Install .NET 8 + iOS workload
+        run: |
+          set -e
+          curl -sSL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel 8.0 --install-dir "$HOME/.dotnet"
+          echo "$HOME/.dotnet" >> "$GITHUB_PATH"
+          "$HOME/.dotnet/dotnet" workload install ios --skip-manifest-update
+
+      - name: Install .NET 10 (needed by RecompOne.Runtime/Recompiler)
+        run: curl -sSL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel 10.0 --install-dir "$HOME/.dotnet"
+
+      - name: Fetch disc image (private, provided by you)
+        run: |
+          set -e
+          mkdir -p "$RUNNER_TEMP/disc"
+          curl -fSL "${{ inputs.cue_url }}" -o "$RUNNER_TEMP/disc/game.cue"
+          curl -fSL "${{ inputs.cue_url%.cue}.bin" -o "$RUNNER_TEMP/disc/game.bin" || true
+          ls -la "$RUNNER_TEMP/disc"
+
+      - name: Pre-recompile (ELF -> C#, no Roslyn-in-app)
+        run: |
+          chmod +x scripts/prerecompile.sh
+          ./scripts/prerecompile.sh "$RUNNER_TEMP/disc/game.cue"
+
+      - name: Create build dir
+        run: mkdir -p build
+
+      - name: Find simulator
+        id: sim
+        run: |
+          set -e
+          NAME=$(xcrun simctl list devices available | grep -E "iPhone [0-9]" | grep -v "unavailable" | head -1 | sed -E 's/^ *([^(]+) \(.*/\1/' | xargs)
+          if [ -z "$NAME" ]; then
+            echo "No simulator found:"; xcrun simctl list devices; exit 1
+          fi
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "Found simulator: $NAME"
+
+      - name: Build for simulator (Debug) — catches most errors fast
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -eo pipefail
+          dotnet build CrashBandicoot.IosHost.csproj \
+            -c Debug -f net8.0-ios -r iossimulator-arm64 \
+            -p:CodesignKey="" -p:CodesignProvision="" \
+          2>&1 | tee ../build/sim.log
+          grep -qi "Build succeeded" ../build/sim.log && echo "✅ Simulator build OK" \
+            || { echo "❌ Simulator build FAILED"; grep -i "error" ../build/sim.log | head -40; exit 1; }
+
+      - name: Build for device (Release, unsigned)
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -eo pipefail
+          dotnet build CrashBandicoot.IosHost.csproj \
+            -c Release -f net8.0-ios -r ios-arm64 \
+            -p:BuildIpa=true -p:ArchiveOnBuild=true \
+            -p:CodesignKey="" -p:CodesignProvision="" \
+          2>&1 | tee ../build/device.log
+          grep -qi "Build succeeded" ../build/device.log && echo "✅ Device build OK" \
+            || { echo "❌ Device build FAILED"; grep -i "error" ../build/device.log | head -40; exit 1; }
+
+      - name: Locate or package .ipa
+        id: ipa
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -e
+          IPA=$(find bin -name '*.ipa' | head -n1)
+          if [ -z "$IPA" ]; then
+            echo "No .ipa produced by dotnet build directly, packaging by hand…"
+            APP_PATH=$(find bin -maxdepth 6 -name '*.app' | head -n1)
+            if [ -z "$APP_PATH" ]; then
+              echo "No .app found either — check device.log"; find bin -maxdepth 6; exit 1
+            fi
+            mkdir -p ../build/ipa/Payload
+            cp -R "$APP_PATH" ../build/ipa/Payload/
+            (cd ../build/ipa && zip -r -q ../CrashBandicoot-unsigned.ipa Payload)
+            IPA="../build/CrashBandicoot-unsigned.ipa"
+          fi
+          echo "path=$IPA" >> "$GITHUB_OUTPUT"
+          echo "Found/packaged: $IPA"
+
+      - name: Upload artifacts (always, even on failure)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: CrashBandicoot-iOS-TrollStore
+          path: |
+            build/sim.log
+            build/device.log
+            ${{ steps.ipa.outputs.path }}
+          retention-days: 14
