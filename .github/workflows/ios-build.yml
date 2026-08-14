@@ -65,48 +65,13 @@ jobs:
           set -e
           mkdir -p "$RUNNER_TEMP/disc"
 
-          # Google Drive helper: files under ~100MB download directly via
-          # uc?export=download. Larger files first return an HTML
-          # "can't scan for viruses" confirmation page containing a
-          # confirm token, which must be replayed as a second request.
-          # This function handles both cases transparently.
-          gdrive_download() {
-            local file_id="$1"
-            local out_path="$2"
-            local base_url="https://drive.google.com/uc?export=download"
-            local cookie_jar
-            cookie_jar="$(mktemp)"
+          pip install -q gdown
 
-            # First request: may return the file directly, or an HTML
-            # confirmation page (for large files).
-            curl -fSL -c "$cookie_jar" -o "$out_path" \
-              "${base_url}&id=${file_id}"
-
-            # If what we got is actually HTML, it's the confirm page —
-            # extract the confirm token and re-request with it.
-            if grep -qi "download_warning\|virus scan" "$out_path" 2>/dev/null; then
-              local confirm
-              confirm=$(grep -o 'confirm=[A-Za-z0-9_-]\+' "$out_path" | head -1 | cut -d= -f2)
-              if [ -z "$confirm" ]; then
-                # Newer Drive UI sometimes only sets it as a cookie
-                confirm=$(grep -o 'download_warning[A-Za-z0-9_-]*=[A-Za-z0-9_-]\+' "$cookie_jar" | head -1 | cut -d$'\t' -f7)
-              fi
-              if [ -n "$confirm" ]; then
-                echo "Large file detected for $out_path — replaying with confirm token"
-                curl -fSL -b "$cookie_jar" -o "$out_path" \
-                  "${base_url}&id=${file_id}&confirm=${confirm}"
-              else
-                echo "::error::Could not extract Google Drive confirm token for $file_id — check sharing permissions ('Anyone with the link')"
-                head -c 500 "$out_path"
-                rm -f "$cookie_jar"
-                exit 1
-              fi
-            fi
-            rm -f "$cookie_jar"
-          }
-
-          gdrive_download "$CUE_FILE_ID" "$RUNNER_TEMP/disc/game.cue"
-          gdrive_download "$BIN_FILE_ID" "$RUNNER_TEMP/disc/game.bin"
+          # gdown handles both small files (direct download) and large
+          # files (virus-scan confirmation page + token) internally,
+          # so we don't need to parse Google's HTML ourselves.
+          gdown --id "$CUE_FILE_ID" -O "$RUNNER_TEMP/disc/game.cue"
+          gdown --id "$BIN_FILE_ID" -O "$RUNNER_TEMP/disc/game.bin"
 
           ls -la "$RUNNER_TEMP/disc"
           file "$RUNNER_TEMP/disc/game.cue"
