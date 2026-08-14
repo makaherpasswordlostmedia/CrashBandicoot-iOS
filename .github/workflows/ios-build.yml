@@ -19,8 +19,11 @@ name: iOS Host (TrollStore .ipa)
 on:
   workflow_dispatch:
     inputs:
-      cue_url:
-        description: "Authenticated URL to your own game.cue (bin must be alongside it, same URL prefix)"
+      cue_file_id:
+        description: "Google Drive file ID of your own game.cue (must be shared as 'Anyone with the link')"
+        required: true
+      bin_file_id:
+        description: "Google Drive file ID of your own game.bin (must be shared as 'Anyone with the link')"
         required: true
 
 jobs:
@@ -54,16 +57,73 @@ jobs:
       - name: Install .NET 10 (needed by RecompOne.Runtime/Recompiler)
         run: curl -sSL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel 10.0 --install-dir "$HOME/.dotnet"
 
-      - name: Fetch disc image (private, provided by you)
+      - name: Fetch disc image (private, provided by you, from Google Drive)
         env:
-          CUE_URL: ${{ inputs.cue_url }}
+          CUE_FILE_ID: ${{ inputs.cue_file_id }}
+          BIN_FILE_ID: ${{ inputs.bin_file_id }}
         run: |
           set -e
           mkdir -p "$RUNNER_TEMP/disc"
-          curl -fSL "$CUE_URL" -o "$RUNNER_TEMP/disc/game.cue"
-          BIN_URL="${CUE_URL%.cue}.bin"
-          curl -fSL "$BIN_URL" -o "$RUNNER_TEMP/disc/game.bin" || true
+
+          # Google Drive helper: files under ~100MB download directly via
+          # uc?export=download. Larger files first return an HTML
+          # "can't scan for viruses" confirmation page containing a
+          # confirm token, which must be replayed as a second request.
+          # This function handles both cases transparently.
+          gdrive_download() {
+            local file_id="$1"
+            local out_path="$2"
+            local base_url="https://drive.google.com/uc?export=download"
+            local cookie_jar
+            cookie_jar="$(mktemp)"
+
+            # First request: may return the file directly, or an HTML
+            # confirmation page (for large files).
+            curl -fSL -c "$cookie_jar" -o "$out_path" \
+              "${base_url}&id=${file_id}"
+
+            # If what we got is actually HTML, it's the confirm page —
+            # extract the confirm token and re-request with it.
+            if file "$out_path" | grep -qi "HTML\|ASCII text"; then
+              local confirm
+              confirm=$(grep -o 'confirm=[A-Za-z0-9_-]\+' "$out_path" | head -1 | cut -d= -f2)
+              if [ -z "$confirm" ]; then
+                # Newer Drive UI sometimes only sets it as a cookie
+                confirm=$(grep -o 'download_warning[A-Za-z0-9_-]*=[A-Za-z0-9_-]\+' "$cookie_jar" | head -1 | cut -d$'\t' -f7)
+              fi
+              if [ -n "$confirm" ]; then
+                echo "Large file detected for $out_path — replaying with confirm token"
+                curl -fSL -b "$cookie_jar" -o "$out_path" \
+                  "${base_url}&id=${file_id}&confirm=${confirm}"
+              else
+                echo "::error::Could not extract Google Drive confirm token for $file_id — check sharing permissions ('Anyone with the link')"
+                head -c 500 "$out_path"
+                rm -f "$cookie_jar"
+                exit 1
+              fi
+            fi
+            rm -f "$cookie_jar"
+          }
+
+          gdrive_download "$CUE_FILE_ID" "$RUNNER_TEMP/disc/game.cue"
+          gdrive_download "$BIN_FILE_ID" "$RUNNER_TEMP/disc/game.bin"
+
           ls -la "$RUNNER_TEMP/disc"
+          file "$RUNNER_TEMP/disc/game.cue"
+          file "$RUNNER_TEMP/disc/game.bin"
+
+          # Быстрая валидация вместо падения глубоко внутри C# рекомпилятора
+          if ! grep -q "TRACK" "$RUNNER_TEMP/disc/game.cue"; then
+            echo "::error::game.cue does not look like a valid cue sheet (no TRACK line found) — check cue_file_id and sharing permissions"
+            cat "$RUNNER_TEMP/disc/game.cue"
+            exit 1
+          fi
+          CUE_SIZE=$(wc -c < "$RUNNER_TEMP/disc/game.cue")
+          BIN_SIZE=$(wc -c < "$RUNNER_TEMP/disc/game.bin")
+          if [ "$BIN_SIZE" -le "$CUE_SIZE" ]; then
+            echo "::error::game.bin ($BIN_SIZE bytes) is not larger than game.cue ($CUE_SIZE bytes) — download likely failed"
+            exit 1
+          fi
 
       - name: Pre-recompile (ELF -> C#, no Roslyn-in-app)
         run: |
