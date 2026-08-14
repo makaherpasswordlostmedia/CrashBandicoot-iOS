@@ -84,7 +84,7 @@ jobs:
 
             # If what we got is actually HTML, it's the confirm page —
             # extract the confirm token and re-request with it.
-            if file "$out_path" | grep -qi "HTML\|ASCII text"; then
+            if grep -qi "download_warning\|virus scan" "$out_path" 2>/dev/null; then
               local confirm
               confirm=$(grep -o 'confirm=[A-Za-z0-9_-]\+' "$out_path" | head -1 | cut -d= -f2)
               if [ -z "$confirm" ]; then
