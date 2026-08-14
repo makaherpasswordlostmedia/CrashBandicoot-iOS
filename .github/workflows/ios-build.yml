@@ -70,8 +70,8 @@ jobs:
           # gdown handles both small files (direct download) and large
           # files (virus-scan confirmation page + token) internally,
           # so we don't need to parse Google's HTML ourselves.
-          gdown --id "$CUE_FILE_ID" -O "$RUNNER_TEMP/disc/game.cue"
-          gdown --id "$BIN_FILE_ID" -O "$RUNNER_TEMP/disc/game.bin"
+          gdown "$CUE_FILE_ID" -O "$RUNNER_TEMP/disc/game.cue"
+          gdown "$BIN_FILE_ID" -O "$RUNNER_TEMP/disc/game.bin"
 
           ls -la "$RUNNER_TEMP/disc"
           file "$RUNNER_TEMP/disc/game.cue"
