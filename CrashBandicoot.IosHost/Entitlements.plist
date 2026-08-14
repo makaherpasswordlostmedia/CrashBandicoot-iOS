@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      No com.apple.security.cs.allow-jit here on purpose. We do not use Mono
+      JIT (see csproj comment) - only the Mono interpreter + AOT, neither of
+      which needs the JIT entitlement. TrollStore preserves whatever
+      entitlements are in the binary as-is, so keep this minimal; a
+      dynamic-codesigning-class entitlement is not needed and, per TrollStore
+      docs, some of that class are actively blocked on A12+ anyway. Our A11
+      device doesn't need them either way.
+    -->
+    <key>get-task-allow</key>
+    <true/>
+    <key>com.apple.private.security.no-sandbox</key>
+    <true/>
+</dict>
+</plist>

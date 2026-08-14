@@ -1,0 +1,61 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0-ios</TargetFramework>
+    <SupportedOSPlatformVersion>14.0</SupportedOSPlatformVersion>
+    <!-- Built and installed via TrollStore, not the App Store. -->
+    <RuntimeIdentifier>ios-arm64</RuntimeIdentifier>
+    <OutputType>Exe</OutputType>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <ApplicationId>io.github.matteo842.crashlauncher.ioshost</ApplicationId>
+    <ApplicationVersion>1</ApplicationVersion>
+    <ApplicationDisplayVersion>1.0.0</ApplicationDisplayVersion>
+
+    <!--
+      CRITICAL: iOS forbids both JIT and dynamic assembly loading. There is
+      no way around this that Apple/Microsoft's toolchain supports, TrollStore
+      or not - TrollStore grants entitlements, it does not add a missing
+      runtime feature. So:
+        - Everything under Recompiled/ (produced by PreRecompiler on CI, see
+          tools/CrashBandicoot.PreRecompiler) is ordinary source, compiled
+          AOT into this same binary. No Assembly.Load anywhere.
+        - UseInterpreter stays on as a safety net for any reflection-ish
+          pattern in the shared RecompOne.Runtime code the Mono AOT compiler
+          can't statically resolve (generic virtual methods called through
+          an interface, etc). Full AOT alone is stricter than mixed AOT+interp.
+    -->
+    <UseInterpreter>true</UseInterpreter>
+    <MtouchUseLlvm>true</MtouchUseLlvm>
+
+    <!-- Not code-signed by us: TrollStore fake-signs on install. -->
+    <CodesignKey Condition="'$(Configuration)'=='Release'"></CodesignKey>
+    <BuildIpa>true</BuildIpa>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\RecompOne.Runtime\RecompOne.Runtime.csproj" />
+    <!-- NOTE: RecompOne.Recompiler is intentionally NOT referenced here.
+         The recompiler (ELF -> C# codegen, Roslyn) only ever runs on CI via
+         CrashBandicoot.PreRecompiler. The device only ever runs the already
+         generated, already AOT-compiled Recompiled.Entry.Run. -->
+  </ItemGroup>
+
+  <!-- No NativeReference needed: rendering uses Apple's own OpenGLES
+       framework (EAGLContext/CAEAGLLayer, see IosEglContext.cs) rather
+       than a third-party ANGLE build. One less binary to source, pin, and
+       link correctly. -->
+
+  <ItemGroup>
+    <!-- Populated by scripts/prerecompile.sh before `dotnet build`.
+         Excluded from source control (see .gitignore) since it's
+         copyrighted game code generated from the user's own disc. -->
+    <Compile Include="Recompiled\**\*.cs" Condition="Exists('Recompiled')" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <BundleResource Include="Resources\**\*" />
+  </ItemGroup>
+
+</Project>
