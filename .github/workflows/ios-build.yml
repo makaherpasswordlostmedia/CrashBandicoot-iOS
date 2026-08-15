@@ -162,8 +162,11 @@ jobs:
             (cd ../build/ipa && zip -r -q ../CrashBandicoot-unsigned.ipa Payload)
             IPA="../build/CrashBandicoot-unsigned.ipa"
           fi
-          echo "path=$IPA" >> "$GITHUB_OUTPUT"
-          echo "Found/packaged: $IPA"
+          # upload-artifact@v4 rejects paths containing '..', so resolve to
+          # an absolute path before writing it to GITHUB_OUTPUT.
+          IPA_ABS=$(realpath "$IPA")
+          echo "path=$IPA_ABS" >> "$GITHUB_OUTPUT"
+          echo "Found/packaged: $IPA_ABS"
 
       - name: Upload artifacts (always, even on failure)
         uses: actions/upload-artifact@v4
