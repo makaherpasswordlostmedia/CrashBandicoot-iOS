@@ -135,7 +135,7 @@ jobs:
           export PATH="$HOME/.dotnet9:$PATH"
           dotnet build CrashBandicoot.IosHost.csproj \
             -c Release -f net9.0-ios -r ios-arm64 \
-            -p:BuildIpa=true -p:ArchiveOnBuild=true \
+            -p:BuildIpa=false \
             -p:CodesignKey="" -p:CodesignProvision="" \
             -p:CodesignRequireProvisioningProfile=false \
           2>&1 | tee ../build/device.log
