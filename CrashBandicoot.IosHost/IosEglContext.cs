@@ -66,6 +66,8 @@ sealed class IosEglContext : INativeContext, IDisposable
     /// </summary>
     public void Initialize(UIView hostView, int width, int height)
     {
+        lock (_glLock)
+        {
         _context = new EAGLContext(EAGLRenderingAPI.OpenGLES2)
             ?? throw new InvalidOperationException("EAGLContext creation failed (OpenGLES2 unavailable).");
         if (!EAGLContext.SetCurrentContext(_context))
@@ -100,6 +102,7 @@ sealed class IosEglContext : INativeContext, IDisposable
         // MakeCurrentOnCallingThread, called from GameViewController.RunGame
         // right before the render loop starts) fixes this.
         EAGLContext.SetCurrentContext(null);
+        }
     }
 
     void CreateFramebuffer(int width, int height)
@@ -130,6 +133,28 @@ sealed class IosEglContext : INativeContext, IDisposable
     }
 
     /// <summary>
+    /// Guards every GL call in this class (both SetExpectedSize's resize
+    /// path and SwapBuffers) against concurrent use from two different
+    /// threads. EAGLContext.SetCurrentContext only fixes which thread the
+    /// context is current ON - it says nothing about two threads calling
+    /// GL entry points against the same context at the same time, which is
+    /// exactly what happens when ViewDidLayoutSubviews (main thread, on a
+    /// device rotation/size change) races the render loop
+    /// (IosPlatformHost.Present -> SwapBuffers, on crash-game-main): both
+    /// sides do SetCurrentContext + glBind*/glFramebuffer* calls against
+    /// the same EAGLContext concurrently, which is a data race at the
+    /// driver level and was the cause of the abort() seen once the game
+    /// was successfully running (main thread crashed while crash-game-main
+    /// had a live, deep render-loop stack - i.e. mid-frame).
+    /// Exposed publicly as GlLockObject so IosPlatformHost.Present can hold
+    /// this same lock across an entire frame's worth of Silk.NET GL calls
+    /// (PresentDisplay/PresentToDefaultFramebuffer), not just the
+    /// SwapBuffers call at the end - those also race a concurrent resize.
+    /// </summary>
+    readonly object _glLock = new();
+    public object GlLockObject => _glLock;
+
+    /// <summary>
     /// Makes this context current on whatever thread calls this method.
     /// EAGLContext is thread-affine: being current on one thread does not
     /// make it current on another. Must be called once at the start of any
@@ -139,13 +164,22 @@ sealed class IosEglContext : INativeContext, IDisposable
     /// no current context on this thread is what causes the native abort()
     /// this fixes - better to fail loud and early with a catchable
     /// managed exception than crash the whole process.
+    /// Callers must hold _glLock (see SetExpectedSize/SwapBuffers) so that
+    /// the SetCurrentContext + subsequent GL calls stay atomic with respect
+    /// to the other thread doing the same.
     /// </summary>
-    public void MakeCurrentOnCallingThread()
+    void MakeCurrentOnCallingThreadLocked()
     {
         if (_context == null)
             throw new InvalidOperationException("MakeCurrentOnCallingThread called before Initialize().");
         if (!EAGLContext.SetCurrentContext(_context))
             throw new InvalidOperationException("EAGLContext.SetCurrentContext failed on render thread.");
+    }
+
+    /// <summary>Public entry point kept for the render thread's one-time setup call in GameViewController.RunGame.</summary>
+    public void MakeCurrentOnCallingThread()
+    {
+        lock (_glLock) MakeCurrentOnCallingThreadLocked();
     }
 
     public void SetExpectedSize(int width, int height)
@@ -154,25 +188,32 @@ sealed class IosEglContext : INativeContext, IDisposable
         if (width <= 0 || height <= 0) return;
         if (width == SurfaceWidth && height == SurfaceHeight) return;
 
-        MakeCurrentOnCallingThread();
-        glBindRenderbuffer(GL_RENDERBUFFER, 0);
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        CreateFramebuffer(width, height);
+        lock (_glLock)
+        {
+            MakeCurrentOnCallingThreadLocked();
+            glBindRenderbuffer(GL_RENDERBUFFER, 0);
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            CreateFramebuffer(width, height);
+        }
     }
 
     public void SwapBuffers()
     {
         if (_context == null || _colorRenderbuffer == 0) return;
-        // Cheap idempotent re-assert: SetCurrentContext is a no-op fast
-        // path when this context is already current on this thread, and
-        // guards against any future caller that forgets the explicit
-        // MakeCurrentOnCallingThread() at render-thread start (e.g. a
-        // resize event handled on yet another thread down the line).
-        if (!EAGLContext.SetCurrentContext(_context))
-            throw new InvalidOperationException("EAGLContext.SetCurrentContext failed before SwapBuffers.");
-        glBindRenderbuffer(GL_RENDERBUFFER, _colorRenderbuffer);
-        _context.PresentRenderBuffer((uint)GL_RENDERBUFFER);
+        lock (_glLock)
+        {
+            // Cheap idempotent re-assert: SetCurrentContext is a no-op fast
+            // path when this context is already current on this thread, and
+            // guards against any future caller that forgets the explicit
+            // MakeCurrentOnCallingThread() at render-thread start (e.g. a
+            // resize event handled on yet another thread down the line).
+            if (!EAGLContext.SetCurrentContext(_context))
+                throw new InvalidOperationException("EAGLContext.SetCurrentContext failed before SwapBuffers.");
+            glBindRenderbuffer(GL_RENDERBUFFER, _colorRenderbuffer);
+            _context.PresentRenderBuffer((uint)GL_RENDERBUFFER);
+        }
     }
+
 
     // --- INativeContext (Silk.NET.OpenGL.GL.GetApi(this) needs this) ---
     // OpenGLES.framework's GLES2 entry points are resolved by ordinary
@@ -190,13 +231,16 @@ sealed class IosEglContext : INativeContext, IDisposable
 
     public void Dispose()
     {
-        _layer?.RemoveFromSuperLayer();
-        _layer = null;
-        if (_context != null)
+        lock (_glLock)
         {
-            EAGLContext.SetCurrentContext(null);
-            _context.Dispose();
-            _context = null;
+            _layer?.RemoveFromSuperLayer();
+            _layer = null;
+            if (_context != null)
+            {
+                EAGLContext.SetCurrentContext(null);
+                _context.Dispose();
+                _context = null;
+            }
         }
     }
 

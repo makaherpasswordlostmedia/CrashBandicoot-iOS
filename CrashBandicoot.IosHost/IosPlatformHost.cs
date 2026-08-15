@@ -53,6 +53,20 @@ sealed class IosPlatformHost(
 
     public void NotifySurfaceSize(int width, int height) => egl.SetExpectedSize(width, height);
 
+    /// <summary>
+    /// Exposes the same lock IosEglContext uses internally for
+    /// SetExpectedSize/SwapBuffers/Initialize/Dispose, so a whole frame's
+    /// worth of GL calls (PresentDisplay/PresentToDefaultFramebuffer, both
+    /// straight Silk.NET GL calls that bypass IosEglContext's own locked
+    /// methods) can be held atomic against a concurrent resize from
+    /// ViewDidLayoutSubviews on the main thread. Locking only inside
+    /// SwapBuffers was not sufficient: a resize could still land its own
+    /// SetCurrentContext + framebuffer rebuild in between
+    /// PresentToDefaultFramebuffer and SwapBuffers, i.e. mid-frame, pulling
+    /// the context out from under the render thread's in-flight GL calls.
+    /// </summary>
+    public object GlLock => egl.GlLockObject;
+
     public void Present(Gpu? gpu)
     {
         CheatManager.Apply();
@@ -66,6 +80,8 @@ sealed class IosPlatformHost(
         if (nativeWidth <= 0 || nativeHeight <= 0)
             return;
 
+        lock (GlLock)
+        {
         var surfaceWidth = egl.SurfaceWidth;
         var surfaceHeight = egl.SurfaceHeight;
         var phaseStart = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -119,6 +135,7 @@ sealed class IosPlatformHost(
         if (!_firstFrame) return;
         _firstFrame = false;
         status.SetStatus($"Game running • {presented.w}×{presented.h}", visible: false);
+        }
     }
 
     public void Shutdown()
