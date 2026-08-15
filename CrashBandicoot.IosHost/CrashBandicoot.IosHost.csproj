@@ -50,7 +50,12 @@
   <ItemGroup>
     <!-- Populated by scripts/prerecompile.sh before `dotnet build`.
          Excluded from source control (see .gitignore) since it's
-         copyrighted game code generated from the user's own disc. -->
+         copyrighted game code generated from the user's own disc.
+         The SDK's default globbing already picks these up from the
+         project directory, so remove them first to avoid NETSDK1022
+         duplicate-Compile-item errors, then re-add explicitly so the
+         Condition/Exists guard still applies when Recompiled/ is absent. -->
+    <Compile Remove="Recompiled\**\*.cs" />
     <Compile Include="Recompiled\**\*.cs" Condition="Exists('Recompiled')" />
   </ItemGroup>
 
