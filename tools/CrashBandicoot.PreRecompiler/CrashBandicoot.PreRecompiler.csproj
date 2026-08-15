@@ -38,4 +38,16 @@
         <Compile Include="..\..\CrashBandicoot.Launcher\Recomp\RecompRunner.cs" Link="Shared\RecompRunner.cs" />
     </ItemGroup>
 
+    <!--
+      RecompRunner.FindPatchPath() looks for main.cs.patch next to this
+      tool's built assembly (AppContext.BaseDirectory), not next to its
+      source. Copy it into the output dir at build time so it's found
+      at runtime without needing an explicit --patch argument.
+    -->
+    <ItemGroup>
+        <None Include="..\..\CrashBandicoot.Launcher\Recomp\Patches\main.cs.patch"
+              Link="Recomp\Patches\main.cs.patch"
+              CopyToOutputDirectory="PreserveNewest" />
+    </ItemGroup>
+
 </Project>
