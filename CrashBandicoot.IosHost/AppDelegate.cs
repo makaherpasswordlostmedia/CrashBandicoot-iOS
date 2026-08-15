@@ -40,6 +40,20 @@ public sealed class AppDelegate : UIApplicationDelegate
             RawLog($"UnobservedTaskException: {e.Exception}");
             e.SetObserved();
         };
+
+        // AppDomain.UnhandledException only catches exceptions thrown from
+        // managed code. It does NOT catch a raw abort() coming from a
+        // native/objc-trampoline call (e.g. a managed override calling into
+        // a UIKit base method through the binding layer) - which is exactly
+        // what field crash reports show happening here (checkpoint.log
+        // stops mid-ViewDidLoad, right at base.ViewDidLoad()). Installing an
+        // NSUncaughtExceptionHandler catches genuine ObjC-level exceptions
+        // that reach that layer, giving at least a checkpoint line before
+        // the process dies in cases where it IS a catchable ObjC exception
+        // rather than a hard trap/assert (which no handler can intercept -
+        // that class of failure needs the MtouchUseLlvm=false fix instead).
+        ObjCRuntime.Runtime.MarshalManagedException += (_, args) =>
+            RawLog($"MarshalManagedException: {args.Exception}");
     }
 
     static void RawLog(string message)

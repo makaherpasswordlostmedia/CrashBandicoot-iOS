@@ -27,7 +27,20 @@
           an interface, etc). Full AOT alone is stricter than mixed AOT+interp.
     -->
     <UseInterpreter>true</UseInterpreter>
-    <MtouchUseLlvm>true</MtouchUseLlvm>
+    <!--
+      MtouchUseLlvm was true here originally. Dropped: on iOS 14.7/A11 this
+      combination (LLVM AOT codegen + Mono interpreter fallback) has been
+      observed to abort() on the very first managed->native UIKit trampoline
+      call (UIViewController.ViewDidLoad -> base.ViewDidLoad(), before any
+      application code runs - see checkpoint.log evidence: execution never
+      reaches the line immediately after base.ViewDidLoad()). Plain Mono AOT
+      (no LLVM backend) + interpreter fallback is the better-trodden path for
+      this runtime/OS combination and avoids the interaction between the two
+      codegen backends at objc-trampoline boundaries. Revisit only if this
+      is confirmed fixed AND a profiling need justifies LLVM's extra codegen
+      quality.
+    -->
+    <MtouchUseLlvm>false</MtouchUseLlvm>
 
     <!-- Not code-signed by us: TrollStore fake-signs on install.
          EnableCodeSigning/CodesignRequireProvisioningProfile default to
