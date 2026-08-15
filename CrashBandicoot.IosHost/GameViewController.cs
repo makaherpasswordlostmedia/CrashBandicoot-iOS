@@ -160,6 +160,17 @@ sealed class GameViewController : UIViewController, IStatusSink
             InvokeOnMainThread(() => _egl.Initialize(View!, width, height));
             Checkpoint("RunGame: EAGL context/layer initialized");
 
+            // The EAGLContext created above was made current on the MAIN
+            // thread inside Initialize(), then explicitly released there.
+            // Every GL call from this point on - Silk.NET's GL.GetApi
+            // probing, GlBackend.InitGl, and the whole Present()/SwapBuffers
+            // render loop - runs on THIS thread (crash-game-main), so the
+            // context must be made current here too. EAGLContext is
+            // thread-affine; skipping this is what previously caused a
+            // native abort() on the main thread on first frame present.
+            _egl.MakeCurrentOnCallingThread();
+            Checkpoint("RunGame: EAGL context made current on render thread");
+
             var gl = Silk.NET.OpenGL.GL.GetApi(_egl);
             Checkpoint("RunGame: Silk.NET GL.GetApi resolved");
             var backend = new GlBackend(gl);
