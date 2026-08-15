@@ -138,6 +138,8 @@ jobs:
             -p:BuildIpa=false \
             -p:CodesignKey="" -p:CodesignProvision="" \
             -p:CodesignRequireProvisioningProfile=false \
+            -p:_CodeSigningRequired=false -p:CodeSigningRequired=false \
+            -p:CodesignEntitlements="" \
           2>&1 | tee ../build/device.log
           grep -qi "Build succeeded" ../build/device.log && echo "✅ Device build OK" \
             || { echo "❌ Device build FAILED"; grep -i "error" ../build/device.log | head -40; exit 1; }
