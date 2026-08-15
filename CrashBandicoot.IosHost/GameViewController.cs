@@ -82,7 +82,9 @@ sealed class GameViewController : UIViewController, IStatusSink
     {
         Checkpoint("ViewDidLoad: enter");
         base.ViewDidLoad();
+        Checkpoint("ViewDidLoad: base done");
         View!.BackgroundColor = UIColor.Black;
+        Checkpoint("ViewDidLoad: bg color set");
 
         // No Metal/CAMetalLayer setup here: IosEglContext.Initialize(View, ...)
         // creates and attaches its own CAEAGLLayer once RunGame() starts.
@@ -94,6 +96,7 @@ sealed class GameViewController : UIViewController, IStatusSink
             Text = "Starting…",
         };
         View.AddSubview(_statusLabel);
+        Checkpoint("ViewDidLoad: statusLabel added");
 
         _spinner = new UIActivityIndicatorView(UIActivityIndicatorViewStyle.Large)
         {
@@ -101,8 +104,10 @@ sealed class GameViewController : UIViewController, IStatusSink
         };
         _spinner.StartAnimating();
         View.AddSubview(_spinner);
+        Checkpoint("ViewDidLoad: spinner added");
 
         _touchView = new TouchControllerView(View.Bounds);
+        Checkpoint("ViewDidLoad: TouchControllerView constructed");
         _touchView.ThreeFingerHold = () => InvokeOnMainThread(() =>
             SetStatus("Dev menu not ported yet (hold detected).", visible: true));
         View.AddSubview(_touchView);
