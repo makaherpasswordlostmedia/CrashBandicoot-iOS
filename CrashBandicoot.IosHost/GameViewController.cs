@@ -4,6 +4,7 @@ using RecompOne.Runtime;
 using RecompOne.Runtime.Diagnostics;
 using RecompOne.Runtime.Hle;
 using RecompOne.Runtime.Memory;
+using System.Threading;
 using UIKit;
 
 namespace CrashBandicoot.IosHost;
@@ -157,7 +158,35 @@ sealed class GameViewController : UIViewController, IStatusSink
             // the actual GL rendering afterward runs from this background
             // thread (this matches the standard EAGL pattern of "set up on
             // main thread, current-context-and-draw from a render thread").
-            InvokeOnMainThread(() => _egl.Initialize(View!, width, height));
+            //
+            // InvokeOnMainThread is ASYNCHRONOUS (dispatch_async under the
+            // hood) - it queues the block and returns immediately on THIS
+            // thread. The code here previously called
+            // _egl.MakeCurrentOnCallingThread() and started issuing GL calls
+            // right after this line, assuming Initialize() had already run
+            // on the main thread by then. It hadn't, most of the time - this
+            // was a race between Initialize() (main thread) and everything
+            // below (render thread) that reads/writes the same IosEglContext
+            // fields (_context, _layer, the framebuffer). That race, not the
+            // resize/SwapBuffers path, was the actual cause of the abort():
+            // the crash stack landed at different depths across runs because
+            // a data race's exact failure point is non-deterministic, but it
+            // reproduced on effectively every launch because this code path
+            // runs unconditionally at startup, with no resize needed to
+            // trigger it. A ManualResetEventSlim makes RunGame actually wait
+            // for the main-thread Initialize() to finish before touching
+            // _egl from this thread at all.
+            using var eglReady = new ManualResetEventSlim(false);
+            Exception? eglInitError = null;
+            InvokeOnMainThread(() =>
+            {
+                try { _egl.Initialize(View!, width, height); }
+                catch (Exception ex) { eglInitError = ex; }
+                finally { eglReady.Set(); }
+            });
+            eglReady.Wait();
+            if (eglInitError != null)
+                throw new InvalidOperationException("EAGL Initialize failed on main thread.", eglInitError);
             Checkpoint("RunGame: EAGL context/layer initialized");
 
             // The EAGLContext created above was made current on the MAIN
