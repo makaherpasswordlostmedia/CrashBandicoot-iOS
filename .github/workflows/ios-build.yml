@@ -134,8 +134,9 @@ jobs:
           set -eo pipefail
           export PATH="$HOME/.dotnet9:$PATH"
           dotnet build CrashBandicoot.IosHost.csproj \
-            -c Release -f net9.0-ios -r ios-arm64 \
+            -c Release -f net9.0-ios \
             -p:BuildIpa=false \
+            -p:EnableCodeSigning=false \
             -p:CodesignKey="" -p:CodesignProvision="" \
             -p:CodesignRequireProvisioningProfile=false \
             -p:_CodeSigningRequired=false -p:CodeSigningRequired=false \
