@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net8.0-ios</TargetFramework>
+    <TargetFramework>net9.0-ios</TargetFramework>
     <SupportedOSPlatformVersion>14.0</SupportedOSPlatformVersion>
     <!-- Built and installed via TrollStore, not the App Store. -->
     <RuntimeIdentifier>ios-arm64</RuntimeIdentifier>
