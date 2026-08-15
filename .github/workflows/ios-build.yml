@@ -50,12 +50,11 @@ jobs:
       - name: Install .NET 9 + iOS workload
         run: |
           set -e
-          curl -sSL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel 9.0 --install-dir "$HOME/.dotnet"
-          echo "$HOME/.dotnet" >> "$GITHUB_PATH"
-          "$HOME/.dotnet/dotnet" workload install ios --skip-manifest-update
+          curl -sSL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel 9.0 --install-dir "$HOME/.dotnet9"
+          "$HOME/.dotnet9/dotnet" workload install ios --skip-manifest-update
 
       - name: Install .NET 10 (needed by RecompOne.Runtime/Recompiler)
-        run: curl -sSL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel 10.0 --install-dir "$HOME/.dotnet"
+        run: curl -sSL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel 10.0 --install-dir "$HOME/.dotnet10"
 
       - name: Fetch disc image (private, provided by you, from Google Drive)
         env:
@@ -99,6 +98,7 @@ jobs:
 
       - name: Pre-recompile (ELF -> C#, no Roslyn-in-app)
         run: |
+          export PATH="$HOME/.dotnet10:$PATH"
           chmod +x scripts/prerecompile.sh
           ./scripts/prerecompile.sh "$RUNNER_TEMP/disc/game.cue"
 
@@ -120,6 +120,7 @@ jobs:
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           set -eo pipefail
+          export PATH="$HOME/.dotnet9:$PATH"
           dotnet build CrashBandicoot.IosHost.csproj \
             -c Debug -f net9.0-ios -r iossimulator-arm64 \
             -p:CodesignKey="" -p:CodesignProvision="" \
@@ -131,6 +132,7 @@ jobs:
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           set -eo pipefail
+          export PATH="$HOME/.dotnet9:$PATH"
           dotnet build CrashBandicoot.IosHost.csproj \
             -c Release -f net9.0-ios -r ios-arm64 \
             -p:BuildIpa=true -p:ArchiveOnBuild=true \
