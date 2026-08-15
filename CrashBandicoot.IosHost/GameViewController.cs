@@ -1,6 +1,7 @@
 using CoreGraphics;
 using Foundation;
 using RecompOne.Runtime;
+using RecompOne.Runtime.Diagnostics;
 using RecompOne.Runtime.Hle;
 using RecompOne.Runtime.Memory;
 using UIKit;

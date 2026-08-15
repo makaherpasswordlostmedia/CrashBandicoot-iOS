@@ -95,16 +95,15 @@ sealed class IosAudioOutput : IDisposable
                 // Render callback runs on a realtime CoreAudio thread - must
                 // not allocate, lock with contention, or block. It only ever
                 // drains the ring buffer written by MixerLoop below.
-                var sourceNode = new AVAudioSourceNode(format, (isSilence, timestamp, frameCount, audioBufferList) =>
+                var sourceNode = new AVAudioSourceNode(format, (ref bool isSilence, ref AudioTimeStamp timestamp, uint frameCount, ref AudioBuffers outputData) =>
                 {
                     unsafe
                     {
-                        var buffers = (AudioBuffers*)audioBufferList;
                         // Interleaved stereo 16-bit PCM output.
-                        var outPtr = (short*)(*buffers)[0];
+                        var outPtr = (short*)outputData[0].Data;
                         int framesNeeded = (int)frameCount;
                         int framesWritten = DrainRing(outPtr, framesNeeded);
-                        isSilence.Data = framesWritten == 0;
+                        isSilence = framesWritten == 0;
                         return 0; // noErr
                     }
                 });
