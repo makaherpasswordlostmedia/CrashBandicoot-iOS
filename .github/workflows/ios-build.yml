@@ -38,7 +38,7 @@ jobs:
       - name: Select Xcode
         run: |
           set -e
-          for v in 15.4 15.3 15.2; do
+          for v in 16.4 16.3 16.2 16.1 16.0 15.4 15.3 15.2; do
             if [ -d "/Applications/Xcode_${v}.app" ]; then
               sudo xcode-select -s "/Applications/Xcode_${v}.app/Contents/Developer"
               echo "Selected Xcode ${v}"
