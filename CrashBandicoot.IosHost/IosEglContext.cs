@@ -3,7 +3,7 @@ using CoreAnimation;
 using Foundation;
 using ObjCRuntime;
 using OpenGLES;
-using Silk.NET.Core.Native;
+using Silk.NET.Core.Contexts;
 using UIKit;
 
 namespace CrashBandicoot.IosHost;
