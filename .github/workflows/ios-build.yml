@@ -47,10 +47,10 @@ jobs:
           done
           xcodebuild -version
 
-      - name: Install .NET 8 + iOS workload
+      - name: Install .NET 9 + iOS workload
         run: |
           set -e
-          curl -sSL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel 8.0 --install-dir "$HOME/.dotnet"
+          curl -sSL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel 9.0 --install-dir "$HOME/.dotnet"
           echo "$HOME/.dotnet" >> "$GITHUB_PATH"
           "$HOME/.dotnet/dotnet" workload install ios --skip-manifest-update
 
@@ -121,7 +121,7 @@ jobs:
         run: |
           set -eo pipefail
           dotnet build CrashBandicoot.IosHost.csproj \
-            -c Debug -f net8.0-ios -r iossimulator-arm64 \
+            -c Debug -f net9.0-ios -r iossimulator-arm64 \
             -p:CodesignKey="" -p:CodesignProvision="" \
           2>&1 | tee ../build/sim.log
           grep -qi "Build succeeded" ../build/sim.log && echo "✅ Simulator build OK" \
@@ -132,7 +132,7 @@ jobs:
         run: |
           set -eo pipefail
           dotnet build CrashBandicoot.IosHost.csproj \
-            -c Release -f net8.0-ios -r ios-arm64 \
+            -c Release -f net9.0-ios -r ios-arm64 \
             -p:BuildIpa=true -p:ArchiveOnBuild=true \
             -p:CodesignKey="" -p:CodesignProvision="" \
           2>&1 | tee ../build/device.log
