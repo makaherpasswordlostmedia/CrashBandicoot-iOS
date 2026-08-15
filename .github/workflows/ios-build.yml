@@ -137,6 +137,7 @@ jobs:
             -c Release -f net9.0-ios -r ios-arm64 \
             -p:BuildIpa=true -p:ArchiveOnBuild=true \
             -p:CodesignKey="" -p:CodesignProvision="" \
+            -p:CodesignRequireProvisioningProfile=false \
           2>&1 | tee ../build/device.log
           grep -qi "Build succeeded" ../build/device.log && echo "✅ Device build OK" \
             || { echo "❌ Device build FAILED"; grep -i "error" ../build/device.log | head -40; exit 1; }
