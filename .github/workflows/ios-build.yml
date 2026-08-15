@@ -73,6 +73,13 @@ jobs:
           gdown "$CUE_FILE_ID" -O "$RUNNER_TEMP/disc/game.cue"
           gdown "$BIN_FILE_ID" -O "$RUNNER_TEMP/disc/game.bin"
 
+          # The .cue references its bin by whatever filename was burned
+          # into it originally (e.g. "Crash Bandicoot.bin"), which won't
+          # match our fixed game.bin filename. Rewrite the FILE line to
+          # point at the actual downloaded filename.
+          sed -i.bak -E 's/^FILE "[^"]+"/FILE "game.bin"/' "$RUNNER_TEMP/disc/game.cue"
+          rm -f "$RUNNER_TEMP/disc/game.cue.bak"
+
           ls -la "$RUNNER_TEMP/disc"
           file "$RUNNER_TEMP/disc/game.cue"
           file "$RUNNER_TEMP/disc/game.bin"
