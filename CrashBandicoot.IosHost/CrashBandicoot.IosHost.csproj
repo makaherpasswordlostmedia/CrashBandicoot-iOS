@@ -29,7 +29,13 @@
     <UseInterpreter>true</UseInterpreter>
     <MtouchUseLlvm>true</MtouchUseLlvm>
 
-    <!-- Not code-signed by us: TrollStore fake-signs on install. -->
+    <!-- Not code-signed by us: TrollStore fake-signs on install.
+         EnableCodeSigning/CodesignRequireProvisioningProfile default to
+         true for a real device RuntimeIdentifier (ios-arm64), regardless
+         of -p: overrides passed on the dotnet build command line, so they
+         must be set here in the csproj to actually take effect. -->
+    <EnableCodeSigning>false</EnableCodeSigning>
+    <CodesignRequireProvisioningProfile>false</CodesignRequireProvisioningProfile>
     <CodesignKey Condition="'$(Configuration)'=='Release'"></CodesignKey>
     <BuildIpa>true</BuildIpa>
   </PropertyGroup>
