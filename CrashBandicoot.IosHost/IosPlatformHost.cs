@@ -1,5 +1,6 @@
 using RecompOne.Runtime;
 using RecompOne.Runtime.Config;
+using RecompOne.Runtime.Diagnostics;
 using RecompOne.Runtime.Hle;
 using RecompOne.Runtime.Host.Cheats;
 
@@ -105,7 +106,7 @@ sealed class IosPlatformHost(
         {
             var frames = Math.Max(1, _fpsFrames);
             LastFps = _fpsFrames / elapsed;
-            Log.Info($"{_fpsFrames / elapsed:F1} FPS, surface {surfaceWidth}x{surfaceHeight}, " +
+            SessionLog.Info($"{_fpsFrames / elapsed:F1} FPS, surface {surfaceWidth}x{surfaceHeight}, " +
                      $"present {presented.w}x{presented.h}, CPU submit " +
                      $"{_prepareMilliseconds / frames:F2}+{_surfaceMilliseconds / frames:F2} ms, " +
                      $"swap {_swapMilliseconds / frames:F2} ms");

@@ -1,6 +1,7 @@
 using AVFoundation;
 using AudioToolbox;
 using RecompOne.Runtime;
+using RecompOne.Runtime.Diagnostics;
 
 namespace CrashBandicoot.IosHost;
 
@@ -100,7 +101,7 @@ sealed class IosAudioOutput : IDisposable
                     {
                         var buffers = (AudioBuffers*)audioBufferList;
                         // Interleaved stereo 16-bit PCM output.
-                        var outPtr = (short*)(*buffers)[0].Data;
+                        var outPtr = (short*)(*buffers)[0];
                         int framesNeeded = (int)frameCount;
                         int framesWritten = DrainRing(outPtr, framesNeeded);
                         isSilence.Data = framesWritten == 0;
@@ -125,7 +126,7 @@ sealed class IosAudioOutput : IDisposable
                     Priority = ThreadPriority.AboveNormal,
                 };
                 _mixerThread.Start();
-                Log.Info($"AVAudioEngine started: {SampleRate} Hz stereo, ring {RingCapacityFrames} frames.");
+                SessionLog.Info($"AVAudioEngine started: {SampleRate} Hz stereo, ring {RingCapacityFrames} frames.");
             }
             catch (Exception ex)
             {
@@ -133,7 +134,7 @@ sealed class IosAudioOutput : IDisposable
                 _running = false;
                 try { _engine?.Stop(); } catch { /* ignore */ }
                 _engine = null;
-                Log.Error($"Audio init failed, game stays silent: {ex}");
+                SessionLog.Error($"Audio init failed, game stays silent: {ex}");
             }
         }
     }
