@@ -13,8 +13,16 @@ public sealed class AppDelegate : UIApplicationDelegate
         InstallCrashCheckpoint();
         DiskLog.Log("AppDelegate.FinishedLaunching: enter");
 
-        DiskLog.Log("AppDelegate.FinishedLaunching: about to create UIWindow");
-        Window = new UIWindow(UIScreen.MainScreen.Bounds);
+        DiskLog.Log("AppDelegate.FinishedLaunching: about to read UIScreen.MainScreen");
+        var mainScreen = UIScreen.MainScreen;
+        DiskLog.Log("AppDelegate.FinishedLaunching: UIScreen.MainScreen read OK");
+
+        DiskLog.Log("AppDelegate.FinishedLaunching: about to read mainScreen.Bounds");
+        var bounds = mainScreen.Bounds;
+        DiskLog.Log($"AppDelegate.FinishedLaunching: bounds read OK ({bounds.Width}x{bounds.Height})");
+
+        DiskLog.Log("AppDelegate.FinishedLaunching: about to construct UIWindow");
+        Window = new UIWindow(bounds);
         DiskLog.Log("AppDelegate.FinishedLaunching: UIWindow created");
 
         // TEMPORARY DIAGNOSTIC: swap GameViewController for a bare
