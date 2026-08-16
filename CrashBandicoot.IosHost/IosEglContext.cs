@@ -45,6 +45,8 @@ sealed class IosEglContext : INativeContext, IDisposable
     const string GlesLib = "/System/Library/Frameworks/OpenGLES.framework/OpenGLES";
     [DllImport(GlesLib)] static extern void glGenFramebuffers(int n, out uint framebuffers);
     [DllImport(GlesLib)] static extern void glGenRenderbuffers(int n, out uint renderbuffers);
+    [DllImport(GlesLib)] static extern void glDeleteFramebuffers(int n, ref uint framebuffers);
+    [DllImport(GlesLib)] static extern void glDeleteRenderbuffers(int n, ref uint renderbuffers);
     [DllImport(GlesLib)] static extern void glBindFramebuffer(uint target, uint framebuffer);
     [DllImport(GlesLib)] static extern void glBindRenderbuffer(uint target, uint renderbuffer);
     [DllImport(GlesLib)] static extern void glFramebufferRenderbuffer(uint target, uint attachment, uint renderbuffertarget, uint renderbuffer);
@@ -114,6 +116,33 @@ sealed class IosEglContext : INativeContext, IDisposable
     void CreateFramebuffer(int width, int height)
     {
         DiskLog.Log($"IosEglContext.CreateFramebuffer: enter {width}x{height}");
+
+        // RenderBufferStorage sizes the renderbuffer from _layer's bounds
+        // (in points) times its contentsScale - NOT from the width/height
+        // parameters passed here. If the layer's frame/contentsScale are
+        // stale (e.g. still the initial hostView.Bounds set once in
+        // Initialize(), at 1x scale) while width/height here reflect a
+        // newer physical-pixel size (e.g. after SetExpectedSize is called
+        // with Retina-scaled dimensions), RenderBufferStorage silently
+        // sizes the renderbuffer to the OLD/wrong size. The subsequent
+        // glCheckFramebufferStatus then fails with
+        // FRAMEBUFFER_INCOMPLETE_ATTACHMENT because nothing else here
+        // actually matches - this was the root cause of the crash seen
+        // right after startup, on the very first SetExpectedSize call.
+        // Keeping the layer's contentsScale and frame in sync with the
+        // pixel size we were actually asked for fixes this.
+        var scale = UIScreen.MainScreen.Scale;
+        _layer!.ContentsScale = scale;
+        _layer.Frame = new CoreGraphics.CGRect(0, 0, width / scale, height / scale);
+
+        // Delete any previously created framebuffer/renderbuffer before
+        // regenerating - CreateFramebuffer can be called repeatedly (every
+        // SetExpectedSize on a rotation/size change), and without this the
+        // old GL objects were never freed, leaking one framebuffer +
+        // renderbuffer pair per resize for the lifetime of the process.
+        if (_framebuffer != 0) glDeleteFramebuffers(1, ref _framebuffer);
+        if (_colorRenderbuffer != 0) glDeleteRenderbuffers(1, ref _colorRenderbuffer);
+
         glGenFramebuffers(1, out _framebuffer);
         glBindFramebuffer(GL_FRAMEBUFFER, _framebuffer);
 
