@@ -28,7 +28,12 @@ sealed class GameViewController : UIViewController, IStatusSink
     UILabel? _statusLabel;
     UIActivityIndicatorView? _spinner;
     TouchControllerView? _touchView;
-    IosEglContext? _egl;
+    // volatile: written on crash-game-main (RunGame), read on the main
+    // thread (ViewDidLayoutSubviews) with no lock between them. Without
+    // this, ARM64's weak memory model does not guarantee the main thread
+    // ever observes the write, or observes a fully-constructed
+    // IosEglContext instance rather than a torn/partial one.
+    volatile IosEglContext? _egl;
     Thread? _gameThread;
 
     /// <summary>
@@ -121,10 +126,23 @@ sealed class GameViewController : UIViewController, IStatusSink
         if (_statusLabel != null) _statusLabel.Frame = View!.Bounds;
         if (_spinner != null) _spinner.Center = View!.Center;
         if (_touchView != null) _touchView.Frame = View!.Bounds;
-        if (_egl != null && View != null)
+        // Capture _egl into a local before the null check: this field is
+        // written on crash-game-main (RunGame) and read here on the main
+        // thread with no lock or volatile between them. Re-reading the
+        // field a second time after the null check (the old code did
+        // `_egl.SetExpectedSize(...)` as a separate statement) is a classic
+        // TOCTOU - the field could still be non-null at the check and then
+        // read again with no guarantee it's the same fully-published
+        // reference, or SetExpectedSize could run against an _egl that
+        // RunGame's catch block is simultaneously tearing down after an
+        // exception. Capturing once removes the double-read; SetExpectedSize
+        // itself already no-ops safely if this particular instance hasn't
+        // finished Initialize() yet (_layer/_context still null there).
+        var egl = _egl;
+        if (egl != null && View != null)
         {
             var scale = UIScreen.MainScreen.Scale;
-            _egl.SetExpectedSize((int)(View.Bounds.Width * scale), (int)(View.Bounds.Height * scale));
+            egl.SetExpectedSize((int)(View.Bounds.Width * scale), (int)(View.Bounds.Height * scale));
         }
     }
 
@@ -161,26 +179,31 @@ sealed class GameViewController : UIViewController, IStatusSink
             //
             // InvokeOnMainThread is ASYNCHRONOUS (dispatch_async under the
             // hood) - it queues the block and returns immediately on THIS
-            // thread. The code here previously called
-            // _egl.MakeCurrentOnCallingThread() and started issuing GL calls
-            // right after this line, assuming Initialize() had already run
-            // on the main thread by then. It hadn't, most of the time - this
-            // was a race between Initialize() (main thread) and everything
-            // below (render thread) that reads/writes the same IosEglContext
-            // fields (_context, _layer, the framebuffer). That race, not the
-            // resize/SwapBuffers path, was the actual cause of the abort():
-            // the crash stack landed at different depths across runs because
-            // a data race's exact failure point is non-deterministic, but it
-            // reproduced on effectively every launch because this code path
-            // runs unconditionally at startup, with no resize needed to
-            // trigger it. A ManualResetEventSlim makes RunGame actually wait
-            // for the main-thread Initialize() to finish before touching
-            // _egl from this thread at all.
+            // thread. The lambda below reads the `_egl` field from the main
+            // thread while it was just written on THIS thread a few lines
+            // up. On ARM64's weak memory model, a plain field write on one
+            // thread is not guaranteed to be visible to a read on another
+            // thread without an explicit memory barrier - there is nothing
+            // here (no lock, no volatile, no Interlocked) forcing that
+            // visibility, so the main thread could in principle still see a
+            // stale/null `_egl` when the queued block runs, or - more
+            // realistically given ManualResetEventSlim.Wait() below already
+            // acts as a full fence once eglReady.Set() happens-before this
+            // thread's eglReady.Wait() returns - see a *partially
+            // constructed* IosEglContext object (the reference could become
+            // visible before all of its constructor's field writes are).
+            // Capturing the freshly constructed instance into a local and
+            // passing that into the lambda closes this gap: the local is
+            // definitely fully constructed by the time it's captured, and
+            // ManualResetEventSlim's Set/Wait pair (which use Monitor
+            // internally) already provides the happens-before edge back to
+            // this thread for everything the lambda touches.
+            var egl = _egl;
             using var eglReady = new ManualResetEventSlim(false);
             Exception? eglInitError = null;
             InvokeOnMainThread(() =>
             {
-                try { _egl.Initialize(View!, width, height); }
+                try { egl.Initialize(View!, width, height); }
                 catch (Exception ex) { eglInitError = ex; }
                 finally { eglReady.Set(); }
             });
