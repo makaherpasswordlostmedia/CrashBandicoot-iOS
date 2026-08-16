@@ -196,8 +196,12 @@ sealed class GameViewController : UIViewController, IStatusSink
             // same extension AndroidGlesInfo already prefers first on
             // Android), so probe for it here the same way and request that
             // path explicitly instead of taking the None default.
-            var glExtensions = System.Runtime.InteropServices.Marshal.PtrToStringAnsi(
-                (nint)gl.GetString(Silk.NET.OpenGL.StringName.Extensions)) ?? string.Empty;
+            string glExtensions;
+            unsafe
+            {
+                glExtensions = System.Runtime.InteropServices.Marshal.PtrToStringAnsi(
+                    (nint)gl.GetString(Silk.NET.OpenGL.StringName.Extensions)) ?? string.Empty;
+            }
             var fetchPath = glExtensions.Contains("GL_EXT_shader_framebuffer_fetch", StringComparison.Ordinal)
                 ? RecompOne.Runtime.Hle.GlesFramebufferFetchPath.Ext
                 : glExtensions.Contains("GL_ARM_shader_framebuffer_fetch", StringComparison.Ordinal)
