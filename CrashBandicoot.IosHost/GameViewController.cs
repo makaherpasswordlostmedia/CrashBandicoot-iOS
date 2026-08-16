@@ -125,6 +125,57 @@ sealed class GameViewController : UIViewController, IStatusSink
         Checkpoint("RunGame: enter");
         try
         {
+            // AppPaths.Root defaults to Environment.ProcessPath's directory
+            // (see AppPaths.SetRoot's own doc comment: "Android hosts must
+            // call this before the runtime is initialized because the APK
+            // install directory is read-only"). The exact same constraint
+            // applies here - on iOS, ProcessPath/AppContext.BaseDirectory
+            // point inside the app bundle, which is code-signed and
+            // read-only after install. Any static state under
+            // RecompOne.Runtime.Runtime that touches AppPaths at class-init
+            // time (e.g. the MemoryCard fields opening/creating
+            // AppPaths.CardAPath) throws there, which surfaces here as an
+            // opaque TypeInitializationException the very first time
+            // `Runtime` is touched. Point AppPaths at the app's actual
+            // writable Documents directory - the same NSSearchPathDirectory
+            // location LocateDiscCue() below already uses for the .cue/.bin
+            // pair - before anything reaches RecompOne.Runtime.Runtime,
+            // mirroring what AndroidRuntimeHost.MainActivity already does
+            // with FilesDir before its own runtime init.
+            var docsDir = NSFileManager.DefaultManager
+                .GetUrls(NSSearchPathDirectory.DocumentDirectory, NSSearchPathDomain.User)[0]
+                .Path;
+            if (!string.IsNullOrEmpty(docsDir))
+            {
+                var dataRoot = System.IO.Path.Combine(docsDir, "runtime");
+                RecompOne.Runtime.AppPaths.SetRoot(dataRoot);
+                RecompOne.Runtime.AppPaths.EnsureCreated();
+                Checkpoint($"RunGame: AppPaths.Root set to {dataRoot}");
+
+                // Mirror AndroidRuntimeHost.MainActivity.StartGameAsync's
+                // full pre-launch sequence, not just SetRoot/EnsureCreated -
+                // ConfigManager.Load() reads settings.json/interface.ini
+                // (safe no-ops on first run, since ConfigManager.Game/View
+                // already default to `new()`), and
+                // ApplyRuntimeGraphicsSettings mirrors ConfigManager.View
+                // into RecompOne.Runtime.Hle.GpuHle's static fields
+                // (TextureFilter, Dedither, PresentNearest, IntegerScale,
+                // wide-aspect, etc.) that GlShaders' PrimFs (uFilterMode,
+                // uDedither, ...) and GlBackend read at draw time. Skipping
+                // this doesn't crash - those statics just stay at their C#
+                // default values - but it silently produces a
+                // visually-wrong render (no widescreen, no texture
+                // filtering, no dedither) that would otherwise look like a
+                // brand new, unrelated bug.
+                RecompOne.Runtime.Config.ConfigManager.Load();
+                ApplyRuntimeGraphicsSettings();
+                Checkpoint("RunGame: ConfigManager.Load + ApplyRuntimeGraphicsSettings done");
+            }
+            else
+            {
+                Checkpoint("RunGame: WARNING could not resolve Documents dir, AppPaths.Root left at bundle default (read-only)");
+            }
+
             _egl = new IosEglContext();
             Checkpoint("RunGame: IosEglContext constructed");
             // EAGL/UIKit calls must happen on the main thread even though
@@ -248,10 +299,40 @@ sealed class GameViewController : UIViewController, IStatusSink
         }
         catch (Exception ex)
         {
-            Checkpoint($"RunGame: EXCEPTION {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}");
+            // TypeInitializationException (and similar wrapper exceptions)
+            // put the actually useful information in InnerException, not
+            // Message - ex.Message alone was previously just the opaque
+            // resource key "TypeInitialization_Type" with no indication of
+            // which static field failed or why. Walk the chain so the real
+            // cause (e.g. a static field's constructor failing to write to
+            // a read-only path) actually reaches checkpoint.log.
+            var chain = new System.Text.StringBuilder();
+            for (var cur = ex; cur != null; cur = cur.InnerException)
+                chain.Append($"{cur.GetType().Name}: {cur.Message}\n");
+            Checkpoint($"RunGame: EXCEPTION chain:\n{chain}{ex.StackTrace}");
             SessionLog.Exception("GameViewController.RunGame", ex);
             SetStatus($"Crashed: {ex.Message}", visible: true);
         }
+    }
+
+    /// <summary>
+    /// Mirrors AndroidRuntimeHost.MainActivity.ApplyRuntimeGraphicsSettings
+    /// exactly - pushes ConfigManager.View into GpuHle's static fields.
+    /// Called once, right after ConfigManager.Load(), before the game
+    /// thread reaches any GL work that reads these.
+    /// </summary>
+    static void ApplyRuntimeGraphicsSettings()
+    {
+        var view = RecompOne.Runtime.Config.ConfigManager.View;
+        RecompOne.Runtime.Hle.GpuHle.WideAspect = view.Widescreen ? 16f / 9f : 0f;
+        RecompOne.Runtime.Hle.GpuHle.TextureFilter = view.TextureFilter;
+        RecompOne.Runtime.Hle.GpuHle.TextureFilterStrength = view.TextureFilterStrength;
+        RecompOne.Runtime.Hle.GpuHle.Dedither = view.Dedither;
+        RecompOne.Runtime.Hle.GpuHle.Dejitter = view.Dejitter;
+        RecompOne.Runtime.Hle.GpuHle.PresentNearest = view.PresentNearest;
+        RecompOne.Runtime.Hle.GpuHle.IntegerScale = view.IntegerScale;
+        RecompOne.Runtime.Host.FrameClock.SkipThrottle = false;
+        RecompOne.Runtime.Hle.GpuHle.RefreshWideFov();
     }
 
     static string? LocateDiscCue()
