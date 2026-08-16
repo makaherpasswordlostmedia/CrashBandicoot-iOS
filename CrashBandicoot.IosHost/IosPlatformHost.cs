@@ -23,6 +23,7 @@ sealed class IosPlatformHost(
     bool _firstFrame = true;
     long _fpsWindow = System.Diagnostics.Stopwatch.GetTimestamp();
     int _fpsFrames;
+    long _frameCounter;
     double _prepareMilliseconds;
     double _surfaceMilliseconds;
     double _swapMilliseconds;
@@ -33,25 +34,46 @@ sealed class IosPlatformHost(
 
     public static double LastFps { get; private set; }
 
-    public void Initialize(string title) => status.SetStatus($"{title}: first frame incoming…", visible: true);
+    public void Initialize(string title)
+    {
+        DiskLog.Log($"IosPlatformHost.Initialize: {title}");
+        status.SetStatus($"{title}: first frame incoming…", visible: true);
+    }
     public void WaitForValidDisc() { }
-    public void AttachAudio(Spu? spu) => _audio.Attach(spu);
+    public void AttachAudio(Spu? spu)
+    {
+        DiskLog.Log("IosPlatformHost.AttachAudio");
+        _audio.Attach(spu);
+    }
     public void SetMasterVolume(float volume) => _audio.SetMasterVolume(volume);
-    public void ShowNotice(string message) => status.SetStatus(message, visible: true);
+    public void ShowNotice(string message)
+    {
+        DiskLog.Log($"IosPlatformHost.ShowNotice: {message}");
+        status.SetStatus(message, visible: true);
+    }
 
     public void PauseAudio()
     {
+        DiskLog.Log("IosPlatformHost.PauseAudio: enter");
         RecompOne.Runtime.Host.FrameClock.PauseTiming();
         _audio.PauseOutput();
+        DiskLog.Log("IosPlatformHost.PauseAudio: done");
     }
 
     public void ResumeAudio()
     {
+        DiskLog.Log("IosPlatformHost.ResumeAudio: enter");
         _audio.ResumeOutput();
         RecompOne.Runtime.Host.FrameClock.ResumeTiming();
+        DiskLog.Log("IosPlatformHost.ResumeAudio: done");
     }
 
-    public void NotifySurfaceSize(int width, int height) => egl.SetExpectedSize(width, height);
+    public void NotifySurfaceSize(int width, int height)
+    {
+        DiskLog.Log($"IosPlatformHost.NotifySurfaceSize: {width}x{height} (frame {_frameCounter})");
+        egl.SetExpectedSize(width, height);
+        DiskLog.Log($"IosPlatformHost.NotifySurfaceSize: SetExpectedSize returned (frame {_frameCounter})");
+    }
 
     /// <summary>
     /// Exposes the same lock IosEglContext uses internally for
@@ -80,10 +102,24 @@ sealed class IosPlatformHost(
         if (nativeWidth <= 0 || nativeHeight <= 0)
             return;
 
+        _frameCounter++;
+        // Heartbeat every 120 frames (~2s at 60fps) rather than every frame:
+        // logging every single frame would itself perturb timing enough to
+        // mask or shift a race, and 68KB-scale log files get awkward to
+        // pull off-device. The goal here is narrowing "crashed somewhere in
+        // Entry.Run, at some point, doing something" down to "crashed
+        // between frame N and N+1, during phase X" - a heartbeat plus
+        // per-phase logging on the frames immediately after a resize/
+        // pause/resume (the known trigger candidates from earlier in this
+        // investigation) covers that without flooding the log.
+        bool verbose = _frameCounter <= 5 || _frameCounter % 120 == 0;
+        if (verbose) DiskLog.Log($"Present: frame {_frameCounter} begin, gpu {nativeWidth}x{nativeHeight}");
+
         lock (GlLock)
         {
         var surfaceWidth = egl.SurfaceWidth;
         var surfaceHeight = egl.SurfaceHeight;
+        if (verbose) DiskLog.Log($"Present: frame {_frameCounter} got GlLock, surface {surfaceWidth}x{surfaceHeight}");
         var phaseStart = System.Diagnostics.Stopwatch.GetTimestamp();
         var frameIntervalMilliseconds = _lastPresentTimestamp == 0
             ? 0
@@ -93,10 +129,13 @@ sealed class IosPlatformHost(
         var presented = backend.PresentDisplay(
             gpu.DisplayX, gpu.DisplayY, nativeWidth, nativeHeight, gpu.Display24Bit,
             surfaceWidth, surfaceHeight);
+        if (verbose) DiskLog.Log($"Present: frame {_frameCounter} PresentDisplay done ({presented.w}x{presented.h})");
         var prepared = System.Diagnostics.Stopwatch.GetTimestamp();
         backend.PresentToDefaultFramebuffer(surfaceWidth, surfaceHeight, presented.aspect);
+        if (verbose) DiskLog.Log($"Present: frame {_frameCounter} PresentToDefaultFramebuffer done");
         var composited = System.Diagnostics.Stopwatch.GetTimestamp();
         egl.SwapBuffers();
+        if (verbose) DiskLog.Log($"Present: frame {_frameCounter} SwapBuffers done");
         var swapped = System.Diagnostics.Stopwatch.GetTimestamp();
 
         double ticksToMilliseconds = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
@@ -134,16 +173,19 @@ sealed class IosPlatformHost(
 
         if (!_firstFrame) return;
         _firstFrame = false;
+        DiskLog.Log("Present: first frame complete, hiding status");
         status.SetStatus($"Game running • {presented.w}×{presented.h}", visible: false);
         }
     }
 
     public void Shutdown()
     {
+        DiskLog.Log("IosPlatformHost.Shutdown: enter");
         RecompOne.Runtime.Host.FrameClock.ResumeTiming();
         _audio.Dispose();
         RecompOne.Runtime.Hardware.Controller.SetVirtualPadState(0);
         status.SetStatus("Session ended.", visible: true);
+        DiskLog.Log("IosPlatformHost.Shutdown: done");
     }
 }
 

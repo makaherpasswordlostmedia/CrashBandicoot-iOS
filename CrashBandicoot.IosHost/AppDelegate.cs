@@ -11,33 +11,61 @@ public sealed class AppDelegate : UIApplicationDelegate
     public override bool FinishedLaunching(UIApplication app, NSDictionary options)
     {
         InstallCrashCheckpoint();
+        DiskLog.Log("AppDelegate.FinishedLaunching: enter");
 
         Window = new UIWindow(UIScreen.MainScreen.Bounds)
         {
             RootViewController = new GameViewController(),
         };
         Window.MakeKeyAndVisible();
+        DiskLog.Log("AppDelegate.FinishedLaunching: window made key and visible");
         return true;
     }
+
+    // The app lifecycle transitions below (background/foreground/resign/
+    // activate) are exactly when iOS can invalidate GPU/audio resources out
+    // from under the app (e.g. the EAGL context, or the audio session route)
+    // - a common source of crashes that have nothing to do with steady-state
+    // gameplay. None of these were logged before, so if a field crash
+    // report's last checkpoint.log line is one of these, that immediately
+    // rules in/out "something during a background/foreground transition" as
+    // the trigger, separate from anything happening mid-frame in Present().
+    public override void DidEnterBackground(UIApplication application) =>
+        DiskLog.Log("AppDelegate.DidEnterBackground");
+
+    public override void WillEnterForeground(UIApplication application) =>
+        DiskLog.Log("AppDelegate.WillEnterForeground");
+
+    public override void OnResignActivation(UIApplication application) =>
+        DiskLog.Log("AppDelegate.OnResignActivation");
+
+    public override void OnActivated(UIApplication application) =>
+        DiskLog.Log("AppDelegate.OnActivated");
+
+    public override void WillTerminate(UIApplication application) =>
+        DiskLog.Log("AppDelegate.WillTerminate");
+
+    public override void ReceiveMemoryWarning(UIApplication application) =>
+        DiskLog.Log("AppDelegate.ReceiveMemoryWarning: *** low memory ***");
 
     /// <summary>
     /// Catches unhandled .NET exceptions and native (Obj-C/Mono) crashes
     /// that happen before or outside GameViewController's own try/catch,
-    /// and appends them to the same Documents/checkpoint.log via raw POSIX
-    /// I/O. See GameViewController.Checkpoint for why POSIX and not any
-    /// managed logging API. Without this, a crash during app launch itself
-    /// (before GameViewController.ViewDidLoad even runs) is completely
-    /// silent - exactly the kind of failure that burns iterations without
-    /// any information to act on.
+    /// and appends them to the same Documents/checkpoint.log via DiskLog
+    /// (raw POSIX I/O - see DiskLog.cs for why not any managed logging
+    /// API). Without this, a crash during app launch itself (before
+    /// GameViewController.ViewDidLoad even runs) is completely silent -
+    /// exactly the kind of failure that burns iterations without any
+    /// information to act on.
     /// </summary>
     static void InstallCrashCheckpoint()
     {
         AppDomain.CurrentDomain.UnhandledException += (_, e) =>
-            RawLog($"AppDomain.UnhandledException: {e.ExceptionObject}");
+            DiskLog.Log($"[FATAL] AppDomain.UnhandledException: {e.ExceptionObject}");
 
         TaskScheduler.UnobservedTaskException += (_, e) =>
         {
-            RawLog($"UnobservedTaskException: {e.Exception}");
+            DiskLog.Log($"[FATAL] UnobservedTaskException: {e.Exception}");
             e.SetObserved();
         };
 
@@ -53,22 +81,7 @@ public sealed class AppDelegate : UIApplicationDelegate
         // rather than a hard trap/assert (which no handler can intercept -
         // that class of failure needs the MtouchUseLlvm=false fix instead).
         ObjCRuntime.Runtime.MarshalManagedException += (_, args) =>
-            RawLog($"MarshalManagedException: {args.Exception}");
-    }
-
-    static void RawLog(string message)
-    {
-        try
-        {
-            var docs = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
-            var path = System.IO.Path.Combine(docs, "checkpoint.log");
-            var line = $"{DateTime.UtcNow:HH:mm:ss.fff} [FATAL] {message}\n";
-            System.IO.File.AppendAllText(path, line);
-        }
-        catch
-        {
-            // Last-resort logger; nothing further we can do if this fails.
-        }
+            DiskLog.Log($"[FATAL] MarshalManagedException: {args.Exception}");
     }
 }
 

@@ -36,53 +36,8 @@ sealed class GameViewController : UIViewController, IStatusSink
     volatile IosEglContext? _egl;
     Thread? _gameThread;
 
-    /// <summary>
-    /// Appends a line to Documents/checkpoint.log via raw POSIX
-    /// open/write/close, deliberately bypassing every managed I/O and
-    /// logging path (File.AppendAllText, NSLog, etc). The point: if the
-    /// Mono runtime, GC, or any managed subsystem is what's crashing, a
-    /// managed logger crashes right along with it and you're back to
-    /// silent failures. A raw POSIX write from a P/Invoke has the fewest
-    /// possible moving parts between "something went wrong" and "there is
-    /// a line about it in a file you can pull off the device". This is the
-    /// single highest-leverage lesson carried over from a previous
-    /// (non-.NET) iOS port that took ~70 iterations to get building:
-    /// unexplained crashes with no log cost far more time than any
-    /// individual compile error does.
-    /// </summary>
-    static void Checkpoint(string stage)
-    {
-        try
-        {
-            var docs = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
-            var path = System.IO.Path.Combine(docs, "checkpoint.log");
-            var line = $"{DateTime.UtcNow:HH:mm:ss.fff} {stage}\n";
-            var bytes = System.Text.Encoding.UTF8.GetBytes(line);
-            int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0x1A4 /* 0644 */);
-            if (fd < 0) return;
-            unsafe
-            {
-                fixed (byte* p = bytes)
-                    write(fd, (IntPtr)p, (UIntPtr)bytes.Length);
-            }
-            close(fd);
-        }
-        catch
-        {
-            // Checkpointing must never itself be the thing that crashes.
-        }
-    }
-
-    const int O_WRONLY = 0x0001;
-    const int O_CREAT = 0x0200;
-    const int O_APPEND = 0x0008;
-
-    [System.Runtime.InteropServices.DllImport("libc", SetLastError = true)]
-    static extern int open(string path, int flags, int mode);
-    [System.Runtime.InteropServices.DllImport("libc")]
-    static extern IntPtr write(int fd, IntPtr buf, UIntPtr count);
-    [System.Runtime.InteropServices.DllImport("libc")]
-    static extern int close(int fd);
+    /// <summary>Thin wrapper kept for call-site brevity; see DiskLog.cs for what this actually does.</summary>
+    static void Checkpoint(string stage) => DiskLog.Log(stage);
 
     public override void ViewDidLoad()
     {

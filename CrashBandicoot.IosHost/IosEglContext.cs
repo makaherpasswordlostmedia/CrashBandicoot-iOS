@@ -66,12 +66,15 @@ sealed class IosEglContext : INativeContext, IDisposable
     /// </summary>
     public void Initialize(UIView hostView, int width, int height)
     {
+        DiskLog.Log($"IosEglContext.Initialize: enter {width}x{height}");
         lock (_glLock)
         {
         _context = new EAGLContext(EAGLRenderingAPI.OpenGLES2)
             ?? throw new InvalidOperationException("EAGLContext creation failed (OpenGLES2 unavailable).");
+        DiskLog.Log("IosEglContext.Initialize: EAGLContext created");
         if (!EAGLContext.SetCurrentContext(_context))
             throw new InvalidOperationException("EAGLContext.SetCurrentContext failed.");
+        DiskLog.Log("IosEglContext.Initialize: SetCurrentContext ok");
 
         _layer = new CAEAGLLayer
         {
@@ -82,8 +85,10 @@ sealed class IosEglContext : INativeContext, IDisposable
                 new NSObject[] { EAGLDrawableProperty.RetainedBacking, EAGLDrawableProperty.ColorFormat }),
         };
         hostView.Layer.AddSublayer(_layer);
+        DiskLog.Log("IosEglContext.Initialize: CAEAGLLayer created and attached");
 
         CreateFramebuffer(width, height);
+        DiskLog.Log($"IosEglContext.Initialize: CreateFramebuffer done, surface {SurfaceWidth}x{SurfaceHeight}");
 
         // IMPORTANT: EAGLContext is thread-affine (like EGL/GLX/WGL contexts
         // generally). Initialize() itself runs on the main thread (see
@@ -103,10 +108,12 @@ sealed class IosEglContext : INativeContext, IDisposable
         // right before the render loop starts) fixes this.
         EAGLContext.SetCurrentContext(null);
         }
+        DiskLog.Log("IosEglContext.Initialize: exit");
     }
 
     void CreateFramebuffer(int width, int height)
     {
+        DiskLog.Log($"IosEglContext.CreateFramebuffer: enter {width}x{height}");
         glGenFramebuffers(1, out _framebuffer);
         glBindFramebuffer(GL_FRAMEBUFFER, _framebuffer);
 
@@ -117,6 +124,7 @@ sealed class IosEglContext : INativeContext, IDisposable
         // drawableProperties/bounds - this is the standard EAGL dance
         // (see Apple's now-retired "Configuring OpenGL ES Contexts" guide).
         _context!.RenderBufferStorage((uint)GL_RENDERBUFFER, _layer!);
+        DiskLog.Log("IosEglContext.CreateFramebuffer: RenderBufferStorage done");
 
         glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_WIDTH, out var w);
         glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_HEIGHT, out var h);
@@ -130,6 +138,7 @@ sealed class IosEglContext : INativeContext, IDisposable
             throw new InvalidOperationException($"EAGL framebuffer incomplete: 0x{status:X}");
 
         glViewport(0, 0, SurfaceWidth, SurfaceHeight);
+        DiskLog.Log($"IosEglContext.CreateFramebuffer: exit, {SurfaceWidth}x{SurfaceHeight}");
     }
 
     /// <summary>
@@ -188,6 +197,7 @@ sealed class IosEglContext : INativeContext, IDisposable
         if (width <= 0 || height <= 0) return;
         if (width == SurfaceWidth && height == SurfaceHeight) return;
 
+        DiskLog.Log($"IosEglContext.SetExpectedSize: {width}x{height} (was {SurfaceWidth}x{SurfaceHeight})");
         lock (_glLock)
         {
             MakeCurrentOnCallingThreadLocked();
@@ -195,6 +205,7 @@ sealed class IosEglContext : INativeContext, IDisposable
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
             CreateFramebuffer(width, height);
         }
+        DiskLog.Log($"IosEglContext.SetExpectedSize: done, now {SurfaceWidth}x{SurfaceHeight}");
     }
 
     public void SwapBuffers()
