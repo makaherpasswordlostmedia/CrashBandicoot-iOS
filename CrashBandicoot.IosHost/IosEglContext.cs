@@ -78,7 +78,13 @@ sealed class IosEglContext : INativeContext, IDisposable
         // OpenGLES3 to match what the shader source actually targets.
         _context = new EAGLContext(EAGLRenderingAPI.OpenGLES3)
             ?? throw new InvalidOperationException("EAGLContext creation failed (OpenGLES3 unavailable - device/OS may not support it).");
-        DiskLog.Log("IosEglContext.Initialize: EAGLContext created");
+        // EAGLContext's initWithAPI: on some iOS versions/devices can
+        // silently hand back a context using a *different* API than
+        // requested instead of returning nil - so confirm what we actually
+        // got rather than trusting the constructor call alone.
+        DiskLog.Log($"IosEglContext.Initialize: EAGLContext created, actual API={_context.API}");
+        if (_context.API != EAGLRenderingAPI.OpenGLES3)
+            throw new InvalidOperationException($"Requested OpenGLES3 but got {_context.API} - GLSL ES 320 shaders will fail to compile.");
         if (!EAGLContext.SetCurrentContext(_context))
             throw new InvalidOperationException("EAGLContext.SetCurrentContext failed.");
         DiskLog.Log("IosEglContext.Initialize: SetCurrentContext ok");
