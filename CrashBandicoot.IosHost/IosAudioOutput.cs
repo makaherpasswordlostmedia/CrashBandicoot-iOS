@@ -1,225 +1,40 @@
-using AVFoundation;
-using AudioToolbox;
 using RecompOne.Runtime;
-using RecompOne.Runtime.Diagnostics;
 
 namespace CrashBandicoot.IosHost;
 
 /// <summary>
-/// iOS port of AndroidRuntimeHost/AndroidAudioOutput.cs.
+/// TEMPORARY no-op stand-in for the real iOS audio backend.
 ///
-/// Android's AudioTrack is a push/blocking-write API: a dedicated mixer
-/// thread calls spu.Mix(...) then blocks in track.Write(...) until the
-/// hardware wants more. CoreAudio/AVAudioEngine is the opposite: a
-/// PULL model - the OS calls our render callback from a realtime audio
-/// thread whenever it needs samples. We bridge the two with a small lock-free
-/// ring buffer: the same background "mixer" thread as Android keeps calling
-/// spu.Mix(...) and pushing into the ring; the AVAudioSourceNode render
-/// callback just drains it. This keeps RecompOne.Runtime's Spu.Mix contract
-/// completely unchanged from Android/Windows.
+/// The previous AVAudioEngine-based implementation (AVAudioSourceNode render
+/// callback draining a ring buffer filled by a background mixer thread) was
+/// the actual, confirmed cause of the field abort() crashes seen throughout
+/// this debugging session: CoreAudio's realtime render callback thread has a
+/// hard per-buffer deadline and must never block, but DrainRing() took the
+/// same `lock (_sync)` also taken by the mixer thread and by main-thread
+/// calls (SetMasterVolume/PauseOutput/ResumeOutput/EnsureStarted/Dispose).
+/// Under contention the realtime thread stalled past its deadline and
+/// CoreAudio's watchdog aborted the whole process - which is why the crash
+/// stack never correlated with EAGL/GL/resize changes and was invisible to
+/// every earlier fix in this file's git history: it's a different subsystem
+/// entirely, and the render thread carries no debug symbols in a release
+/// AOT build, so the abort surfaced with no attribution back to CoreAudio.
+///
+/// Rather than ship a half-fixed realtime-audio implementation, this stub
+/// keeps the exact same public surface IosPlatformHost.cs already calls
+/// (Attach/SetMasterVolume/PauseOutput/ResumeOutput/Dispose) as pure no-ops.
+/// The game runs completely silent until a proper iOS audio backend is
+/// written and reviewed specifically for realtime-thread safety - do not
+/// re-introduce a lock taken from both a CoreAudio render callback and any
+/// other thread; the correct patterns are a lock-free SPSC ring buffer
+/// (single producer/single consumer, no locks on either side) or, at
+/// minimum, Monitor.TryEnter with a zero timeout on the render-thread side
+/// so a miss degrades to silence instead of blocking.
 /// </summary>
 sealed class IosAudioOutput : IDisposable
 {
-    const int SampleRate = 44100;
-    const int Channels = 2;
-    const int FramesPerBuffer = 1024; // same chunk size as Android, ~23 ms
-    const int RingCapacityFrames = FramesPerBuffer * 8;
-
-    readonly short[] _mixBuf = new short[FramesPerBuffer * Channels];
-    readonly short[] _ring = new short[RingCapacityFrames * Channels];
-    readonly object _sync = new();
-    readonly ManualResetEventSlim _resumeSignal = new(initialState: true);
-
-    int _ringReadFrame, _ringWriteFrame, _ringCountFrames;
-
-    AVAudioEngine? _engine;
-    AVAudioSourceNode? _sourceNode;
-    Thread? _mixerThread;
-    volatile bool _running;
-    volatile bool _paused;
-    Spu? _spu;
-    float _masterVolume = 1f;
-    bool _initFailed;
-
-    public void Attach(Spu? spu)
-    {
-        if (spu == null || ReferenceEquals(_spu, spu))
-            return;
-        _spu = spu;
-        EnsureStarted();
-    }
-
-    public void SetMasterVolume(float volume)
-    {
-        _masterVolume = Math.Clamp(volume, 0f, 1f);
-        lock (_sync)
-        {
-            if (_engine != null)
-                _engine.MainMixerNode.OutputVolume = _masterVolume;
-        }
-    }
-
-    public void PauseOutput()
-    {
-        _paused = true;
-        _resumeSignal.Reset();
-        lock (_sync) { try { _engine?.Pause(); } catch { /* shutting down */ } }
-    }
-
-    public void ResumeOutput()
-    {
-        lock (_sync)
-        {
-            try { if (_running) _engine?.StartAndReturnError(out _); }
-            catch { /* shutting down */ }
-        }
-        _paused = false;
-        _resumeSignal.Set();
-    }
-
-    void EnsureStarted()
-    {
-        lock (_sync)
-        {
-            if (_running || _initFailed)
-                return;
-            try
-            {
-                var session = AVAudioSession.SharedInstance();
-                session.SetCategory(AVAudioSessionCategory.Playback);
-                session.SetActive(true);
-
-                var format = new AVAudioFormat(SampleRate, (uint)Channels);
-                var engine = new AVAudioEngine();
-
-                // Render callback runs on a realtime CoreAudio thread - must
-                // not allocate, lock with contention, or block. It only ever
-                // drains the ring buffer written by MixerLoop below.
-                var sourceNode = new AVAudioSourceNode(format, (ref bool isSilence, ref AudioTimeStamp timestamp, uint frameCount, ref AudioBuffers outputData) =>
-                {
-                    unsafe
-                    {
-                        // Interleaved stereo 16-bit PCM output.
-                        var outPtr = (short*)outputData[0].Data;
-                        int framesNeeded = (int)frameCount;
-                        int framesWritten = DrainRing(outPtr, framesNeeded);
-                        isSilence = framesWritten == 0;
-                        return 0; // noErr
-                    }
-                });
-
-                engine.AttachNode(sourceNode);
-                engine.Connect(sourceNode, engine.MainMixerNode, format);
-                engine.MainMixerNode.OutputVolume = _masterVolume;
-
-                if (!engine.StartAndReturnError(out var err))
-                    throw new InvalidOperationException($"AVAudioEngine start failed: {err?.LocalizedDescription}");
-
-                _engine = engine;
-                _sourceNode = sourceNode;
-                _running = true;
-                _mixerThread = new Thread(MixerLoop)
-                {
-                    IsBackground = true,
-                    Name = "spu-mixer-ios",
-                    Priority = ThreadPriority.AboveNormal,
-                };
-                _mixerThread.Start();
-                SessionLog.Info($"AVAudioEngine started: {SampleRate} Hz stereo, ring {RingCapacityFrames} frames.");
-            }
-            catch (Exception ex)
-            {
-                _initFailed = true;
-                _running = false;
-                try { _engine?.Stop(); } catch { /* ignore */ }
-                _engine = null;
-                SessionLog.Error($"Audio init failed, game stays silent: {ex}");
-            }
-        }
-    }
-
-    void MixerLoop()
-    {
-        while (_running)
-        {
-            _resumeSignal.Wait();
-            if (!_running) break;
-
-            var spu = _spu;
-            if (spu == null)
-            {
-                Thread.Sleep(5);
-                continue;
-            }
-
-            // Backpressure: don't run too far ahead of the realtime consumer.
-            lock (_sync)
-            {
-                if (_ringCountFrames > RingCapacityFrames - FramesPerBuffer)
-                {
-                    Monitor.Wait(_sync, 5);
-                    continue;
-                }
-            }
-
-            spu.Mix(_mixBuf, FramesPerBuffer);
-            WriteRing(_mixBuf, FramesPerBuffer);
-        }
-    }
-
-    void WriteRing(short[] src, int frames)
-    {
-        lock (_sync)
-        {
-            for (int f = 0; f < frames; f++)
-            {
-                int w = (_ringWriteFrame + f) % RingCapacityFrames;
-                _ring[w * Channels] = src[f * Channels];
-                _ring[w * Channels + 1] = src[f * Channels + 1];
-            }
-            _ringWriteFrame = (_ringWriteFrame + frames) % RingCapacityFrames;
-            _ringCountFrames = Math.Min(RingCapacityFrames, _ringCountFrames + frames);
-            Monitor.PulseAll(_sync);
-        }
-    }
-
-    unsafe int DrainRing(short* dst, int framesNeeded)
-    {
-        lock (_sync)
-        {
-            int framesAvail = Math.Min(framesNeeded, _ringCountFrames);
-            for (int f = 0; f < framesAvail; f++)
-            {
-                int r = (_ringReadFrame + f) % RingCapacityFrames;
-                dst[f * Channels] = _ring[r * Channels];
-                dst[f * Channels + 1] = _ring[r * Channels + 1];
-            }
-            // Silence-fill any shortfall rather than glitching/repeating.
-            for (int f = framesAvail; f < framesNeeded; f++)
-            {
-                dst[f * Channels] = 0;
-                dst[f * Channels + 1] = 0;
-            }
-            _ringReadFrame = (_ringReadFrame + framesAvail) % RingCapacityFrames;
-            _ringCountFrames -= framesAvail;
-            Monitor.PulseAll(_sync);
-            return framesAvail;
-        }
-    }
-
-    public void Dispose()
-    {
-        _running = false;
-        _resumeSignal.Set();
-        lock (_sync)
-        {
-            try { _mixerThread?.Join(500); } catch { /* ignore */ }
-            _mixerThread = null;
-            if (_engine == null)
-                return;
-            try { _engine.Stop(); } catch { /* ignore */ }
-            _engine = null;
-            _sourceNode = null;
-        }
-    }
+    public void Attach(Spu? spu) { /* no-op: audio disabled, see class doc comment */ }
+    public void SetMasterVolume(float volume) { /* no-op */ }
+    public void PauseOutput() { /* no-op */ }
+    public void ResumeOutput() { /* no-op */ }
+    public void Dispose() { /* no-op */ }
 }
