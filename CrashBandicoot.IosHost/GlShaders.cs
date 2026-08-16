@@ -366,7 +366,17 @@ internal static class GlShaders
     {
         if (!gles) return source;
 
-        var header = "#version 320 es";
+        // "#version 320 es" corresponds to GLES 3.2. iOS's EAGL API only
+        // exposes EAGLRenderingAPI.OpenGLES1/2/3 - there is no GLES-3.2
+        // context option - and EAGLRenderingAPI.OpenGLES3 provides GLES 3.0
+        // (GLSL ES "300 es"), not 3.2. On-device this was confirmed: the
+        // context reports actual API=OpenGLES3 and SetCurrentContext
+        // succeeds, yet glCompileShader still rejects "#version 320 es"
+        // with "version '320' is not supported" - i.e. the context is
+        // real GLES 3.0, and 320 was simply never obtainable on iOS via
+        // this API surface. Use 300 es instead to match what iOS actually
+        // provides.
+        var header = "#version 300 es";
         if (source.Contains("index = 1", StringComparison.Ordinal))
             header += opaqueOnly
                 ? "\n#define GLES_OPAQUE_ONLY 1"
