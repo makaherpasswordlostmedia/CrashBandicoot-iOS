@@ -195,7 +195,12 @@ sealed class GameViewController : UIViewController, IStatusSink
             if (cuePath == null)
             {
                 Checkpoint("RunGame: no .cue found in Documents");
-                SetStatus("No disc image found in Documents. Add a .cue/.bin pair via Files.app and relaunch.", visible: true);
+                SetStatus("No disc image found in Documents. Add a .cue/.bin pair via Files.app, then tap to retry.", visible: true);
+                // Allow ViewDidAppear to spin up a fresh game thread on the
+                // next attempt (e.g. user adds the file and re-triggers via
+                // foregrounding) instead of leaving _gameThread permanently
+                // non-null with no way to retry without relaunching the app.
+                _gameThread = null;
                 return;
             }
 

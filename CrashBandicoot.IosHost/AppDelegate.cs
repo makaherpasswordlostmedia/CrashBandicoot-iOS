@@ -25,15 +25,8 @@ public sealed class AppDelegate : UIApplicationDelegate
         Window = new UIWindow(bounds);
         DiskLog.Log("AppDelegate.FinishedLaunching: UIWindow created");
 
-        // TEMPORARY DIAGNOSTIC: swap GameViewController for a bare
-        // UIViewController to isolate whether the crash is in generic
-        // UIKit window/rootVC bring-up (this trampoline call itself) or
-        // specifically inside GameViewController's own code. If this
-        // still crashes at the same offset, the problem is NOT in
-        // GameViewController - it's in the Mono AOT <-> UIKit trampoline
-        // layer itself, and MtouchUseLlvm=false was not a full fix.
-        Window.RootViewController = new UIViewController();
-        DiskLog.Log("AppDelegate.FinishedLaunching: rootVC assigned (DIAGNOSTIC: bare UIViewController)");
+        Window.RootViewController = new GameViewController();
+        DiskLog.Log("AppDelegate.FinishedLaunching: rootVC assigned (GameViewController)");
 
         Window.MakeKeyAndVisible();
         DiskLog.Log("AppDelegate.FinishedLaunching: window made key and visible");
