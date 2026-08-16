@@ -184,7 +184,7 @@ sealed class GameViewController : UIViewController, IStatusSink
             backend.InitGl(gles: true);
             Checkpoint($"RunGame: GlBackend.InitGl done, Ready={backend.Ready}");
             if (!backend.Ready)
-                throw new InvalidOperationException("GlBackend failed to initialize over EAGL.");
+                throw new InvalidOperationException($"GlBackend failed to initialize over EAGL: {backend.LastDiagnostic}");
 
             var diagnostics = new IosGpuDiagnosticsSession();
             var host = new IosPlatformHost(this, _egl, backend, diagnostics);

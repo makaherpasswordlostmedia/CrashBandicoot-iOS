@@ -71,8 +71,13 @@ sealed class IosEglContext : INativeContext, IDisposable
         DiskLog.Log($"IosEglContext.Initialize: enter {width}x{height}");
         lock (_glLock)
         {
-        _context = new EAGLContext(EAGLRenderingAPI.OpenGLES2)
-            ?? throw new InvalidOperationException("EAGLContext creation failed (OpenGLES2 unavailable).");
+        // GlShaders.AdaptSource emits "#version 320 es" (GLSL ES 3.20,
+        // matching GLES 3.2) for all GLES-path shaders - a GLES2 context
+        // cannot compile that at all (shader compile silently fails,
+        // GlBackend.InitGl then returns with Ready=false). This must be
+        // OpenGLES3 to match what the shader source actually targets.
+        _context = new EAGLContext(EAGLRenderingAPI.OpenGLES3)
+            ?? throw new InvalidOperationException("EAGLContext creation failed (OpenGLES3 unavailable - device/OS may not support it).");
         DiskLog.Log("IosEglContext.Initialize: EAGLContext created");
         if (!EAGLContext.SetCurrentContext(_context))
             throw new InvalidOperationException("EAGLContext.SetCurrentContext failed.");
