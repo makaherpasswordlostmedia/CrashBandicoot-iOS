@@ -122,8 +122,20 @@ public static class Runtime
         Mem = m;
     }
 
+    /// <summary>
+    /// Diagnostics only: incremented every time the recompiled game code
+    /// calls PresentFrame(). This is the game's own main-loop-per-frame
+    /// call, not the host's independent render loop - a climbing count
+    /// here is direct proof the recompiled MIPS-to-C# code is actually
+    /// executing and reaching its main loop, as opposed to being stuck
+    /// somewhere in BIOS dispatch, CD wait, or memory/overlay loading
+    /// before ever calling this.
+    /// </summary>
+    public static long PresentFrameCalls { get; private set; }
+
     public static void PresentFrame()
     {
+        PresentFrameCalls++;
         if (_platformHost != null)
         {
             _platformHost.Present(Gpu);
