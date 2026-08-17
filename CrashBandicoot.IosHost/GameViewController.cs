@@ -145,6 +145,21 @@ sealed class GameViewController : UIViewController, IStatusSink
     void RunGame(int width, int height)
     {
         Checkpoint("RunGame: enter");
+
+        // DIAGNOSTIC: route RecompOne.Runtime.Log category logs (normally
+        // discarded - see Log.Sink's own doc comment, Console.WriteLine is
+        // invisible on a TrollStore-installed binary) into the same
+        // checkpoint.log used everywhere else, and turn on the Gpu/Cd
+        // categories specifically. This targets the observed symptom: CD
+        // sectors keep getting read (sectorsRead climbs into the
+        // thousands) but GlBackend.BeginCalls never leaves 0, i.e. no GP0
+        // draw command is ever issued - these logs should show whether
+        // WriteGp0 is ever reached at all, and what DriveStatus() bits are
+        // actually being reported back to the game on every CD command.
+        RecompOne.Runtime.Log.Sink = DiskLog.Log;
+        RecompOne.Runtime.Log.GpuOn = true;
+        RecompOne.Runtime.Log.CdOn = true;
+
         try
         {
             // AppPaths.Root defaults to Environment.ProcessPath's directory
