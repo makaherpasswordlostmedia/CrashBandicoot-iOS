@@ -25,6 +25,7 @@ sealed class IosPlatformHost(
     int _fpsFrames;
     long _frameCounter;
     bool _lastLoggedHadRt;
+    readonly List<string> _cdEventsScratch = new();
     double _prepareMilliseconds;
     double _surfaceMilliseconds;
     double _swapMilliseconds;
@@ -101,7 +102,7 @@ sealed class IosPlatformHost(
         if (gpu.DisplayToggledSinceLastCheck)
         {
             gpu.DisplayToggledSinceLastCheck = false;
-            DiskLog.Log($"Present: GPU display toggled -> {(gpu.DisplayEnabled ? "ENABLED" : "DISABLED")} at frame {_frameCounter}, size {gpu.DisplayWidth}x{gpu.DisplayHeight}");
+            DiskLog.Log($"Present: GPU display toggled -> {(gpu.DisplayEnabled ? "ENABLED" : "DISABLED")} at frame {_frameCounter}, size {gpu.DisplayWidth}x{gpu.DisplayHeight}, Runtime.PresentFrameCalls so far={Runtime.PresentFrameCalls}");
         }
 
         if (!gpu.DisplayEnabled || !backend.Ready)
@@ -123,7 +124,21 @@ sealed class IosPlatformHost(
         // pause/resume (the known trigger candidates from earlier in this
         // investigation) covers that without flooding the log.
         bool verbose = _frameCounter <= 10 || _frameCounter % 300 == 0;
-        if (verbose) DiskLog.Log($"Present: frame {_frameCounter} begin, gpu {nativeWidth}x{nativeHeight}");
+        if (verbose)
+        {
+            DiskLog.Log($"Present: frame {_frameCounter} begin, gpu {nativeWidth}x{nativeHeight}, Runtime.PresentFrameCalls={Runtime.PresentFrameCalls}");
+            if (Runtime.Cd != null)
+            {
+                Runtime.Cd.CaptureDebug(out var cdDebug, _cdEventsScratch);
+                DiskLog.Log($"Present: frame {_frameCounter} CD state: reading={cdDebug.Reading} streamPending={cdDebug.StreamPending} dataReady={cdDebug.DataReady} seekLba={cdDebug.SeekLba} lastReadLba={cdDebug.LastReadLba} sectorsRead={cdDebug.SectorsRead} irqFlags=0x{cdDebug.IrqFlags:X2} pendingIrqs={cdDebug.PendingIrqCount} paramFifo={cdDebug.ParamCount} responseFifo={cdDebug.ResponseCount}");
+                if (_cdEventsScratch.Count > 0)
+                    DiskLog.Log($"Present: frame {_frameCounter} CD recent events:\n{string.Join("\n", _cdEventsScratch.TakeLast(20))}");
+            }
+            else
+            {
+                DiskLog.Log($"Present: frame {_frameCounter} CD state: Runtime.Cd is null (CdController never constructed)");
+            }
+        }
 
         lock (GlLock)
         {
