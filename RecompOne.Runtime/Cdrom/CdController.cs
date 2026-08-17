@@ -278,6 +278,7 @@ public sealed class CdController
     {
         if (_pendingIrqs.Count > 0) { DeliverNext(); return; }
         if (_reading && _lastIrq == 1) _streamPending = true;
+        DbgEvent($"AfterAck: reading={_reading} lastIrq={_lastIrq} -> streamPending={_streamPending}");
         ClearInInterrupt();
     }
 
@@ -287,6 +288,7 @@ public sealed class CdController
         if (_irqFlags != 0 || _pendingIrqs.Count > 0) return;
         _streamPending = false;
         ReadNextSector();
+        DbgEvent($"AdvanceStreaming: delivered lba={_lastReadLba}, next seekLba={_seekLba}");
         DeliverImmediate(1, [DriveStatus()]);
     }
 
@@ -412,7 +414,25 @@ public sealed class CdController
         QueueIrq(2, [DriveStatus()]);
     }
 
-    private static byte DriveStatus() => 0x02;
+    // Was hardcoded to 0x02 (motor-on only) for every single command,
+    // regardless of whether a ReadN/ReadS was actually in progress. Per
+    // psx-spx, bit5 ("Read") must be set while sectors are streaming, and
+    // some games explicitly poll for that bit transition rather than
+    // relying solely on the INT1 interrupt (the psx-spx GT1 seek-vs-read
+    // note documents exactly this class of bug: a title that watches the
+    // wrong stat bit can stall indefinitely on the loading screen even
+    // though sectors keep getting read under the hood - which matches the
+    // observed symptom here: CD reads never stop, but BeginCalls stays at
+    // 0, i.e. no GP0 draw command has ever been issued). Bit1 (motor) is
+    // now unconditionally set too, since a real drive's motor is spinning
+    // whenever it's not stopped.
+    private byte DriveStatus()
+    {
+        byte s = 0x02; // motor on
+        if (_reading) s |= 0x20; // bit5: Read
+        DbgEvent($"DriveStatus() -> 0x{s:X2} (reading={_reading})");
+        return s;
+    }
 
     private static int BcdToLba(byte mm, byte ss, byte ff)
     {
