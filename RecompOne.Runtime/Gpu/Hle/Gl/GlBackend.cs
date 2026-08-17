@@ -330,12 +330,28 @@ public sealed class GlBackend : IGpuBackend
             && _kClipX0 == _env.ClipX0 && _kClipY0 == _env.ClipY0 && _kClipX1 == _env.ClipX1 && _kClipY1 == _env.ClipY1;
     }
 
+    /// <summary>
+    /// Diagnostics only: total Begin() calls (one per draw primitive batch
+    /// - polygon/line/sprite) and total times Classify() returned null
+    /// (no matching display rect for the current clip region) since
+    /// InitGl. If BeginCalls stays at 0 while frames keep presenting, the
+    /// emulated game has not issued a single GP0 draw command yet (still
+    /// in BIOS/loading, or execution is stuck before the main render
+    /// loop) - that is a very different situation from BeginCalls
+    /// climbing while ClassifyNullCount also climbs in lockstep (draw
+    /// calls are happening, but never finding/creating a matching RT).
+    /// </summary>
+    public long BeginCalls { get; private set; }
+    public long ClassifyNullCount { get; private set; }
+
     void Begin(in PrimFlags f, int vertsNeeded)
     {
+        BeginCalls++;
         bool transparent = f.SemiTrans;
         int blend = f.BlendMode;
         bool subtractBatch = transparent && blend == 2;
         var target = Classify();
+        if (target == null) ClassifyNullCount++;
         if (_count > 0 && (target != _kTarget || !DesiredMatches(transparent, blend))) Flush();
         if (_count + vertsNeeded > MaxVerts) Flush();
         CheckTextureFeedback(f);
