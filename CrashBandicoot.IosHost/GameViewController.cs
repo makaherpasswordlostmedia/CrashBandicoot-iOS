@@ -325,6 +325,8 @@ sealed class GameViewController : UIViewController, IStatusSink
             Checkpoint($"RunGame: disc found at {cuePath}, calling Recompiled.Entry.Run");
             host.Initialize("Crash Bandicoot");
 
+            StartStallWatchdog();
+
             // NOTE: no reflection, no AssemblyLoadContext - Recompiled.Entry
             // is an ordinary type statically compiled into this binary
             // (see Recompiled/ populated by scripts/prerecompile.sh before
@@ -351,6 +353,63 @@ sealed class GameViewController : UIViewController, IStatusSink
             SessionLog.Exception("GameViewController.RunGame", ex);
             SetStatus($"Crashed: {ex.Message}", visible: true);
         }
+    }
+
+    /// <summary>
+    /// Runs on its own background thread and logs a "STALL" line whenever
+    /// Runtime.PresentFrameCalls hasn't advanced for over a second, then
+    /// again as the stall gets longer (2s, 5s, 10s, then every 10s). This
+    /// exists to turn "black screen for a while, then the user gave up and
+    /// closed the app" into an unambiguous answer to "is this normal
+    /// loading, or is execution actually stuck": PresentFrameCalls climbing
+    /// steadily but slowly means real (if slow) progress through
+    /// Recompiled.Entry.Run's main loop every frame; PresentFrameCalls
+    /// frozen at some value while wall-clock time keeps advancing means
+    /// gameplay code has genuinely stopped calling PresentFrame at all -
+    /// almost certainly parked in a BIOS syscall busy-wait (the same shape
+    /// of bug the CdController GetlocL/unhandled-cmd fixes addressed, just
+    /// potentially in a different subsystem - GPU or SPU BIOS calls are the
+    /// next most likely candidates, see Bios/BiosA.cs, BiosB.cs, BiosC.cs).
+    /// A fixed, low-overhead 1s poll is cheap enough to leave running for
+    /// the whole session and never needs its own separate on/off toggle.
+    /// </summary>
+    static void StartStallWatchdog()
+    {
+        var thread = new Thread(() =>
+        {
+            long lastSeenFrame = -1;
+            long stallStartTicks = 0;
+            int nextReportSeconds = 1;
+            while (true)
+            {
+                Thread.Sleep(1000);
+                long frame = RecompOne.Runtime.Runtime.PresentFrameCalls;
+                long now = System.Diagnostics.Stopwatch.GetTimestamp();
+                if (frame != lastSeenFrame)
+                {
+                    lastSeenFrame = frame;
+                    stallStartTicks = now;
+                    nextReportSeconds = 1;
+                    continue;
+                }
+                double stalledSeconds = (now - stallStartTicks) / (double)System.Diagnostics.Stopwatch.Frequency;
+                if (stalledSeconds < nextReportSeconds) continue;
+                DiskLog.Log($"[STALL] PresentFrameCalls stuck at {frame} for {stalledSeconds:F0}s - " +
+                            "gameplay code has not called PresentFrame in this long, almost certainly " +
+                            "parked in a BIOS syscall busy-wait rather than slow-but-progressing loading.");
+                nextReportSeconds = nextReportSeconds switch
+                {
+                    1 => 2,
+                    2 => 5,
+                    5 => 10,
+                    _ => nextReportSeconds + 10,
+                };
+            }
+            // ReSharper disable once FunctionNeverReturns - deliberate:
+            // lives for the process lifetime, same as _gameThread itself.
+        })
+        { IsBackground = true, Name = "stall-watchdog" };
+        thread.Start();
     }
 
     /// <summary>
