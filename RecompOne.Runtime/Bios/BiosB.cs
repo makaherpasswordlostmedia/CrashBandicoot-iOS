@@ -207,7 +207,24 @@ public static class BiosB
             case 0x16: PadRead(m); break;
             case 0x17: break;
             case 0x18: IntrEnvInInterruptAddr = 0u; break;
-            case 0x19: IntrEnvInInterruptAddr = c.A0 != 0u ? c.A0 - 0x36u : 0u; break;
+            case 0x19:
+                IntrEnvInInterruptAddr = c.A0 != 0u ? c.A0 - 0x36u : 0u;
+                // Diagnostics: this is the BIOS call that establishes the
+                // interrupt-handler table Interrupts.Deliver reads from
+                // every frame (see that file's own logging for what
+                // happens if this is never called, or called with A0=0).
+                // Logged unconditionally via Log.Sink (not the gated
+                // Log.Bios) for the same reason as Interrupts.cs - if a
+                // black-screen report ever shows this line is missing
+                // entirely from checkpoint.log, the game never even
+                // attempted to set up its interrupt table, which points
+                // further back (BIOS init order, or a different
+                // registration syscall this emulator doesn't implement -
+                // see the B(19h)/B(18h) syscall table in psx-spx for
+                // siblings that might be the real path this title uses).
+                RecompOne.Runtime.Log.Sink?.Invoke(
+                    $"[BIOS] B(19h) SetIntrEnv: A0=0x{c.A0:X8} -> IntrEnvInInterruptAddr=0x{IntrEnvInInterruptAddr:X8}");
+                break;
             case 0x1A: break;
             case 0x1B: break;
             case 0x1C: break;
