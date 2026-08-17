@@ -24,6 +24,7 @@ sealed class IosPlatformHost(
     long _fpsWindow = System.Diagnostics.Stopwatch.GetTimestamp();
     int _fpsFrames;
     long _frameCounter;
+    bool _lastLoggedHadRt;
     double _prepareMilliseconds;
     double _surfaceMilliseconds;
     double _swapMilliseconds;
@@ -94,7 +95,16 @@ sealed class IosPlatformHost(
         CheatManager.Apply();
         Runtime.RamLog.Tick();
 
-        if (gpu == null || !gpu.DisplayEnabled || !backend.Ready)
+        if (gpu == null)
+            return;
+
+        if (gpu.DisplayToggledSinceLastCheck)
+        {
+            gpu.DisplayToggledSinceLastCheck = false;
+            DiskLog.Log($"Present: GPU display toggled -> {(gpu.DisplayEnabled ? "ENABLED" : "DISABLED")} at frame {_frameCounter}, size {gpu.DisplayWidth}x{gpu.DisplayHeight}");
+        }
+
+        if (!gpu.DisplayEnabled || !backend.Ready)
             return;
 
         var nativeWidth = gpu.DisplayWidth;
@@ -112,7 +122,7 @@ sealed class IosPlatformHost(
         // per-phase logging on the frames immediately after a resize/
         // pause/resume (the known trigger candidates from earlier in this
         // investigation) covers that without flooding the log.
-        bool verbose = _frameCounter <= 5 || _frameCounter % 120 == 0;
+        bool verbose = _frameCounter <= 10 || _frameCounter % 300 == 0;
         if (verbose) DiskLog.Log($"Present: frame {_frameCounter} begin, gpu {nativeWidth}x{nativeHeight}");
 
         lock (GlLock)
@@ -129,7 +139,12 @@ sealed class IosPlatformHost(
         var presented = backend.PresentDisplay(
             gpu.DisplayX, gpu.DisplayY, nativeWidth, nativeHeight, gpu.Display24Bit,
             surfaceWidth, surfaceHeight);
-        if (verbose) DiskLog.Log($"Present: frame {_frameCounter} PresentDisplay done ({presented.w}x{presented.h})");
+        if (backend.LastPresentHadRt != _lastLoggedHadRt)
+        {
+            _lastLoggedHadRt = backend.LastPresentHadRt;
+            DiskLog.Log($"Present: frame {_frameCounter} render target availability changed -> {(backend.LastPresentHadRt ? "HAS RT (drawing real content)" : "NO RT (falling back to raw VRAM)")}");
+        }
+        if (verbose) DiskLog.Log($"Present: frame {_frameCounter} PresentDisplay done ({presented.w}x{presented.h}), hadRt={backend.LastPresentHadRt}");
         var prepared = System.Diagnostics.Stopwatch.GetTimestamp();
         backend.PresentToDefaultFramebuffer(surfaceWidth, surfaceHeight, presented.aspect);
         if (verbose) DiskLog.Log($"Present: frame {_frameCounter} PresentToDefaultFramebuffer done");
@@ -137,6 +152,14 @@ sealed class IosPlatformHost(
         egl.SwapBuffers();
         if (verbose) DiskLog.Log($"Present: frame {_frameCounter} SwapBuffers done");
         var swapped = System.Diagnostics.Stopwatch.GetTimestamp();
+
+        // ~4x/sec at 60fps - frequent enough to visibly confirm the render
+        // loop is alive without a per-frame InvokeOnMainThread flood.
+        if (_frameCounter % 15 == 0)
+        {
+            status.UpdateDebugOverlay(
+                $"frame {_frameCounter}  disp={gpu.DisplayWidth}x{gpu.DisplayHeight}  hadRt={backend.LastPresentHadRt}");
+        }
 
         double ticksToMilliseconds = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
         _prepareMilliseconds += (prepared - phaseStart) * ticksToMilliseconds;
@@ -197,6 +220,7 @@ sealed class IosPlatformHost(
 public interface IStatusSink
 {
     void SetStatus(string text, bool visible);
+    void UpdateDebugOverlay(string text);
 }
 
 /// <summary>

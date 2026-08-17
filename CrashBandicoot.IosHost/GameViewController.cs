@@ -27,6 +27,7 @@ sealed class GameViewController : UIViewController, IStatusSink
 {
     UILabel? _statusLabel;
     UIActivityIndicatorView? _spinner;
+    UILabel? _debugOverlay;
     TouchControllerView? _touchView;
     // volatile: written on crash-game-main (RunGame), read on the main
     // thread (ViewDidLayoutSubviews) with no lock between them. Without
@@ -73,6 +74,26 @@ sealed class GameViewController : UIViewController, IStatusSink
             SetStatus("Dev menu not ported yet (hold detected).", visible: true));
         View.AddSubview(_touchView);
         Checkpoint("ViewDidLoad: subviews attached");
+
+        // Always-visible debug overlay, independent of _statusLabel (which
+        // is hidden after the first Present() call - see SetStatus/
+        // "first frame complete, hiding status"). The point is to answer,
+        // just by looking at the screen with no log pull required, "is the
+        // render loop alive and drawing frames with content, or stuck/
+        // crashed?" - a black screen with a ticking frame counter and
+        // hadRt=true means the game is genuinely rendering black content;
+        // a frozen counter or hadRt=false the whole time points at a real
+        // problem instead.
+        _debugOverlay = new UILabel(new CGRect(4, 20, View.Bounds.Width - 8, 40))
+        {
+            TextColor = UIColor.Green,
+            Font = UIFont.SystemFontOfSize(11),
+            Lines = 2,
+            Text = "debug: waiting for first frame…",
+            BackgroundColor = UIColor.Black.ColorWithAlpha(0.5f),
+        };
+        View.AddSubview(_debugOverlay);
+        Checkpoint("ViewDidLoad: debug overlay added");
     }
 
     public override void ViewDidLayoutSubviews()
@@ -81,6 +102,7 @@ sealed class GameViewController : UIViewController, IStatusSink
         if (_statusLabel != null) _statusLabel.Frame = View!.Bounds;
         if (_spinner != null) _spinner.Center = View!.Center;
         if (_touchView != null) _touchView.Frame = View!.Bounds;
+        if (_debugOverlay != null) _debugOverlay.Frame = new CGRect(4, 20, View!.Bounds.Width - 8, 40);
         // Capture _egl into a local before the null check: this field is
         // written on crash-game-main (RunGame) and read here on the main
         // thread with no lock or volatile between them. Re-reading the
@@ -353,6 +375,25 @@ sealed class GameViewController : UIViewController, IStatusSink
             _statusLabel.Text = text;
             _statusLabel.Hidden = !visible;
             _spinner!.Hidden = !visible;
+        });
+    }
+
+    /// <summary>
+    /// Updates the always-visible debug overlay. Uses InvokeOnMainThread
+    /// like every other UIKit mutation in this class - writing UILabel.Text
+    /// from a background thread is not safe on this AOT/Mono UIKit binding
+    /// (this exact class of background-thread-touches-UIKit bug is what
+    /// several other crashes earlier in this file's history turned out to
+    /// be). Callers on the render thread (IosPlatformHost.Present) are
+    /// expected to throttle how often they call this - see the frame-
+    /// interval check there - rather than relying on this method to
+    /// coalesce anything.
+    /// </summary>
+    public void UpdateDebugOverlay(string text)
+    {
+        InvokeOnMainThread(() =>
+        {
+            if (_debugOverlay != null) _debugOverlay.Text = text;
         });
     }
 }
