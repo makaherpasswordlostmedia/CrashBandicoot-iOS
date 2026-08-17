@@ -125,8 +125,22 @@ public sealed partial class Gpu
         return (uint)(lo | (hi << 16));
     }
 
+    // One-shot diagnostic: logs the very first WriteGp0 call since Gpu was
+    // constructed. If BeginCalls in GlBackend stays at 0 while frames keep
+    // presenting (see its own doc comment), the question is whether *any*
+    // GP0 command is ever issued at all - this answers that independent of
+    // GlBackend's own draw-primitive-specific counting, since not every
+    // GP0 command results in a Begin() call (e.g. E1-E5 are just state
+    // writes, not draws).
+    bool _loggedFirstGp0;
+
     public void WriteGp0(uint word)
     {
+        if (!_loggedFirstGp0)
+        {
+            _loggedFirstGp0 = true;
+            RecompOne.Runtime.Log.Gpu($"WriteGp0: first call ever, word=0x{word:X8}, op=0x{word >> 24:X2}");
+        }
         if (_loadImage) { StoreImageHalfword((ushort)word); StoreImageHalfword((ushort)(word >> 16)); return; }
         if (_polyline)
         {
