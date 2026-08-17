@@ -159,6 +159,7 @@ sealed class GameViewController : UIViewController, IStatusSink
         RecompOne.Runtime.Log.Sink = DiskLog.Log;
         RecompOne.Runtime.Log.GpuOn = true;
         RecompOne.Runtime.Log.CdOn = true;
+        RecompOne.Runtime.Log.SdkOn = true;
 
         try
         {
