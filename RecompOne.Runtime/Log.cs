@@ -10,39 +10,54 @@ public static class Log
     public static bool SdkOn = false;
     public static bool MdecOn = false;
 
+    // Console.WriteLine on iOS writes to stdout, which is not visible
+    // anywhere without an attached debugger/Xcode console session - so on
+    // a device installed via TrollStore, every one of these category logs
+    // was silently discarded. Platform hosts that have their own durable
+    // logging (e.g. CrashBandicoot.IosHost's DiskLog, which appends to
+    // Documents/checkpoint.log) can assign this to also route category
+    // logs there. Left null by default so non-iOS hosts (desktop/Android,
+    // which do have a visible console) see no behavior change.
+    public static Action<string>? Sink;
+
+    static void Emit(string line)
+    {
+        Console.WriteLine(line);
+        Sink?.Invoke(line);
+    }
+
     public static void Mdec(string m)
     {
-        if (MdecOn) Console.WriteLine($"[MDEC] {m}");
+        if (MdecOn) Emit($"[MDEC] {m}");
     }
 
     public static void Bios(string m)
     {
-        if (BiosOn) Console.WriteLine($"[BIOS] {m}");
+        if (BiosOn) Emit($"[BIOS] {m}");
     }
 
     public static void Spu(string m)
     {
-        if (SpuOn)  Console.WriteLine($"[SPU] {m}");
+        if (SpuOn) Emit($"[SPU] {m}");
     }
 
     public static void Gpu(string m)
     {
-        if (GpuOn)  
-            Console.WriteLine($"[GPU] {m}");
+        if (GpuOn) Emit($"[GPU] {m}");
     }
 
     public static void Dma(string m)
     {
-        if (DmaOn)  Console.WriteLine($"[DMA] {m}");
+        if (DmaOn) Emit($"[DMA] {m}");
     }
 
     public static void Cd(string m)
     {
-        if (CdOn)   Console.WriteLine($"[CD] {m}");
+        if (CdOn) Emit($"[CD] {m}");
     }
 
     public static void Sdk(string m)
     {
-        if (SdkOn)  Console.WriteLine($"[SDK] {m}");
+        if (SdkOn) Emit($"[SDK] {m}");
     }
 }
