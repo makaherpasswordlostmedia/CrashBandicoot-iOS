@@ -158,7 +158,8 @@ sealed class IosPlatformHost(
         if (_frameCounter % 15 == 0)
         {
             status.UpdateDebugOverlay(
-                $"frame {_frameCounter}  disp={gpu.DisplayWidth}x{gpu.DisplayHeight}  hadRt={backend.LastPresentHadRt}");
+                $"frame {_frameCounter}  disp={gpu.DisplayWidth}x{gpu.DisplayHeight}  hadRt={backend.LastPresentHadRt}\n" +
+                $"begin={backend.BeginCalls}  classifyNull={backend.ClassifyNullCount}");
         }
 
         double ticksToMilliseconds = 1000.0 / System.Diagnostics.Stopwatch.Frequency;

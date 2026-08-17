@@ -84,11 +84,11 @@ sealed class GameViewController : UIViewController, IStatusSink
         // hadRt=true means the game is genuinely rendering black content;
         // a frozen counter or hadRt=false the whole time points at a real
         // problem instead.
-        _debugOverlay = new UILabel(new CGRect(4, 20, View.Bounds.Width - 8, 40))
+        _debugOverlay = new UILabel(new CGRect(4, 20, View.Bounds.Width - 8, 60))
         {
             TextColor = UIColor.Green,
             Font = UIFont.SystemFontOfSize(11),
-            Lines = 2,
+            Lines = 3,
             Text = "debug: waiting for first frame…",
             BackgroundColor = UIColor.Black.ColorWithAlpha(0.5f),
         };
@@ -102,7 +102,7 @@ sealed class GameViewController : UIViewController, IStatusSink
         if (_statusLabel != null) _statusLabel.Frame = View!.Bounds;
         if (_spinner != null) _spinner.Center = View!.Center;
         if (_touchView != null) _touchView.Frame = View!.Bounds;
-        if (_debugOverlay != null) _debugOverlay.Frame = new CGRect(4, 20, View!.Bounds.Width - 8, 40);
+        if (_debugOverlay != null) _debugOverlay.Frame = new CGRect(4, 20, View!.Bounds.Width - 8, 60);
         // Capture _egl into a local before the null check: this field is
         // written on crash-game-main (RunGame) and read here on the main
         // thread with no lock or volatile between them. Re-reading the
