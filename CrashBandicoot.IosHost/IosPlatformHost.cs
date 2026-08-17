@@ -144,7 +144,7 @@ sealed class IosPlatformHost(
             _lastLoggedHadRt = backend.LastPresentHadRt;
             DiskLog.Log($"Present: frame {_frameCounter} render target availability changed -> {(backend.LastPresentHadRt ? "HAS RT (drawing real content)" : "NO RT (falling back to raw VRAM)")}");
         }
-        if (verbose) DiskLog.Log($"Present: frame {_frameCounter} PresentDisplay done ({presented.w}x{presented.h}), hadRt={backend.LastPresentHadRt}");
+        if (verbose) DiskLog.Log($"Present: frame {_frameCounter} PresentDisplay done ({presented.w}x{presented.h}), hadRt={backend.LastPresentHadRt}, begin={backend.BeginCalls}, classifyNull={backend.ClassifyNullCount}");
         var prepared = System.Diagnostics.Stopwatch.GetTimestamp();
         backend.PresentToDefaultFramebuffer(surfaceWidth, surfaceHeight, presented.aspect);
         if (verbose) DiskLog.Log($"Present: frame {_frameCounter} PresentToDefaultFramebuffer done");
