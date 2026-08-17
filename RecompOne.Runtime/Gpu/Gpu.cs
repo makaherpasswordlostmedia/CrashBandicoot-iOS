@@ -51,6 +51,15 @@ public sealed partial class Gpu
     public bool Display24Bit => _disp24;
     public bool Pal => _pal;
 
+    /// <summary>
+    /// Set whenever GP1(03h) actually flips display enable/disable state
+    /// (not on every GP1(03h) write - only on a real transition). Hosts can
+    /// poll-and-clear this once per Present() to log exactly which frame
+    /// the display turned on, without adding per-frame log spam for a value
+    /// that normally never changes after boot.
+    /// </summary>
+    public bool DisplayToggledSinceLastCheck;
+
     int CyclesPerPixel => _hres368 ? 7 : _hres switch { 0 => 10, 1 => 8, 2 => 5, _ => 4 };
 
     public int DisplayWidth
@@ -150,7 +159,12 @@ public sealed partial class Gpu
             case 0x00: Reset(); break;
             case 0x01: _fifo.Clear(); _polyline = false; _loadImage = false; break;
             case 0x02: break;
-            case 0x03: _displayDisabled = (p & 1) != 0; break;
+            case 0x03:
+                var wasDisabled = _displayDisabled;
+                _displayDisabled = (p & 1) != 0;
+                if (wasDisabled != _displayDisabled)
+                    DisplayToggledSinceLastCheck = true;
+                break;
             case 0x04: _dmaDir = (int)(p & 3); break;
             case 0x10: SetGpuInfo(p); break;
         }
