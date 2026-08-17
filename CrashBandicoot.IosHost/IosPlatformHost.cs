@@ -3,6 +3,7 @@ using RecompOne.Runtime.Config;
 using RecompOne.Runtime.Diagnostics;
 using RecompOne.Runtime.Hle;
 using RecompOne.Runtime.Host.Cheats;
+using System.Linq;
 
 namespace CrashBandicoot.IosHost;
 
@@ -127,6 +128,17 @@ sealed class IosPlatformHost(
         if (verbose)
         {
             DiskLog.Log($"Present: frame {_frameCounter} begin, gpu {nativeWidth}x{nativeHeight}, Runtime.PresentFrameCalls={Runtime.PresentFrameCalls}");
+            // VBlank (irq0) delivery count: see Interrupts.cs doc comment.
+            // Stuck at 0 here while frames keep climbing means every VBlank
+            // is being silently dropped (IntrEnvInInterruptAddr never set,
+            // or set but with no handler registered for irq0) - check for
+            // an accompanying "[IRQ] Interrupts.Deliver: DROPPED" line
+            // logged once nearby. Climbing but GPU still shows begin=0
+            // instead means VBlank handlers *are* running but the game's
+            // own logic inside them isn't reaching a draw call for some
+            // other reason - a meaningfully different bug to chase next.
+            var irqCounts = string.Join(",", Enumerable.Range(0, 4).Select(i => $"irq{i}={Interrupts.DeliveredCount[i]}"));
+            DiskLog.Log($"Present: frame {_frameCounter} IRQ deliveries: {irqCounts}");
             if (Runtime.Cd != null)
             {
                 Runtime.Cd.CaptureDebug(out var cdDebug, _cdEventsScratch);
