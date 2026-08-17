@@ -318,6 +318,16 @@ internal static class GlShaders
         }
         """;
 
+    /// <summary>
+    /// Text of the most recent shader compile/link failure (info log from
+    /// glGetShaderInfoLog/glGetProgramInfoLog). Console.WriteLine alone is
+    /// not reliably visible when running as a TrollStore-sideloaded iOS app
+    /// (no attached console), so callers that need this on-device (e.g.
+    /// GameViewController surfacing GlBackend.LastDiagnostic to the on-screen
+    /// status label / checkpoint.log) should read this after Build() returns 0.
+    /// </summary>
+    public static string? LastError { get; private set; }
+
     public static uint Build(GL gl, string vsSrc, string fsSrc, string name, bool gles = false,
         GlesFramebufferFetchPath framebufferFetch = GlesFramebufferFetchPath.None,
         bool opaqueOnly = false)
@@ -333,7 +343,9 @@ internal static class GlShaders
         gl.GetProgram(prog, ProgramPropertyARB.LinkStatus, out int ok);
         if (ok == 0)
         {
-            Console.WriteLine($"[GlBackend] link failed ({name}): {gl.GetProgramInfoLog(prog)}");
+            var log = $"[GlBackend] link failed ({name}): {gl.GetProgramInfoLog(prog)}";
+            Console.WriteLine(log);
+            LastError = log;
             gl.DeleteProgram(prog);
             prog = 0;
         }
@@ -354,7 +366,17 @@ internal static class GlShaders
     {
         if (!gles) return source;
 
-        var header = "#version 320 es";
+        // "#version 320 es" corresponds to GLES 3.2. iOS's EAGL API only
+        // exposes EAGLRenderingAPI.OpenGLES1/2/3 - there is no GLES-3.2
+        // context option - and EAGLRenderingAPI.OpenGLES3 provides GLES 3.0
+        // (GLSL ES "300 es"), not 3.2. On-device this was confirmed: the
+        // context reports actual API=OpenGLES3 and SetCurrentContext
+        // succeeds, yet glCompileShader still rejects "#version 320 es"
+        // with "version '320' is not supported" - i.e. the context is
+        // real GLES 3.0, and 320 was simply never obtainable on iOS via
+        // this API surface. Use 300 es instead to match what iOS actually
+        // provides.
+        var header = "#version 300 es";
         if (source.Contains("index = 1", StringComparison.Ordinal))
             header += opaqueOnly
                 ? "\n#define GLES_OPAQUE_ONLY 1"
@@ -387,7 +409,9 @@ internal static class GlShaders
         gl.GetShader(sh, ShaderParameterName.CompileStatus, out int ok);
         if (ok == 0)
         {
-            Console.WriteLine($"[GlBackend] compile failed ({name} {type}) {gl.GetShaderInfoLog(sh)}");
+            var log = $"[GlBackend] compile failed ({name} {type}) {gl.GetShaderInfoLog(sh)}";
+            Console.WriteLine(log);
+            LastError = log;
             gl.DeleteShader(sh);
             return 0;
         }

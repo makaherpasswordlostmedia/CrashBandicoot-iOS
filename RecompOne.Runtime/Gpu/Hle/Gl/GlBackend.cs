@@ -89,7 +89,11 @@ public sealed class GlBackend : IGpuBackend
         _progPresent24 = GlShaders.Build(_gl, GlShaders.FullscreenVs, GlShaders.Present24Fs, "present24", gles);
         CheckError("shaders");
         if (_progPrim == 0 || (_glesFramebufferFetchPath != GlesFramebufferFetchPath.None && _progPrimFast == 0) ||
-            _progPresent == 0 || _progPresent24 == 0) return;
+            _progPresent == 0 || _progPresent24 == 0)
+        {
+            LastDiagnostic = $"shader build failed (gles={gles}): {GlShaders.LastError ?? "unknown (no info log captured)"}";
+            return;
+        }
 
         _uTexWindow = _gl.GetUniformLocation(_progPrim, "uTexWindow");
         _uBlend = _gl.GetUniformLocation(_progPrim, "uBlend");
@@ -676,6 +680,17 @@ public sealed class GlBackend : IGpuBackend
 
     public void Present(in HleDispEnv disp) => PresentDisplay(disp.X, disp.Y, disp.W, disp.H, disp.Rgb24);
 
+    /// <summary>
+    /// Set every call by PresentDisplay - lets a host log, without adding
+    /// per-frame log spam itself, whether frames are actually drawing from
+    /// a dirty render target (real game content) or falling back to the
+    /// raw VRAM texture (src == null - typically means nothing has drawn
+    /// into a display-sized RT recently, e.g. still on a boot/loading
+    /// screen that only clears VRAM, or GP0 draw commands aren't reaching
+    /// the RT the display command is reading from).
+    /// </summary>
+    public bool LastPresentHadRt { get; private set; }
+
     public unsafe (uint tex, int w, int h, float aspect) PresentDisplay(int dispX, int dispY, int w, int h, bool rgb24 = false, int outW = 0, int outH = 0)
     {
         if (!Ready || w <= 0 || h <= 0) return (0, 0, 0, GpuHle.OutputAspect);
@@ -710,6 +725,7 @@ public sealed class GlBackend : IGpuBackend
 
         // Only show side margins while FOV expand is filling them. Otherwise present the
         // 4:3 core alone (clean black pillars) — avoids flickering stale gutter pixels.
+        LastPresentHadRt = src != null;
         bool showWide = src is { Margin: > 0 } && GpuHle.WideFovActive;
         int w1x = showWide ? w + src!.Margin * 2 : w;
         int h1x = h;
