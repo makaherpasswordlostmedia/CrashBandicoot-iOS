@@ -74,9 +74,12 @@ public static class LibCdStream
 
     public static void StSetMask(CpuContext c, IMemory m) { c.V0 = 0; Log.Sdk("StSetMask"); }
 
+    static long _getNextCalls, _getNextEmpty;
+
     public static void StGetNext(CpuContext c, IMemory m)
     {
         if (!_active) { c.V0 = 1; return; }
+        _getNextCalls++;
 
         lock (_lock)
         {
@@ -86,7 +89,20 @@ public static class LibCdStream
                 _prevStart = -1;
             }
 
-            if (_ready.Count == 0) { c.V0 = 1; return; }
+            if (_ready.Count == 0)
+            {
+                _getNextEmpty++;
+                // DIAGNOSTIC: logs every 500th empty poll, so a persistently
+                // stuck loading screen shows up as a long run of these with
+                // _getNextEmpty tracking _getNextCalls almost 1:1 - i.e.
+                // the ring is essentially always empty, meaning
+                // StreamLoop's video-magic filter (see its own diagnostic
+                // log above) is never finding a matching sector to hand
+                // over.
+                if (_getNextEmpty % 500 == 0)
+                    RecompOne.Runtime.Log.Sdk($"StGetNext: empty (calls={_getNextCalls}, empty={_getNextEmpty}, streamLba={_streamLba})");
+                c.V0 = 1; return;
+            }
 
             var (start, n) = _ready.Dequeue();
             uint dataPtr = _dataBase + (uint)(start * SlotData);
@@ -162,7 +178,29 @@ public static class LibCdStream
             catch { Thread.Sleep(2); continue; }
 
             if ((sec[2] & 0x04) != 0) { XaAudio.DecodeSector(sec, 8, sec[3]); _streamLba++; continue; }
-            if (Read16(sec, 8) != VideoMagic || Read16(sec, 12) != 0) { _streamLba++; continue; }
+            if (Read16(sec, 8) != VideoMagic || Read16(sec, 12) != 0)
+            {
+                // DIAGNOSTIC: this filter only accepts STR/video-format
+                // sectors (magic 0x0160 at offset 8, channel 0 at offset
+                // 12). Any other sector - including a game using
+                // StSetStream/StGetNext for plain data streaming rather
+                // than FMV playback - is silently skipped forever here,
+                // which starves StGetNext (always returns V0=1, "not
+                // ready") indefinitely. That matches the observed symptom
+                // exactly: CD reads never stop, but the game never
+                // progresses past its loading screen. Logging every 200th
+                // skip (not every one - this runs per-sector, i.e.
+                // hundreds of times/sec) to see what magic/channel values
+                // are actually showing up without flooding checkpoint.log.
+                if (_streamLba % 200 == 0)
+                {
+                    RecompOne.Runtime.Log.Sdk(
+                        $"StreamLoop: skip lba={_streamLba}, mode={sec[2]:X2}, " +
+                        $"magic=0x{Read16(sec, 8):X4} (want 0x{VideoMagic:X4}), " +
+                        $"chan={Read16(sec, 12)} (want 0)");
+                }
+                _streamLba++; continue;
+            }
 
             int n = Read16(sec, 14);
             if (n <= 0 || n > _slots) { _streamLba++; continue; }
