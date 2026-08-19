@@ -30,9 +30,45 @@ public static class LibEtc
         uint target = c.A0;
         uint count = m.ReadU32(VBlankCountAddr);
 
+        // Diagnostics/safety net for the black-screen investigation: this
+        // loop runs synchronously inside a single MIPS call, calling
+        // Runtime.PresentFrame() itself on every iteration via
+        // AdvanceVBlank - which is exactly why PresentFrameCalls climbs
+        // steadily even while the game's own main loop never gets back
+        // control to reach its next GP0 draw call. If `target` is ever
+        // wrong (corrupted A0/register, or the game genuinely asking to
+        // wait for a vblank count far in the future - e.g. target
+        // underflowed to a huge value if the game intended a *relative*
+        // wait but this HLE treats A0 as absolute), this loop had no upper
+        // bound at all and could spin here indefinitely, which would look
+        // exactly like every earlier field report: PresentFrameCalls (and
+        // therefore Interrupts.DeliveredCount[0]) both climbing forever,
+        // BeginCalls stuck at 0, because control never returns to the
+        // caller. Logged once if the wait turns out to be unusually long
+        // (>= 600 vblanks, ~10s at 60Hz - well beyond any legitimate
+        // "wait for the next frame or two" use) so this shows up
+        // unambiguously in checkpoint.log instead of being silently
+        // indistinguishable from healthy gameplay.
+        uint startCount = count;
+        long spins = 0;
+        const long logThreshold = 600;
+        bool loggedLong = false;
+
         while (count < target)
         {
             count = AdvanceVBlank(c, m);
+            spins++;
+            if (!loggedLong && spins == logThreshold)
+            {
+                loggedLong = true;
+                RecompOne.Runtime.Log.Sink?.Invoke($"[VSYNC] LibEtc.VSync: still waiting after {spins} vblanks - " +
+                    $"target={target}, startCount={startCount}, currentCount={count}. " +
+                    "This is far longer than any normal 'wait one or two frames' call " +
+                    "and points at target being wrong (see this method's doc comment) " +
+                    "rather than legitimate gameplay - if this is the *only* place " +
+                    "execution is stuck, it explains a climbing PresentFrameCalls/" +
+                    "Interrupts irq0 count with GlBackend.BeginCalls stuck at 0.");
+            }
         }
 
         c.V0 = 0;
