@@ -101,7 +101,14 @@ public static class LibCd
 
         for (int i = 0; i < sectors; i++)
         {
-            Dispatcher.LoadByLba(lba + i);
+            // NOTE: previously called Dispatcher.LoadByLba(lba + i) here on every
+            // sector. That re-triggered overlay loading (incl. Console.WriteLine
+            // and OverlayLoadedEvent dispatch) up to `sectors` times per CdRead
+            // (observed sectors=128 in the field), which could re-enter code that
+            // itself waits on CD state -- causing the emu/render thread to stall
+            // indefinitely on a single CdRead call. The overlay for the read
+            // range is already loaded once above via LoadByLba(lba); per-sector
+            // reload is unnecessary and unsafe here.
             byte[] data;
             lock (DiscLock) data = Runtime.Cd!.ReadSectorData(lba + i, size);
             m.LoadBytes(buf + (uint)(i * size), data);
