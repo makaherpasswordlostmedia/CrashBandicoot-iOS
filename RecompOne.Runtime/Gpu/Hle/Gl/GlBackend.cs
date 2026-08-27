@@ -180,6 +180,12 @@ public sealed class GlBackend : IGpuBackend
         _gl.BindTexture(TextureTarget.Texture2D, _presentTex);
         _gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)GLEnum.Linear);
         _gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)GLEnum.Linear);
+        // Default wrap mode is GL_REPEAT; PresentToDefaultFramebuffer's Y-flip
+        // pushes sampled UVs right up against the 0/1 edge, where REPEAT can
+        // wrap a 1px seam in from the opposite edge. ClampToEdge is correct
+        // for a single full-surface blit like this.
+        _gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapS, (int)GLEnum.ClampToEdge);
+        _gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapT, (int)GLEnum.ClampToEdge);
         _presentFbo = _gl.GenFramebuffer();
         _gl.BindFramebuffer(FramebufferTarget.Framebuffer, _presentFbo);
         _gl.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.ColorAttachment0, TextureTarget.Texture2D, _presentTex, 0);
@@ -906,8 +912,10 @@ public sealed class GlBackend : IGpuBackend
         _gl.Disable(EnableCap.Blend);
         _gl.Disable(EnableCap.ScissorTest);
         _gl.Disable(EnableCap.CullFace);
-        // Magenta makes the EGL surface/viewport visible while validating the
-        // direct Android presentation path; the final build restores black.
+        // Black clear behind the blit (letterbox/pillarbox bars). A previous
+        // debug pass used magenta here to make the EGL surface/viewport
+        // visible while validating the direct presentation path; that's
+        // reverted to black for normal builds.
         _gl.ClearColor(0f, 0f, 0f, 1f);
         _gl.Clear(ClearBufferMask.ColorBufferBit);
 
