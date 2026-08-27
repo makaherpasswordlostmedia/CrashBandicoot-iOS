@@ -150,6 +150,16 @@ sealed class IosPlatformHost(
             {
                 DiskLog.Log($"Present: frame {_frameCounter} CD state: Runtime.Cd is null (CdController never constructed)");
             }
+            // Last function address Dispatcher.Call reached and how many
+            // calls total. If this address stops changing between two
+            // verbose frames while PresentFrameCalls keeps climbing, the
+            // game's CPU thread is stuck calling the same function
+            // (or stuck inside it, e.g. a spin loop that never calls back
+            // out through Dispatcher.Call) - if it keeps changing, calls
+            // are still happening normally and the stall is elsewhere
+            // (a specific HLE function that loops internally, like
+            // LibEtc.VSync - see its own long-wait diagnostic).
+            DiskLog.Log($"Present: frame {_frameCounter} Dispatcher: lastCallAddr=0x{RecompOne.Runtime.Dispatch.Dispatcher.LastCallAddr:X8} callCount={RecompOne.Runtime.Dispatch.Dispatcher.CallCount}");
         }
 
         lock (GlLock)
