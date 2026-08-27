@@ -43,9 +43,19 @@ sealed class IosPlatformHost(
         status.SetStatus($"{title}: first frame incoming…", visible: true);
     }
     public void WaitForValidDisc() { }
+    bool _attachAudioLogged;
     public void AttachAudio(Spu? spu)
     {
-        DiskLog.Log("IosPlatformHost.AttachAudio");
+        // Called every PresentFrame() (i.e. every game frame), not just on
+        // attach/detach transitions - logging unconditionally here was
+        // spamming the disk log with thousands of identical lines per
+        // session, drowning out everything else. Log once so we still get
+        // proof the call path is being hit.
+        if (!_attachAudioLogged)
+        {
+            _attachAudioLogged = true;
+            DiskLog.Log("IosPlatformHost.AttachAudio (further calls suppressed)");
+        }
         _audio.Attach(spu);
     }
     public void SetMasterVolume(float volume) => _audio.SetMasterVolume(volume);
@@ -92,13 +102,37 @@ sealed class IosPlatformHost(
     /// </summary>
     public object GlLock => egl.GlLockObject;
 
+    // Tracks the reason the last call to Present() bailed out before
+    // drawing anything (blank/black-screen candidates below), and only
+    // logs on the edge - the moment the reason changes - rather than every
+    // call. Silent early-returns here were the prime suspect for the
+    // black-screen reports: nothing else in this method logs unless a
+    // frame actually gets far enough to draw, so a stall caused by one of
+    // these guards produced zero log output and looked indistinguishable
+    // from "app just isn't calling Present anymore" after the fact.
+    string? _lastPresentSkipReason;
+
+    void LogSkipReasonChange(string? reason)
+    {
+        if (reason == _lastPresentSkipReason)
+            return;
+        _lastPresentSkipReason = reason;
+        if (reason != null)
+            DiskLog.Log($"Present: frame {_frameCounter} STALLED, not drawing - reason: {reason}");
+        else
+            DiskLog.Log($"Present: frame {_frameCounter} resumed drawing (skip condition cleared)");
+    }
+
     public void Present(Gpu? gpu)
     {
         CheatManager.Apply();
         Runtime.RamLog.Tick();
 
         if (gpu == null)
+        {
+            LogSkipReasonChange("gpu is null (Runtime.Gpu never constructed / disc not loaded yet)");
             return;
+        }
 
         if (gpu.DisplayToggledSinceLastCheck)
         {
@@ -106,13 +140,26 @@ sealed class IosPlatformHost(
             DiskLog.Log($"Present: GPU display toggled -> {(gpu.DisplayEnabled ? "ENABLED" : "DISABLED")} at frame {_frameCounter}, size {gpu.DisplayWidth}x{gpu.DisplayHeight}, Runtime.PresentFrameCalls so far={Runtime.PresentFrameCalls}");
         }
 
-        if (!gpu.DisplayEnabled || !backend.Ready)
+        if (!gpu.DisplayEnabled)
+        {
+            LogSkipReasonChange($"gpu.DisplayEnabled=false (size would've been {gpu.DisplayWidth}x{gpu.DisplayHeight})");
             return;
+        }
+        if (!backend.Ready)
+        {
+            LogSkipReasonChange("backend.Ready=false (GL backend not initialized or lost, e.g. after context loss on resume)");
+            return;
+        }
 
         var nativeWidth = gpu.DisplayWidth;
         var nativeHeight = gpu.DisplayHeight;
         if (nativeWidth <= 0 || nativeHeight <= 0)
+        {
+            LogSkipReasonChange($"invalid display size {nativeWidth}x{nativeHeight}");
             return;
+        }
+
+        LogSkipReasonChange(null);
 
         _frameCounter++;
         // Heartbeat every 120 frames (~2s at 60fps) rather than every frame:
