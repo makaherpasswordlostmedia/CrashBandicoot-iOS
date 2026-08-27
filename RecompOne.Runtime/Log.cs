@@ -9,6 +9,7 @@ public static class Log
     public static bool CdOn = false;
     public static bool SdkOn = false;
     public static bool MdecOn = false;
+    public static bool OverlayOn = false;
 
     // Console.WriteLine on iOS writes to stdout, which is not visible
     // anywhere without an attached debugger/Xcode console session - so on
@@ -59,5 +60,18 @@ public static class Log
     public static void Sdk(string m)
     {
         if (SdkOn) Emit($"[SDK] {m}");
+    }
+
+    // Console.WriteLine("[Dispatcher] ...") calls elsewhere in Dispatcher.cs
+    // predate this Sink mechanism and still go straight to Console.WriteLine,
+    // so on iOS/TrollStore (no attached console) they were invisible in
+    // checkpoint.log same as every other category before Sink existed - this
+    // gives overlay loading a route into the same durable log the CD/SDK
+    // traces already use, on by default since it's the thing currently being
+    // diagnosed (a black screen caused by an overlay never loading).
+    public static bool OverlayOnDefaultTrue = true;
+    public static void Overlay(string m)
+    {
+        if (OverlayOn || OverlayOnDefaultTrue) Emit($"[OVERLAY] {m}");
     }
 }
