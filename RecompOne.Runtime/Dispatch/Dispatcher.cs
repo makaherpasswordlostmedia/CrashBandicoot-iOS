@@ -201,8 +201,8 @@ public static class Dispatcher
     // the CPU loop itself, or a BIOS HLE call that never returns).
     // Volatile: read from PresentFrame() on the render thread while written
     // from the emulated CPU thread.
-    internal static volatile uint LastCallAddr;
-    internal static long CallCount;
+    public static volatile uint LastCallAddr;
+    public static long CallCount;
 
     public static void Call(CpuContext c, IMemory m, uint addr)
     {
