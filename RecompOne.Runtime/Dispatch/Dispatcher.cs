@@ -38,12 +38,19 @@ public static class Dispatcher
         _pending = overlay;
     }
 
-    public static void NotifyWrite(uint phys)
+    public static void NotifyWrite(uint phys, uint size = 1)
     {
         var p = _pending;
         if (p == null) return;
         uint start = p.Base & 0x1FFFFFFFu;
-        if (phys < start || phys >= start + 0x800u) return;
+        uint end = start + 0x800u;
+        // Overlap test between the written range [phys, phys+size) and the
+        // pending overlay's load window [start, end), not a single-point
+        // containment check - a bulk CD-read write (LoadBytes) that starts
+        // before the overlay's address but extends into or across it must
+        // still trigger the load. size defaults to 1 so single-byte/aligned
+        // WriteU8/16/32 callers keep their previous point-check behavior.
+        if (phys >= end || phys + size <= start) return;
         _pending = null;
         Load(p.Name);
     }
