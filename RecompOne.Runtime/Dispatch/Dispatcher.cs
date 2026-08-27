@@ -2,7 +2,6 @@ using RecompOne.Runtime.Context;
 using RecompOne.Runtime.Events;
 using RecompOne.Runtime.Memory;
 using BiosKernel = RecompOne.Runtime.Bios.Bios;
-
 namespace RecompOne.Runtime.Dispatch;
 
 public static class Dispatcher
@@ -31,10 +30,12 @@ public static class Dispatcher
         if (!_lbaToName.TryGetValue(lba, out var name)) return;
         var overlay = _registry[name];
         if(overlay.Base == 0) {
+            Log.Overlay($"LoadByLba: lba={lba} -> '{name}' has no Base, loading immediately");
             Load(name);
             return;
         }
 
+        Log.Overlay($"LoadByLba: lba={lba} -> '{name}' pending, waiting for write into 0x{overlay.Base:X8}..0x{overlay.Base + overlay.Size:X8}");
         _pending = overlay;
     }
 
@@ -43,14 +44,27 @@ public static class Dispatcher
         var p = _pending;
         if (p == null) return;
         uint start = p.Base & 0x1FFFFFFFu;
-        uint end = start + 0x800u;
+        // Was hardcoded to start + 0x800 (2KB) - a leftover guess from before
+        // overlays carried their own Size. Real overlays are the full CD
+        // binary length (OverlayWriter emits Size = discBin.Length), commonly
+        // tens to hundreds of KB, so a 2KB window could miss a write that
+        // lands anywhere past the first 2KB of the overlay's own range -
+        // exactly the failure mode the interval-overlap fix above was
+        // supposed to close. Use the overlay's actual size instead.
+        uint overlaySize = p.Size > 0 ? p.Size : 0x800u;
+        uint end = start + overlaySize;
         // Overlap test between the written range [phys, phys+size) and the
         // pending overlay's load window [start, end), not a single-point
         // containment check - a bulk CD-read write (LoadBytes) that starts
         // before the overlay's address but extends into or across it must
         // still trigger the load. size defaults to 1 so single-byte/aligned
         // WriteU8/16/32 callers keep their previous point-check behavior.
-        if (phys >= end || phys + size <= start) return;
+        if (phys >= end || phys + size <= start)
+        {
+            Log.Overlay($"NotifyWrite: MISS write=[0x{phys:X8}..0x{phys + size:X8}) vs pending '{p.Name}' window=[0x{start:X8}..0x{end:X8})");
+            return;
+        }
+        Log.Overlay($"NotifyWrite: HIT write=[0x{phys:X8}..0x{phys + size:X8}) overlaps pending '{p.Name}' window=[0x{start:X8}..0x{end:X8}) -> loading");
         _pending = null;
         Load(p.Name);
     }
@@ -72,7 +86,12 @@ public static class Dispatcher
 
         if (already) return;
         Runtime.OverlayLog.Record(name, OverlayEventKind.Loaded);
-        Console.WriteLine($"[Dispatcher] loaded overlay: {name}");
+        // Was Console.WriteLine only, which on iOS/TrollStore has no attached
+        // console and is silently discarded - checkpoint.log never showed a
+        // single "loaded overlay" line across any session, which is exactly
+        // why this stall was invisible before. Route it through Log.Overlay
+        // (durable, goes to checkpoint.log) instead/in addition.
+        Log.Overlay($"loaded overlay: {name} ({overlay.Functions.Count} functions, base=0x{overlay.Base:X8}, size=0x{overlay.Size:X})");
 
         if (Event.HasAnyListeners<OverlayLoadedEvent>())
         {
@@ -133,7 +152,7 @@ public static class Dispatcher
             foreach (var d in overwritten)
             {
                 Runtime.OverlayLog.Record(d, OverlayEventKind.Overwritten, overlay.Name);
-                Console.WriteLine($"[Dispatcher] overlay {d} overwritten by {overlay.Name}");
+                Log.Overlay($"overlay {d} overwritten by {overlay.Name}");
             }
         }
 
@@ -142,7 +161,7 @@ public static class Dispatcher
             foreach (var (otherName, n) in vramCollisions)
             {
                 Runtime.OverlayLog.Record(overlay.Name, OverlayEventKind.VramCollision, $"{otherName} ({n} funcs)");
-                Console.WriteLine($"[Dispatcher] overlay {overlay.Name} vvram colision with {otherName}: {n} functions");
+                Log.Overlay($"overlay {overlay.Name} vram collision with {otherName}: {n} functions");
             }
         }
     }
@@ -173,8 +192,22 @@ public static class Dispatcher
         Runtime.OverlayLog.Record(name, OverlayEventKind.Unloaded);
     }
 
+    // Diagnostics for the black-screen investigation: "last function address
+    // Dispatcher.Call actually reached" is the single most useful fact we
+    // don't otherwise have once GlBackend.BeginCalls is stuck at 0 - it
+    // tells us whether the game is still making normal calls (and if so,
+    // which one it's stuck inside/before) versus never getting into
+    // Dispatcher.Call at all after some point (which would instead point at
+    // the CPU loop itself, or a BIOS HLE call that never returns).
+    // Volatile: read from PresentFrame() on the render thread while written
+    // from the emulated CPU thread.
+    internal static volatile uint LastCallAddr;
+    internal static long CallCount;
+
     public static void Call(CpuContext c, IMemory m, uint addr)
     {
+        LastCallAddr = addr;
+        CallCount++;
         Sdk.LibEtc.MaybeCatchUpVBlank();
         if (BiosKernel.TryDispatch(c, m, addr)) return;
         if (!_funcMap.TryGetValue(addr, out var fn))
