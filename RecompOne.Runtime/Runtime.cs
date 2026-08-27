@@ -148,6 +148,16 @@ public static class Runtime
         }
         FrameClock.Throttle();
         Sdk.LibCd.Tick();
+        // CdController.AdvanceStreaming() picks up where AfterAck() left
+        // _streamPending = true after a ReadN/ReadS's first-sector IRQ is
+        // acked. Nothing was calling it, so BIOS-level CD streaming
+        // delivered exactly one sector per read command and then went
+        // silent forever - the game's loading loop kept re-issuing
+        // Setloc/ReadN for the same block waiting on data that would
+        // never arrive (matches "sectorsRead stuck, reading=False,
+        // same LBA range repeated" in checkpoint.log). Tick it here,
+        // once per frame, right alongside the existing SDK-level CD tick.
+        Cd?.AdvanceStreaming();
         if (Mem != null) { Bios.BiosB.RefreshPad(Mem); Sdk.LibPad.Refresh(Mem); }
         DispatchIrq(0); //using this to dispatch irqs too if necessary, probably not needed after the rest of stuff is reimplemented
     }
