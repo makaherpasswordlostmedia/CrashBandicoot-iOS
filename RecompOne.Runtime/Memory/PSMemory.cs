@@ -54,7 +54,16 @@ public sealed class PSMemory : IMemory
         {
             uint off = phys % (uint)_ram.Length;
             Runtime.RamLog.RecordWrite(phys % (uint)_ram.Length, size);
-            Dispatcher.NotifyWrite(off);
+            // NotifyWrite used to get only the start offset (off), so it could
+            // only catch an overlay's load address if a write happened to
+            // begin exactly inside that 0x800-byte window. LoadBytes writes
+            // whole CD-read blocks (seen up to 192 sectors = ~393KB in one
+            // call) in a single TrackWrite, so the block's start address is
+            // almost never the overlay's start - the write covers the
+            // overlay's range but starts well before or after it, and the
+            // point check always misses. Passing the size lets NotifyWrite
+            // test the actual written range for overlap instead of one point.
+            Dispatcher.NotifyWrite(off, (uint)size);
         }
 
     }
