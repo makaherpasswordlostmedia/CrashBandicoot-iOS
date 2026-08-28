@@ -99,6 +99,22 @@ public static class LibCd
         Dispatcher.LoadByLba(lba);
         Log.Sdk($"CdRead sectors={sectors} buf=0x{buf:X8} mode=0x{_mode:X2} lba={lba} size={size}");
 
+        // Instrumented per the black-screen/freeze investigation: earlier
+        // attempts to fix this by guessing at the cause (per-sector overlay
+        // reload, cold file-page warmup) didn't hold up under a real trace,
+        // so this times the two halves of the loop separately - actual
+        // disk I/O (ReadSectorData under DiscLock) vs. the emulated-memory
+        // write (LoadBytes) - and logs which one actually ate the time,
+        // plus a per-sector breakdown of the single slowest sector so we
+        // can tell "one bad sector" from "uniformly slow throughout" from
+        // "lock contention with another thread" (that last one would show
+        // as time spent that ReadSectorData's own internal timing doesn't
+        // account for).
+        var totalSw = System.Diagnostics.Stopwatch.StartNew();
+        long ioTicks = 0, memTicks = 0;
+        long worstSectorTicks = 0;
+        int worstSectorIndex = -1;
+        var stepSw = new System.Diagnostics.Stopwatch();
         for (int i = 0; i < sectors; i++)
         {
             // NOTE: previously called Dispatcher.LoadByLba(lba + i) here on every
@@ -110,8 +126,27 @@ public static class LibCd
             // range is already loaded once above via LoadByLba(lba); per-sector
             // reload is unnecessary and unsafe here.
             byte[] data;
+            stepSw.Restart();
             lock (DiscLock) data = Runtime.Cd!.ReadSectorData(lba + i, size);
+            stepSw.Stop();
+            ioTicks += stepSw.ElapsedTicks;
+            if (stepSw.ElapsedTicks > worstSectorTicks) { worstSectorTicks = stepSw.ElapsedTicks; worstSectorIndex = i; }
+
+            stepSw.Restart();
             m.LoadBytes(buf + (uint)(i * size), data);
+            stepSw.Stop();
+            memTicks += stepSw.ElapsedTicks;
+        }
+        totalSw.Stop();
+        if (totalSw.ElapsedMilliseconds > 200)
+        {
+            double toMs = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            Log.Sdk($"SLOW CdRead: {sectors} sectors, total={totalSw.ElapsedMilliseconds}ms " +
+                    $"(disk I/O={ioTicks * toMs:F0}ms, memory write={memTicks * toMs:F0}ms), " +
+                    $"worst single sector=lba {lba + worstSectorIndex} took {worstSectorTicks * toMs:F0}ms - " +
+                    "if I/O dominates and one sector isn't an outlier, it's genuinely slow storage access " +
+                    "for this region; if worst sector is a big fraction of the whole thing, it's a one-off " +
+                    "stall (lock contention or a single cold page) rather than uniformly slow reading.");
         }
         _lastIntr = Complete;
         c.V0 = 1;
