@@ -178,32 +178,24 @@ public static class LibCdStream
             catch { Thread.Sleep(2); continue; }
 
             if ((sec[2] & 0x04) != 0) { XaAudio.DecodeSector(sec, 8, sec[3]); _streamLba++; continue; }
-            if (Read16(sec, 8) != VideoMagic || Read16(sec, 12) != 0)
-            {
-                // DIAGNOSTIC: this filter only accepts STR/video-format
-                // sectors (magic 0x0160 at offset 8, channel 0 at offset
-                // 12). Any other sector - including a game using
-                // StSetStream/StGetNext for plain data streaming rather
-                // than FMV playback - is silently skipped forever here,
-                // which starves StGetNext (always returns V0=1, "not
-                // ready") indefinitely. That matches the observed symptom
-                // exactly: CD reads never stop, but the game never
-                // progresses past its loading screen. Logging every 200th
-                // skip (not every one - this runs per-sector, i.e.
-                // hundreds of times/sec) to see what magic/channel values
-                // are actually showing up without flooding checkpoint.log.
-                if (_streamLba % 200 == 0)
-                {
-                    RecompOne.Runtime.Log.Sdk(
-                        $"StreamLoop: skip lba={_streamLba}, mode={sec[2]:X2}, " +
-                        $"magic=0x{Read16(sec, 8):X4} (want 0x{VideoMagic:X4}), " +
-                        $"chan={Read16(sec, 12)} (want 0)");
-                }
-                _streamLba++; continue;
-            }
 
-            int n = Read16(sec, 14);
-            if (n <= 0 || n > _slots) { _streamLba++; continue; }
+            // FIXED: previously required magic=0x0160 && chan==0 (STR/FMV
+            // sectors only), which starved StGetNext forever whenever the
+            // game used StSetStream/StGetNext for plain data (e.g. level
+            // geometry) streaming instead of video playback - CD reads
+            // never stopped, but the ring stayed empty and the loading
+            // screen never advanced (see git history for the diagnostic
+            // that found this). The real PS1 SDK doesn't filter here: it
+            // hands every non-XA-audio sector to the caller via StGetNext
+            // and lets the game's own STR/data parser decide what to do
+            // with it based on the sector header. We do the same: accept
+            // any sector that isn't XA audio, and only use the STR magic
+            // to decide how many logical "frame" sectors to batch (n),
+            // falling back to delivering a single sector at a time for
+            // non-STR data so nothing gets silently dropped.
+            bool isStr = Read16(sec, 8) == VideoMagic && Read16(sec, 12) == 0;
+            int n = isStr ? Read16(sec, 14) : 1;
+            if (n <= 0 || n > _slots) n = 1;
 
             double delivered = _clock.Elapsed.TotalSeconds * LibCd.SectorsPerSecond;
             if ((_streamLba - _streamStartLba) + n > delivered) { Thread.Sleep(1); continue; }
@@ -241,7 +233,12 @@ public static class LibCdStream
             lba++;
 
             if ((sec[2] & 0x04) != 0) { XaAudio.DecodeSector(sec, 8, sec[3]); continue; }
-            if (Read16(sec, 8) != VideoMagic) continue;
+            // FIXED: was `if (Read16(sec, 8) != VideoMagic) continue;` here
+            // too, which for non-STR data sectors meant this while loop
+            // (collected < n) could spin forever advancing lba without
+            // ever incrementing collected. Non-XA sectors are now always
+            // collected regardless of magic - see the StreamLoop comment
+            // above for why filtering on STR magic was wrong in general.
 
             uint hdr = _statusBase + (uint)((start + collected) * HeaderSize);
             uint dat = _dataBase + (uint)((start + collected) * SlotData);
