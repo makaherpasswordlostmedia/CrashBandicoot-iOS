@@ -14,7 +14,62 @@ public sealed class CueBin : IDisposable
     {
         var cb = new CueBin();
         cb.Parse(cuePath);
+        cb.StartBackgroundWarmup();
         return cb;
+    }
+
+    // Root cause of the multi-second freezes/black-screen reports: the
+    // first read of a given region of the .bin is dramatically slower than
+    // later reads of the same region (measured ~90ms/sector cold vs
+    // ~0.25ms/sector warm - a 128-sector cold read blocked the game thread
+    // for 11+ seconds in captured logs, since QueueAsyncReadSector runs
+    // synchronously on that thread and PresentFrame can't be called again
+    // until it returns). Most likely cause: iOS Data Protection decryption
+    // and/or page cache population happening lazily per-region rather than
+    // for the whole file at open time.
+    // Fix: walk the whole data track sequentially on a background thread
+    // right after opening, so by the time gameplay's own seeks reach a
+    // given offset the pages are already warm. This thread reads through
+    // the same _ioGate lock as real reads, so it never races a real read -
+    // worst case a real read waits briefly behind a warmup read of the
+    // same file, which is still far better than the multi-second stalls
+    // this replaces. Deliberately fire-and-forget: if it doesn't finish
+    // before the disc does, that's fine, it was pure readahead.
+    private void StartBackgroundWarmup()
+    {
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                foreach (var t in _tracks)
+                {
+                    var stream = GetStream(t.BinPath);
+                    const int chunk = 64 * 1024; // small enough that a real read never waits long behind a warmup chunk
+                    var buf = new byte[chunk];
+                    long remaining;
+                    lock (_ioGate) remaining = stream.Length;
+                    long pos = 0;
+                    while (pos < remaining)
+                    {
+                        int want = (int)Math.Min(chunk, remaining - pos);
+                        lock (_ioGate)
+                        {
+                            stream.Seek(pos, SeekOrigin.Begin);
+                            stream.ReadExactly(buf, 0, want);
+                        }
+                        pos += want;
+                    }
+                }
+            }
+            catch
+            {
+                // Best-effort warmup only - a failure here (disposed mid-read,
+                // I/O error) must never surface as a game-facing error since
+                // nothing depends on this thread completing.
+            }
+        })
+        { IsBackground = true, Name = "CueBin-Warmup" };
+        thread.Start();
     }
 
     private void Parse(string cuePath)

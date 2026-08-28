@@ -623,6 +623,17 @@ public sealed class CdController
     public void QueueAsyncReadSector(uint count, uint dstAddr, uint mode)
     {
         DbgEvent($"async ReadSector lba={_seekLba} count={count} dst=0x{dstAddr:X8}");
+        // This runs synchronously on the game thread (called straight out
+        // of the HLE syscall dispatch, no worker thread), so a slow read
+        // here blocks PresentFrame from ever being called again until it
+        // returns - the game freezes on its last rendered frame with zero
+        // other symptoms. Confirmed root cause of the black-screen/hang
+        // reports: every captured session stalls for ~11-12s on the exact
+        // same read (lba=55919, count=128) before continuing normally, so
+        // it's a specific slow disk access rather than random jank. Log
+        // start/elapsed for any read over 200ms so it's visible directly
+        // instead of having to infer it from gaps between timestamps.
+        var sw = count > 32 ? System.Diagnostics.Stopwatch.StartNew() : null;
         for (uint i = 0; i < count; i++)
         {
             ReadNextSector();
@@ -631,6 +642,8 @@ public sealed class CdController
                 _m.WriteU8(dstAddr + i * (uint)sectorSize + (uint)j, _dataBuf[j]);
             _seekLba++;
         }
+        if (sw != null && sw.ElapsedMilliseconds > 200)
+            DbgEvent($"SLOW ReadSector: lba={_seekLba - count} count={count} took {sw.ElapsedMilliseconds}ms - blocked game thread the whole time (no PresentFrame calls possible)");
         QueueIrq(3, [DriveStatus()]);
         QueueIrq(1, [DriveStatus()]);
         QueueIrq(2, [DriveStatus()]);
