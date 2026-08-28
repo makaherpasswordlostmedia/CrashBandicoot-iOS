@@ -22,54 +22,91 @@ public sealed class CueBin : IDisposable
     // first read of a given region of the .bin is dramatically slower than
     // later reads of the same region (measured ~90ms/sector cold vs
     // ~0.25ms/sector warm - a 128-sector cold read blocked the game thread
-    // for 11+ seconds in captured logs, since QueueAsyncReadSector runs
-    // synchronously on that thread and PresentFrame can't be called again
-    // until it returns). Most likely cause: iOS Data Protection decryption
-    // and/or page cache population happening lazily per-region rather than
-    // for the whole file at open time.
-    // Fix: walk the whole data track sequentially on a background thread
-    // right after opening, so by the time gameplay's own seeks reach a
-    // given offset the pages are already warm. This thread reads through
-    // the same _ioGate lock as real reads, so it never races a real read -
-    // worst case a real read waits briefly behind a warmup read of the
-    // same file, which is still far better than the multi-second stalls
-    // this replaces. Deliberately fire-and-forget: if it doesn't finish
-    // before the disc does, that's fine, it was pure readahead.
+    // for 11+ seconds in captured logs, since CdRead (LibCd.cs) runs the
+    // whole transfer synchronously on the calling thread and PresentFrame
+    // can't be called again until it returns). Most likely cause: iOS Data
+    // Protection decryption and/or page cache population happening lazily
+    // per-region rather than for the whole file at open time.
+    //
+    // Fix: walk the whole data track on background threads right after
+    // opening, so by the time gameplay's own seeks reach a given offset
+    // the pages are already warm.
+    //
+    // FIXED: this used to be a single thread walking strictly from byte 0,
+    // which for every session in the field lost the race against gameplay
+    // to a specific hot region around lba 55919 - every captured trace
+    // shows gameplay reaching that lba roughly 10-15s after disc open,
+    // which was not enough time for a single-threaded sequential warmup to
+    // get there first on a multi-hundred-MB image, so the "warm" read
+    // still hit cold pages. Splitting the file into N equal-sized ranges
+    // and warming them concurrently (N = a handful of background threads)
+    // cuts wall-clock warmup time roughly by that factor for any given
+    // offset, which is what actually matters here - we don't care about
+    // total warmup completion time, we care about time-to-warm for
+    // whichever offset gameplay reaches first, and concurrent range
+    // coverage gets every offset warm sooner than a single sweep can.
+    // Threads share the same _ioGate as real reads, so a real read only
+    // ever waits behind a single in-flight warmup chunk (64KB), never the
+    // whole file.
     private void StartBackgroundWarmup()
     {
-        var thread = new Thread(() =>
+        const int warmupThreads = 4;
+        long totalLength;
+        lock (_ioGate) totalLength = _tracks.Count > 0 ? GetStream(_tracks[0].BinPath).Length : 0;
+        if (totalLength <= 0) return;
+
+        // Marker line: if this never appears in checkpoint.log, the build
+        // on device predates the concurrent-warmup fix (or _tracks was
+        // somehow empty) - the single most reliable way to tell "did my
+        // fix actually ship" apart from "did the fix not work" from a log
+        // alone, since both look identical if you only look at CdRead
+        // timings.
+        RecompOne.Runtime.Log.Cd($"CueBin: warmup started, {warmupThreads} threads, {totalLength} bytes total");
+
+        long perThread = totalLength / warmupThreads;
+        for (int t = 0; t < warmupThreads; t++)
         {
-            try
+            long start = t * perThread;
+            long end = t == warmupThreads - 1 ? totalLength : start + perThread;
+            var thread = new Thread(() => WarmupRange(start, end))
+            { IsBackground = true, Name = $"CueBin-Warmup-{t}" };
+            thread.Start();
+        }
+    }
+
+    private void WarmupRange(long start, long end)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        try
+        {
+            foreach (var t in _tracks)
             {
-                foreach (var t in _tracks)
+                var stream = GetStream(t.BinPath);
+                const int chunk = 64 * 1024; // small enough that a real read never waits long behind a warmup chunk
+                var buf = new byte[chunk];
+                long remaining;
+                lock (_ioGate) remaining = stream.Length;
+                long pos = Math.Min(start, remaining);
+                long rangeEnd = Math.Min(end, remaining);
+                while (pos < rangeEnd)
                 {
-                    var stream = GetStream(t.BinPath);
-                    const int chunk = 64 * 1024; // small enough that a real read never waits long behind a warmup chunk
-                    var buf = new byte[chunk];
-                    long remaining;
-                    lock (_ioGate) remaining = stream.Length;
-                    long pos = 0;
-                    while (pos < remaining)
+                    int want = (int)Math.Min(chunk, rangeEnd - pos);
+                    lock (_ioGate)
                     {
-                        int want = (int)Math.Min(chunk, remaining - pos);
-                        lock (_ioGate)
-                        {
-                            stream.Seek(pos, SeekOrigin.Begin);
-                            stream.ReadExactly(buf, 0, want);
-                        }
-                        pos += want;
+                        stream.Seek(pos, SeekOrigin.Begin);
+                        stream.ReadExactly(buf, 0, want);
                     }
+                    pos += want;
                 }
             }
-            catch
-            {
-                // Best-effort warmup only - a failure here (disposed mid-read,
-                // I/O error) must never surface as a game-facing error since
-                // nothing depends on this thread completing.
-            }
-        })
-        { IsBackground = true, Name = "CueBin-Warmup" };
-        thread.Start();
+            RecompOne.Runtime.Log.Cd($"CueBin: warmup range [{start}..{end}) done in {sw.ElapsedMilliseconds}ms");
+        }
+        catch
+        {
+            // Best-effort warmup only - a failure here (disposed mid-read,
+            // I/O error) must never surface as a game-facing error since
+            // nothing depends on this thread completing.
+        }
     }
 
     private void Parse(string cuePath)
