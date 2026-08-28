@@ -25,6 +25,7 @@ public sealed class CdController
     private bool _hasReadAnySector;
 
     private readonly object _dbgGate = new();
+    private readonly object _irqGate = new();
     private readonly Queue<string> _dbgEvents = new();
     private const int DbgMaxEvents = 256;
     private long _sectorsRead;
@@ -98,22 +99,25 @@ public sealed class CdController
 
     public void CaptureDebug(out CdDebug d, List<string> events)
     {
-        d = new CdDebug {
-            SeekLba = _seekLba,
-            LastReadLba = _lastReadLba,
-            Reading = _reading,
-            StreamPending = _streamPending,
-            DataReady = _dataReady,
-            IrqFlags = _irqFlags,
-            LastIrq = _lastIrq,
-            Index = _index,
-            PendingIrqCount = _pendingIrqs.Count,
-            ParamCount = _paramFifo.Count,
-            ResponseCount = _responseFifo.Count,
-            DataFifoPos = _dataFifoPos,
-            DataBufLength = _dataBuf.Length,
-            SectorsRead = _sectorsRead
-        };
+        lock (_irqGate)
+        {
+            d = new CdDebug {
+                SeekLba = _seekLba,
+                LastReadLba = _lastReadLba,
+                Reading = _reading,
+                StreamPending = _streamPending,
+                DataReady = _dataReady,
+                IrqFlags = _irqFlags,
+                LastIrq = _lastIrq,
+                Index = _index,
+                PendingIrqCount = _pendingIrqs.Count,
+                ParamCount = _paramFifo.Count,
+                ResponseCount = _responseFifo.Count,
+                DataFifoPos = _dataFifoPos,
+                DataBufLength = _dataBuf.Length,
+                SectorsRead = _sectorsRead
+            };
+        }
         lock (_dbgGate)
         {
             events.Clear();
@@ -175,41 +179,47 @@ public sealed class CdController
 
     public byte Read(uint phys)
     {
-        return (phys & 3) switch
+        lock (_irqGate)
         {
-            0 => (byte)((_index & 3) | (_paramFifo.Count == 0 ? 0x08 : 0) | 0x10 | (_responseFifo.Count > 0 ? 0x20 : 0) | (_dataReady ? 0x40 : 0)),
-            1 => _responseFifo.Count > 0 ? _responseFifo.Dequeue() : (byte)0,
-            2 => ReadDataByte(),
-            _ => _index == 1 ? _irqFlags : (byte)0,
-        };
+            return (phys & 3) switch
+            {
+                0 => (byte)((_index & 3) | (_paramFifo.Count == 0 ? 0x08 : 0) | 0x10 | (_responseFifo.Count > 0 ? 0x20 : 0) | (_dataReady ? 0x40 : 0)),
+                1 => _responseFifo.Count > 0 ? _responseFifo.Dequeue() : (byte)0,
+                2 => ReadDataByte(),
+                _ => _index == 1 ? _irqFlags : (byte)0,
+            };
+        }
     }
 
     public void Write(uint phys, byte val)
     {
-        switch (phys & 3)
+        lock (_irqGate)
         {
-            case 0:
-                _index = (byte)(val & 3);
-                break;
-            case 1:
-                if (_index == 0) ExecuteCommand(val);
-                break;
-            case 2:
-                if (_index == 0) _paramFifo.Enqueue(val);
-                else if (_index == 1) _paramFifo.Clear();
-                break;
-            case 3:
-                if (_index == 0)
-                {
-                    if ((val & 0x80) != 0) { _dataFifoPos = 0; _dataReady = true; }
-                    else _dataReady = false;
-                }
-                else if (_index == 1)
-                {
-                    _irqFlags &= (byte)~val;
-                    if (_irqFlags == 0) AfterAck();
-                }
-                break;
+            switch (phys & 3)
+            {
+                case 0:
+                    _index = (byte)(val & 3);
+                    break;
+                case 1:
+                    if (_index == 0) ExecuteCommand(val);
+                    break;
+                case 2:
+                    if (_index == 0) _paramFifo.Enqueue(val);
+                    else if (_index == 1) _paramFifo.Clear();
+                    break;
+                case 3:
+                    if (_index == 0)
+                    {
+                        if ((val & 0x80) != 0) { _dataFifoPos = 0; _dataReady = true; }
+                        else _dataReady = false;
+                    }
+                    else if (_index == 1)
+                    {
+                        _irqFlags &= (byte)~val;
+                        if (_irqFlags == 0) AfterAck();
+                    }
+                    break;
+            }
         }
     }
 
@@ -489,10 +499,18 @@ public sealed class CdController
 
     private void QueueIrq(byte irqType, byte[] response)
     {
-        if (_irqFlags == 0 && _pendingIrqs.Count == 0)
-            DeliverImmediate(irqType, response);
-        else
-            _pendingIrqs.Enqueue((irqType, response));
+        // Now reachable from the background read thread (see
+        // QueueAsyncReadSector) as well as the game thread via MMIO
+        // Read/Write, so the shared IRQ/FIFO state needs a lock here that
+        // didn't exist before - previously everything touching this ran
+        // exclusively on the game thread and never needed one.
+        lock (_irqGate)
+        {
+            if (_irqFlags == 0 && _pendingIrqs.Count == 0)
+                DeliverImmediate(irqType, response);
+            else
+                _pendingIrqs.Enqueue((irqType, response));
+        }
     }
 
     private void AfterAck()
@@ -505,12 +523,15 @@ public sealed class CdController
 
     public void AdvanceStreaming()
     {
-        if (!_reading || !_streamPending) return;
-        if (_irqFlags != 0 || _pendingIrqs.Count > 0) return;
-        _streamPending = false;
-        ReadNextSector();
-        DbgEvent($"AdvanceStreaming: delivered lba={_lastReadLba}, next seekLba={_seekLba}");
-        DeliverImmediate(1, [DriveStatus()]);
+        lock (_irqGate)
+        {
+            if (!_reading || !_streamPending) return;
+            if (_irqFlags != 0 || _pendingIrqs.Count > 0) return;
+            _streamPending = false;
+            ReadNextSector();
+            DbgEvent($"AdvanceStreaming: delivered lba={_lastReadLba}, next seekLba={_seekLba}");
+            DeliverImmediate(1, [DriveStatus()]);
+        }
     }
 
     private void DeliverImmediate(byte irqType, byte[] response)
@@ -623,30 +644,66 @@ public sealed class CdController
     public void QueueAsyncReadSector(uint count, uint dstAddr, uint mode)
     {
         DbgEvent($"async ReadSector lba={_seekLba} count={count} dst=0x{dstAddr:X8}");
-        // This runs synchronously on the game thread (called straight out
-        // of the HLE syscall dispatch, no worker thread), so a slow read
-        // here blocks PresentFrame from ever being called again until it
-        // returns - the game freezes on its last rendered frame with zero
-        // other symptoms. Confirmed root cause of the black-screen/hang
-        // reports: every captured session stalls for ~11-12s on the exact
-        // same read (lba=55919, count=128) before continuing normally, so
-        // it's a specific slow disk access rather than random jank. Log
-        // start/elapsed for any read over 200ms so it's visible directly
-        // instead of having to infer it from gaps between timestamps.
-        var sw = count > 32 ? System.Diagnostics.Stopwatch.StartNew() : null;
-        for (uint i = 0; i < count; i++)
+        // FIXED: this used to run the whole transfer synchronously, right
+        // here, on the calling (game) thread - see CueBin's warmup-thread
+        // comment for the full story. That warmup thread helps but can't
+        // guarantee it beats the game to every offset (it walks the disc
+        // image linearly from byte 0, while gameplay seeks straight to
+        // whatever lba it needs next), so a cold read could still stall
+        // this call for 11+ seconds, and because PresentFrame is only ever
+        // called from the game thread, a stall in this HLE call is a stall
+        // of the entire rendered picture - freeze/black-screen with no
+        // other symptom, exactly as reported.
+        //
+        // Real PS1 CdRead() is asynchronous by spec: it kicks off the
+        // transfer and returns immediately, with completion signalled
+        // later via IRQ (that's the whole reason this method is named
+        // "QueueAsync..." and callers already treat it as fire-and-forget,
+        // checking status via GetlocL/DriveStatus rather than blocking).
+        // So doing the actual file I/O on a background thread and firing
+        // the completion IRQs only once it's done is not a workaround,
+        // it's what the API was always supposed to do - this HLE call was
+        // just never actually async internally until now.
+        int startLba = _seekLba;
+        _seekLba += (int)count;
+        _reading = true;
+        var thread = new Thread(() =>
         {
-            ReadNextSector();
-            int sectorSize = (mode & 0x30) == 0 ? 2048 : 2048; //fix
-            for (int j = 0; j < Math.Min(_dataBuf.Length, sectorSize); j++)
-                _m.WriteU8(dstAddr + i * (uint)sectorSize + (uint)j, _dataBuf[j]);
-            _seekLba++;
-        }
-        if (sw != null && sw.ElapsedMilliseconds > 200)
-            DbgEvent($"SLOW ReadSector: lba={_seekLba - count} count={count} took {sw.ElapsedMilliseconds}ms - blocked game thread the whole time (no PresentFrame calls possible)");
-        QueueIrq(3, [DriveStatus()]);
-        QueueIrq(1, [DriveStatus()]);
-        QueueIrq(2, [DriveStatus()]);
+            var sw = count > 32 ? System.Diagnostics.Stopwatch.StartNew() : null;
+            int lba = startLba;
+            for (uint i = 0; i < count; i++)
+            {
+                byte[] sector = ReadSectorDataInternal(lba);
+                int sectorSize = (mode & 0x30) == 0 ? 2048 : 2048; //fix
+                for (int j = 0; j < Math.Min(sector.Length, sectorSize); j++)
+                    _m.WriteU8(dstAddr + i * (uint)sectorSize + (uint)j, sector[j]);
+                lba++;
+            }
+            if (sw != null && sw.ElapsedMilliseconds > 200)
+                DbgEvent($"SLOW ReadSector: lba={startLba} count={count} took {sw.ElapsedMilliseconds}ms - ran off the game thread, so PresentFrame kept going throughout");
+            _reading = false;
+            _lastReadLba = lba - 1;
+            QueueIrq(3, [DriveStatus()]);
+            QueueIrq(1, [DriveStatus()]);
+            QueueIrq(2, [DriveStatus()]);
+        })
+        { IsBackground = true, Name = "CdAsyncRead" };
+        thread.Start();
+    }
+
+    // Thread-safe subset of ReadSectorData(int) used by the background
+    // read above: updates the shared _dataBuf/_sectorsRead/_lastReadLba
+    // state under _dbgGate-adjacent locking is not needed here because
+    // this path writes straight to the destination buffer instead of
+    // through the single shared _dataBuf field that the synchronous
+    // MMIO-driven read path (ReadNextSector/_dataBuf) still uses - keeping
+    // this separate avoids introducing a race on that field now that reads
+    // can happen off the game thread.
+    private byte[] ReadSectorDataInternal(int lba)
+    {
+        DbgReadRun("read", lba);
+        Interlocked.Increment(ref _sectorsRead);
+        return _fs.ReadSectorData(lba, 2048);
     }
 
     // Was hardcoded to 0x02 (motor-on only) for every single command,
