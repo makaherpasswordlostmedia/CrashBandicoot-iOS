@@ -110,6 +110,21 @@ public static class LibCd
         // "lock contention with another thread" (that last one would show
         // as time spent that ReadSectorData's own internal timing doesn't
         // account for).
+        //
+        // FIXED (partial): CueBin now warms the disc image with N
+        // concurrent range threads instead of one sequential sweep from
+        // byte 0 (see CueBin.StartBackgroundWarmup), specifically because
+        // every prior trace showed gameplay reaching lba~55919 well before
+        // a single-threaded warmup got there. This log line is the direct
+        // way to confirm from a fresh checkpoint.log whether that actually
+        // closed the gap: if SLOW CdRead no longer appears at all for this
+        // lba range, the warmup won; if it still appears but with a
+        // smaller elapsed time, the warmup is helping but not enough
+        // (increase warmupThreads or narrow chunk size); if it appears
+        // with the same ~11s as before, the warmup threads aren't winning
+        // the race at all (check they're actually starting - look for
+        // "CueBin: warmup started" below) or the underlying iOS I/O
+        // slowness is worse than 4-way concurrency can hide.
         var totalSw = System.Diagnostics.Stopwatch.StartNew();
         long ioTicks = 0, memTicks = 0;
         long worstSectorTicks = 0;
@@ -146,7 +161,9 @@ public static class LibCd
                     $"worst single sector=lba {lba + worstSectorIndex} took {worstSectorTicks * toMs:F0}ms - " +
                     "if I/O dominates and one sector isn't an outlier, it's genuinely slow storage access " +
                     "for this region; if worst sector is a big fraction of the whole thing, it's a one-off " +
-                    "stall (lock contention or a single cold page) rather than uniformly slow reading.");
+                    "stall (lock contention or a single cold page) rather than uniformly slow reading. " +
+                    "This blocks PresentFrame the whole time it runs (CdRead is still synchronous), so " +
+                    "any occurrence of this line at all is a black-screen/freeze of this exact duration.");
         }
         _lastIntr = Complete;
         c.V0 = 1;
