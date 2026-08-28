@@ -96,6 +96,57 @@ public static class Runtime
         {
             Event.Dispatch(new RuntimeReadyEvent());
         }
+        StartStallWatchdog();
+    }
+
+    // Independent background thread, deliberately not on the game/render
+    // thread - the whole point is to keep observing even when that thread
+    // is off doing something that never calls back into logged code (the
+    // exact failure mode this is chasing: checkpoint.log going completely
+    // silent for 11+ seconds, no CD event, no Present, nothing, then
+    // resuming on its own). Samples Runtime.PresentFrameCalls (proof the
+    // game's own main loop reached VSync) and Dispatch.Dispatcher.CallCount
+    // (proof recompiled game functions are being invoked at all, which
+    // still climbs during heavy in-function work like decompression that
+    // never reaches VSync) once a second. If neither has moved since the
+    // last sample, logs how long both have been flat - this is the
+    // difference between "CPU emulation is genuinely stuck" (both flat)
+    // and "game is doing real work between frames, just not presenting"
+    // (CallCount still climbing, PresentFrameCalls flat).
+    static void StartStallWatchdog()
+    {
+        var thread = new Thread(() =>
+        {
+            long lastPresent = -1, lastCalls = -1;
+            int flatSeconds = 0;
+            while (true)
+            {
+                Thread.Sleep(1000);
+                long present = PresentFrameCalls;
+                long calls = Dispatch.Dispatcher.CallCount;
+                bool presentFlat = present == lastPresent;
+                bool callsFlat = calls == lastCalls;
+                if (presentFlat && lastPresent >= 0)
+                {
+                    flatSeconds++;
+                    if (flatSeconds >= 2)
+                    {
+                        Log.Sink?.Invoke(
+                            $"[WATCHDOG] PresentFrameCalls flat at {present} for {flatSeconds}s - " +
+                            $"Dispatcher.CallCount={calls} ({(callsFlat ? "ALSO FLAT, CPU genuinely stuck" : "still climbing, CPU is busy in-function (e.g. decompression), not deadlocked")}), " +
+                            $"lastCallAddr=0x{Dispatch.Dispatcher.LastCallAddr:X8}");
+                    }
+                }
+                else
+                {
+                    flatSeconds = 0;
+                }
+                lastPresent = present;
+                lastCalls = calls;
+            }
+        })
+        { IsBackground = true, Name = "StallWatchdog" };
+        thread.Start();
     }
 
     public static void WaitForValidDisc()
