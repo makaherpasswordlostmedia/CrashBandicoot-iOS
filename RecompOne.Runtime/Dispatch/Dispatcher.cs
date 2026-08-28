@@ -209,6 +209,20 @@ public static class Dispatcher
         LastCallAddr = addr;
         CallCount++;
         Sdk.LibEtc.MaybeCatchUpVBlank();
+        // AdvanceStreaming() delivers the next queued CD-stream IRQ, but was
+        // only pumped once per PresentFrame (i.e. once per emulated vblank,
+        // ~1/60s) - see the comment on that call site in Runtime.cs. If the
+        // game's own poll loop for that IRQ is a tight register-read loop
+        // that itself never calls another recompiled function or touches
+        // enough memory to trip MaybeCatchUpVBlank's own counter, the game
+        // and the vblank pump wait on each other: the IRQ needed to break
+        // the poll loop is only delivered from inside PresentFrame, but
+        // PresentFrame is only reached once the poll loop breaks. Pumping
+        // it here too - on every single recompiled function call, not just
+        // once a vblank - means any call the poll loop *does* make (even
+        // just re-entering its own wait helper) has a chance to unstick it,
+        // closing most of that window without waiting a full frame or more.
+        Runtime.Cd?.AdvanceStreaming();
         if (BiosKernel.TryDispatch(c, m, addr)) return;
         if (!_funcMap.TryGetValue(addr, out var fn))
             throw new InvalidOperationException($"unmapped call: 0x{addr:X8}");
