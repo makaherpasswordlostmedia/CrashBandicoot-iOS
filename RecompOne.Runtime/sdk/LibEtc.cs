@@ -52,6 +52,19 @@ public static class LibEtc
         uint startCount = count;
         long spins = 0;
         const long logThreshold = 600;
+        // Absolute ceiling: 600 vblanks (~10s) already indicates target is
+        // almost certainly wrong (see doc comment above) rather than a
+        // legitimate wait. Instead of only logging that once and then
+        // continuing to spin indefinitely - which is exactly the silent
+        // black-screen failure mode this diagnostic exists to catch, just
+        // with a log line preceding it instead of zero evidence - clamp
+        // the wait to 10x that (~100s worth of vblanks, generous headroom
+        // above any real "wait a couple frames" call) and bail out. This
+        // trades a hard hang for a resumed, if briefly stale, frame: the
+        // caller gets its target vblank count satisfied early rather than
+        // parking the render thread forever, and checkpoint.log gets an
+        // unambiguous record of exactly when and why.
+        const long hardSpinCeiling = logThreshold * 10;
         bool loggedLong = false;
 
         while (count < target)
@@ -68,6 +81,16 @@ public static class LibEtc
                     "rather than legitimate gameplay - if this is the *only* place " +
                     "execution is stuck, it explains a climbing PresentFrameCalls/" +
                     "Interrupts irq0 count with GlBackend.BeginCalls stuck at 0.");
+            }
+            if (spins >= hardSpinCeiling)
+            {
+                RecompOne.Runtime.Log.Sink?.Invoke($"[VSYNC] LibEtc.VSync: ABORTING wait after {spins} vblanks " +
+                    $"(hard ceiling {hardSpinCeiling}) - target={target} was never reached " +
+                    $"(currentCount={count}). Forcing return instead of hanging the render thread " +
+                    "forever; this almost certainly means A0/target was corrupted or misinterpreted " +
+                    "as absolute when the caller meant relative - treat this as the bug to fix, " +
+                    "not this bailout.");
+                break;
             }
         }
 
