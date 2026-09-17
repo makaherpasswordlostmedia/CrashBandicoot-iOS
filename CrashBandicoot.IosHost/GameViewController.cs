@@ -35,6 +35,7 @@ sealed class GameViewController : UIViewController, IStatusSink
     // ever observes the write, or observes a fully-constructed
     // IosEglContext instance rather than a torn/partial one.
     volatile IosEglContext? _egl;
+    volatile IosPlatformHost? _host;
     Thread? _gameThread;
 
     /// <summary>Thin wrapper kept for call-site brevity; see DiskLog.cs for what this actually does.</summary>
@@ -306,6 +307,7 @@ sealed class GameViewController : UIViewController, IStatusSink
 
             var diagnostics = new IosGpuDiagnosticsSession();
             var host = new IosPlatformHost(this, _egl, backend, diagnostics);
+            _host = host;
             Runtime.SetPlatformHost(host);
             Checkpoint("RunGame: platform host attached");
 
@@ -470,5 +472,36 @@ sealed class GameViewController : UIViewController, IStatusSink
         {
             if (_debugOverlay != null) _debugOverlay.Text = text;
         });
+    }
+
+    /// <summary>
+    /// Called from AppDelegate.DidEnterBackground. Sets Suspended
+    /// immediately (main thread) so the render thread's very next
+    /// Present() call - which can land at any point, including mid-frame,
+    /// since crash-game-main keeps running independently of app lifecycle
+    /// events - stops touching the EAGL surface before iOS gets a chance
+    /// to invalidate it out from under an in-flight GL call.
+    /// </summary>
+    public void OnEnteredBackground()
+    {
+        if (_host != null) _host.Suspended = true;
+        Checkpoint("GameViewController.OnEnteredBackground: host.Suspended=true");
+    }
+
+    /// <summary>
+    /// Called from AppDelegate.WillEnterForeground. Forces a full
+    /// framebuffer/renderbuffer rebuild (same size or not - see
+    /// IosEglContext.RecreateSurfaceAfterForeground's doc comment for why
+    /// the normal size-comparison early-out in SetExpectedSize can't be
+    /// relied on here) before clearing Suspended, so the render thread's
+    /// next Present() draws into a fresh, valid surface instead of
+    /// whatever iOS left behind after backgrounding.
+    /// </summary>
+    public void OnWillEnterForeground()
+    {
+        Checkpoint("GameViewController.OnWillEnterForeground: rebuilding surface");
+        _egl?.RecreateSurfaceAfterForeground();
+        if (_host != null) _host.Suspended = false;
+        Checkpoint("GameViewController.OnWillEnterForeground: host.Suspended=false");
     }
 }

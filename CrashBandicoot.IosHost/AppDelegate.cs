@@ -36,16 +36,25 @@ public sealed class AppDelegate : UIApplicationDelegate
     // The app lifecycle transitions below (background/foreground/resign/
     // activate) are exactly when iOS can invalidate GPU/audio resources out
     // from under the app (e.g. the EAGL context, or the audio session route)
-    // - a common source of crashes that have nothing to do with steady-state
-    // gameplay. None of these were logged before, so if a field crash
-    // report's last checkpoint.log line is one of these, that immediately
-    // rules in/out "something during a background/foreground transition" as
-    // the trigger, separate from anything happening mid-frame in Present().
-    public override void DidEnterBackground(UIApplication application) =>
+    // - a common source of crashes/stuck-black-screens that have nothing to
+    // do with steady-state gameplay. DidEnterBackground/WillEnterForeground
+    // now forward to GameViewController so the render thread actually stops
+    // touching the EAGL surface while backgrounded and rebuilds it before
+    // resuming, instead of just being logged (see GameViewController.
+    // OnEnteredBackground/OnWillEnterForeground and IosPlatformHost.
+    // Suspended for why the previous log-only versions left the surface
+    // permanently stale after a resume).
+    public override void DidEnterBackground(UIApplication application)
+    {
         DiskLog.Log("AppDelegate.DidEnterBackground");
+        (Window?.RootViewController as GameViewController)?.OnEnteredBackground();
+    }
 
-    public override void WillEnterForeground(UIApplication application) =>
+    public override void WillEnterForeground(UIApplication application)
+    {
         DiskLog.Log("AppDelegate.WillEnterForeground");
+        (Window?.RootViewController as GameViewController)?.OnWillEnterForeground();
+    }
 
     public override void OnResignActivation(UIApplication application) =>
         DiskLog.Log("AppDelegate.OnResignActivation");

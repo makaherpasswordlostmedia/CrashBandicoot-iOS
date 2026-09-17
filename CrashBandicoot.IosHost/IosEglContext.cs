@@ -231,13 +231,13 @@ sealed class IosEglContext : INativeContext, IDisposable
         lock (_glLock) MakeCurrentOnCallingThreadLocked();
     }
 
-    public void SetExpectedSize(int width, int height)
+    public void SetExpectedSize(int width, int height, bool force = false)
     {
         if (_layer == null || _context == null) return;
         if (width <= 0 || height <= 0) return;
-        if (width == SurfaceWidth && height == SurfaceHeight) return;
+        if (!force && width == SurfaceWidth && height == SurfaceHeight) return;
 
-        DiskLog.Log($"IosEglContext.SetExpectedSize: {width}x{height} (was {SurfaceWidth}x{SurfaceHeight})");
+        DiskLog.Log($"IosEglContext.SetExpectedSize: {width}x{height} (was {SurfaceWidth}x{SurfaceHeight}, force={force})");
         lock (_glLock)
         {
             MakeCurrentOnCallingThreadLocked();
@@ -246,6 +246,27 @@ sealed class IosEglContext : INativeContext, IDisposable
             CreateFramebuffer(width, height);
         }
         DiskLog.Log($"IosEglContext.SetExpectedSize: done, now {SurfaceWidth}x{SurfaceHeight}");
+    }
+
+    /// <summary>
+    /// Called after returning from background. iOS can invalidate/discard
+    /// the CAEAGLLayer's underlying IOSurface backing store while the app
+    /// is backgrounded (the renderbuffer object survives, but its storage
+    /// doesn't) without changing width/height at all - so the normal
+    /// SetExpectedSize size-comparison early-out never fires and the old,
+    /// now-garbage renderbuffer keeps getting presented, which is exactly
+    /// what shows up on screen as "stuck black/garbage frame after
+    /// resuming from the app switcher". Forcing a full
+    /// RenderBufferStorage + framebuffer rebuild here - unconditionally,
+    /// same size or not - is the fix; this mirrors what a fresh
+    /// glGenRenderbuffers/RenderBufferStorage pair after Initialize()
+    /// would produce.
+    /// </summary>
+    public void RecreateSurfaceAfterForeground()
+    {
+        if (_layer == null || _context == null) return;
+        DiskLog.Log($"IosEglContext.RecreateSurfaceAfterForeground: rebuilding at {SurfaceWidth}x{SurfaceHeight}");
+        SetExpectedSize(SurfaceWidth, SurfaceHeight, force: true);
     }
 
     public void SwapBuffers()

@@ -38,6 +38,20 @@ sealed class IosPlatformHost(
 
     public static double LastFps { get; private set; }
 
+    // Set true on DidEnterBackground, false again only after
+    // RecreateSurfaceAfterForeground has actually rebuilt the EAGL
+    // framebuffer post-resume (see GameViewController's lifecycle
+    // forwarding). Present() must not touch the renderbuffer/CAEAGLLayer
+    // while this is true: iOS is free to discard the layer's backing
+    // store the instant the app backgrounds, and the render thread
+    // (crash-game-main) keeps calling Present() the whole time regardless
+    // - with nothing gating it, every Present() during/right after a
+    // background trip was presenting into a torn-down or stale surface,
+    // which is what a resumed session showed as a permanently stuck black
+    // screen (no exception, no crash - SwapBuffers on a dead renderbuffer
+    // just silently does nothing).
+    public volatile bool Suspended;
+
     public void Initialize(string title)
     {
         DiskLog.Log($"IosPlatformHost.Initialize: {title}");
@@ -128,6 +142,12 @@ sealed class IosPlatformHost(
     {
         CheatManager.Apply();
         Runtime.RamLog.Tick();
+
+        if (Suspended)
+        {
+            LogSkipReasonChange("host.Suspended=true (app is backgrounded or surface not yet rebuilt after resume)");
+            return;
+        }
 
         if (gpu == null)
         {
