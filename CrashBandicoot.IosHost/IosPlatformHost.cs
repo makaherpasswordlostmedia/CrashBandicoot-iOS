@@ -34,6 +34,7 @@ sealed class IosPlatformHost(
     long _writebacks;
     long _vertices;
     long _lastPresentTimestamp;
+    long _burstFrames;
 
     public static double LastFps { get; private set; }
 
@@ -160,6 +161,39 @@ sealed class IosPlatformHost(
         }
 
         LogSkipReasonChange(null);
+
+        // Detect a burst of Present() calls with no real wall-clock time
+        // between them - this is exactly what LibEtc.VSync's spin loop
+        // produces when `target` is far ahead of `count` (see that
+        // method's doc comment): hundreds of frames can fire inside a
+        // single MIPS call with microseconds between them, all landing
+        // between two "verbose" heartbeat frames (every 300), so none of
+        // them show up above. That reads in checkpoint.log as a healthy
+        // climbing frame counter even though the screen is showing
+        // whatever was last actually composited - a silent black/frozen
+        // screen with zero log evidence, which is exactly the class of
+        // bug this file's comments have been chasing. Logged once per
+        // burst (not every burst frame) so a real spin doesn't itself
+        // flood the log the way per-frame logging would.
+        var nowTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+        if (_lastPresentTimestamp != 0)
+        {
+            var sinceLastMs = (nowTicks - _lastPresentTimestamp) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            if (sinceLastMs < 0.5)
+            {
+                _burstFrames++;
+                if (_burstFrames == 60 || (_burstFrames > 60 && _burstFrames % 300 == 0))
+                {
+                    DiskLog.Log($"Present: frame {_frameCounter} BURST - {_burstFrames} consecutive Present() " +
+                                "calls with <0.5ms between them (VSync spin, see LibEtc.VSync doc comment). " +
+                                "Screen is not updating in real time even though the frame counter is climbing.");
+                }
+            }
+            else
+            {
+                _burstFrames = 0;
+            }
+        }
 
         _frameCounter++;
         // Heartbeat every 120 frames (~2s at 60fps) rather than every frame:
