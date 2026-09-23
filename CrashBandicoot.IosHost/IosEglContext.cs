@@ -261,12 +261,21 @@ sealed class IosEglContext : INativeContext, IDisposable
     /// same size or not - is the fix; this mirrors what a fresh
     /// glGenRenderbuffers/RenderBufferStorage pair after Initialize()
     /// would produce.
+    ///
+    /// Takes the caller's current width/height rather than reusing
+    /// SurfaceWidth/SurfaceHeight: those fields reflect whatever size was
+    /// last set BEFORE backgrounding, which is stale if the device
+    /// rotated, entered/left Split View, or changed Stage Manager window
+    /// size while the app sat in the background - rebuilding at the old
+    /// size would still show a black/garbage frame post-resume, just from
+    /// a mismatched-size framebuffer instead of a torn-down one.
     /// </summary>
-    public void RecreateSurfaceAfterForeground()
+    public void RecreateSurfaceAfterForeground(int width, int height)
     {
         if (_layer == null || _context == null) return;
-        DiskLog.Log($"IosEglContext.RecreateSurfaceAfterForeground: rebuilding at {SurfaceWidth}x{SurfaceHeight}");
-        SetExpectedSize(SurfaceWidth, SurfaceHeight, force: true);
+        if (width <= 0 || height <= 0) { width = SurfaceWidth; height = SurfaceHeight; }
+        DiskLog.Log($"IosEglContext.RecreateSurfaceAfterForeground: rebuilding at {width}x{height} (was {SurfaceWidth}x{SurfaceHeight})");
+        SetExpectedSize(width, height, force: true);
     }
 
     public void SwapBuffers()

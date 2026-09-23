@@ -496,11 +496,30 @@ sealed class GameViewController : UIViewController, IStatusSink
     /// relied on here) before clearing Suspended, so the render thread's
     /// next Present() draws into a fresh, valid surface instead of
     /// whatever iOS left behind after backgrounding.
+    ///
+    /// Reads View.Bounds fresh here (main thread, right now) instead of
+    /// letting IosEglContext reuse its own cached SurfaceWidth/Height -
+    /// those reflect the size from BEFORE backgrounding, which is wrong
+    /// if a rotation, Split View change, or Stage Manager resize happened
+    /// while suspended. Falls back to (0,0) - meaning "reuse whatever
+    /// IosEglContext already has" - only if View is somehow gone, which
+    /// shouldn't normally happen for a foregrounding root view controller.
     /// </summary>
     public void OnWillEnterForeground()
     {
         Checkpoint("GameViewController.OnWillEnterForeground: rebuilding surface");
-        _egl?.RecreateSurfaceAfterForeground();
+        var egl = _egl;
+        if (egl != null)
+        {
+            int width = 0, height = 0;
+            if (View != null)
+            {
+                var scale = UIScreen.MainScreen.Scale;
+                width = (int)(View.Bounds.Width * scale);
+                height = (int)(View.Bounds.Height * scale);
+            }
+            egl.RecreateSurfaceAfterForeground(width, height);
+        }
         if (_host != null) _host.Suspended = false;
         Checkpoint("GameViewController.OnWillEnterForeground: host.Suspended=false");
     }
