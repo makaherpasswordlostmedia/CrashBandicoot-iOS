@@ -305,21 +305,21 @@ public sealed class TouchControllerView : UIView
         double r = _dpadR, aw = _armW;
 
         // Base plate: one path for both arms so overlap doesn't double-blend.
-        var plus = UIBezierPath.FromRoundedRect(new CGRect(cx - r, cy - aw / 2, r * 2, aw), aw * 0.30);
-        plus.AppendPath(UIBezierPath.FromRoundedRect(new CGRect(cx - aw / 2, cy - r, aw, r * 2), aw * 0.30));
+        var plus = RoundRect(new CGRect(cx - r, cy - aw / 2, r * 2, aw), aw * 0.30);
+        plus.AppendPath(RoundRect(new CGRect(cx - aw / 2, cy - r, aw, r * 2), aw * 0.30));
         IdleFill.SetFill();
         plus.Fill();
 
         // Pressed arm highlights.
         PressedFill.SetFill();
         if (Down(Controller.Up))
-            UIBezierPath.FromRoundedRect(new CGRect(cx - aw / 2, cy - r, aw, r), aw * 0.30).Fill();
+            RoundRect(new CGRect(cx - aw / 2, cy - r, aw, r), aw * 0.30).Fill();
         if (Down(Controller.Down))
-            UIBezierPath.FromRoundedRect(new CGRect(cx - aw / 2, cy, aw, r), aw * 0.30).Fill();
+            RoundRect(new CGRect(cx - aw / 2, cy, aw, r), aw * 0.30).Fill();
         if (Down(Controller.Left))
-            UIBezierPath.FromRoundedRect(new CGRect(cx - r, cy - aw / 2, r, aw), aw * 0.30).Fill();
+            RoundRect(new CGRect(cx - r, cy - aw / 2, r, aw), aw * 0.30).Fill();
         if (Down(Controller.Right))
-            UIBezierPath.FromRoundedRect(new CGRect(cx, cy - aw / 2, r, aw), aw * 0.30).Fill();
+            RoundRect(new CGRect(cx, cy - aw / 2, r, aw), aw * 0.30).Fill();
 
         // Arrows.
         double d = r * 0.68;   // distance from centre
@@ -329,6 +329,11 @@ public sealed class TouchControllerView : UIView
         DrawArrow(cx - d, cy, -1, 0, s, Down(Controller.Left));
         DrawArrow(cx + d, cy, 1, 0, s, Down(Controller.Right));
     }
+
+    // UIBezierPath.FromRoundedRect wants NFloat, which has no implicit
+    // conversion from double - wrap it once here.
+    static UIBezierPath RoundRect(CGRect rect, double radius) =>
+        UIBezierPath.FromRoundedRect(rect, new System.Runtime.InteropServices.NFloat(radius));
 
     static void DrawArrow(double x, double y, int dirX, int dirY, double s, bool pressed)
     {
@@ -403,7 +408,7 @@ public sealed class TouchControllerView : UIView
     {
         foreach (var (rect, bit) in _pills)
         {
-            var pill = UIBezierPath.FromRoundedRect(rect, (double)rect.Height / 2.6);
+            var pill = RoundRect(rect, (double)rect.Height / 2.6);
             (Down(bit) ? PressedFill : IdleFill).SetFill();
             pill.Fill();
             IdleStroke.SetStroke();
