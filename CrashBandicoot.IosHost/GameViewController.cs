@@ -334,11 +334,29 @@ sealed class GameViewController : UIViewController, IStatusSink
                     : RecompOne.Runtime.Hle.GlesFramebufferFetchPath.None;
             Checkpoint($"RunGame: GLES framebuffer fetch path = {fetchPath}");
 
+            // Same order as AndroidRuntimeHost.MainActivity.RunGameCore: the
+            // internal resolution must be set BEFORE the backend allocates
+            // its VRAM textures.
+            RecompOne.Runtime.Hle.GlVram.Scale = RecompOne.Runtime.Config.ConfigManager.View.InternalResolution;
+            Checkpoint($"RunGame: GlVram.Scale = {RecompOne.Runtime.Hle.GlVram.Scale}");
             var backend = new GlBackend(gl);
             backend.InitGl(gles: true, framebufferFetch: fetchPath);
             Checkpoint($"RunGame: GlBackend.InitGl done, Ready={backend.Ready}");
             if (!backend.Ready)
                 throw new InvalidOperationException($"GlBackend failed to initialize over EAGL: {backend.LastDiagnostic}");
+
+            // ROOT CAUSE OF THE PERMANENT BLACK SCREEN (begin=0 in checkpoint.log):
+            // Gpu.HleOn is `GpuHle.Active && GpuHle.Backend is { Ready: true }`,
+            // and the iOS host never set either. Every GP0 draw / VRAM load /
+            // fill therefore went to the CPU software rasteriser and the GL
+            // backend never saw a single primitive, so PresentDisplay always
+            // fell back to an empty VRAM texture. Android sets exactly these
+            // three lines in MainActivity.RunGameCore.
+            RecompOne.Runtime.Hle.GpuHle.Backend = backend;
+            RecompOne.Runtime.Hle.GpuHle.Active = true;
+            RecompOne.Runtime.Hle.GpuHle.NativeResolution =
+                RecompOne.Runtime.Config.ConfigManager.View.InternalResolution <= 1;
+            Checkpoint($"RunGame: GpuHle.Active={RecompOne.Runtime.Hle.GpuHle.Active} Backend.Ready={backend.Ready} NativeResolution={RecompOne.Runtime.Hle.GpuHle.NativeResolution}");
 
             var diagnostics = new IosGpuDiagnosticsSession();
             var host = new IosPlatformHost(this, _egl, backend, diagnostics);
@@ -360,6 +378,8 @@ sealed class GameViewController : UIViewController, IStatusSink
             // because the code was already known at build time.
             Recompiled.Entry.Run(new PSMemory(), cuePath);
             Checkpoint("RunGame: Recompiled.Entry.Run returned (session ended)");
+            RecompOne.Runtime.Hle.GpuHle.Active = false;
+            RecompOne.Runtime.Hle.GpuHle.Backend = null;
         }
         catch (Exception ex)
         {
@@ -374,6 +394,8 @@ sealed class GameViewController : UIViewController, IStatusSink
             for (var cur = ex; cur != null; cur = cur.InnerException)
                 chain.Append($"{cur.GetType().Name}: {cur.Message}\n");
             Checkpoint($"RunGame: EXCEPTION chain:\n{chain}{ex.StackTrace}");
+            RecompOne.Runtime.Hle.GpuHle.Active = false;
+            RecompOne.Runtime.Hle.GpuHle.Backend = null;
             SessionLog.Exception("GameViewController.RunGame", ex);
             SetStatus($"Crashed: {ex.Message}", visible: true);
         }
