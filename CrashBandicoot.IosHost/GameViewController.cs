@@ -241,6 +241,12 @@ sealed class GameViewController : UIViewController, IStatusSink
                 var viewCfg = RecompOne.Runtime.Config.ConfigManager.View;
                 if (!viewCfg.Values.ContainsKey("InternalResolution"))
                     viewCfg.InternalResolution = 1;
+                // Same idea for the optional post effects: extra fragment
+                // work on every pixel, off unless explicitly configured.
+                if (!viewCfg.Values.ContainsKey("TextureFilter")) viewCfg.TextureFilter = 0;
+                if (!viewCfg.Values.ContainsKey("Dedither")) viewCfg.Dedither = false;
+                if (!viewCfg.Values.ContainsKey("Dejitter")) viewCfg.Dejitter = false;
+                if (!viewCfg.Values.ContainsKey("Widescreen")) viewCfg.Widescreen = false;
                 ApplyRuntimeGraphicsSettings();
                 Checkpoint("RunGame: ConfigManager.Load + ApplyRuntimeGraphicsSettings done");
             }

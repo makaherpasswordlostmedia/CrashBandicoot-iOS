@@ -26,7 +26,7 @@
           can't statically resolve (generic virtual methods called through
           an interface, etc). Full AOT alone is stricter than mixed AOT+interp.
     -->
-    <UseInterpreter>true</UseInterpreter>
+    <UseInterpreter>false</UseInterpreter>
     <!--
       MtouchUseLlvm was true here originally. Dropped: on iOS 14.7/A11 this
       combination (LLVM AOT codegen + Mono interpreter fallback) has been
@@ -41,6 +41,19 @@
       quality.
     -->
     <MtouchUseLlvm>false</MtouchUseLlvm>
+
+    <!--
+      PERFORMANCE: interpreter fully OFF -> everything runs as native AOT code
+      (fastest option on iOS). Mono's JIT is not shipped in the iOS device
+      runtime, so AOT-only is the closest thing to "JIT speed" available.
+      IF THE APP CRASHES with "attempting to JIT compile method ...", set
+      UseInterpreter back to true above (optionally with
+      <MtouchInterpreter>-CrashBandicoot.IosHost,-RecompOne.Runtime</MtouchInterpreter>
+      to keep the hot assemblies native).
+    -->
+    <Optimize>true</Optimize>
+    <DebugType>none</DebugType>
+    <InvariantGlobalization>true</InvariantGlobalization>
 
     <!-- Not code-signed by us: TrollStore fake-signs on install.
          EnableCodeSigning/CodesignRequireProvisioningProfile default to

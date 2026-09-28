@@ -296,7 +296,9 @@ sealed class IosPlatformHost(
         // resize / foreground.
         backend.DefaultFramebuffer = egl.Framebuffer;
         backend.PresentToDefaultFramebuffer(surfaceWidth, surfaceHeight, presented.aspect);
-        var glErr = egl.PollGlError();
+        // glGetError forces a CPU/GPU sync on tile-based GPUs (A11), so only poll
+        // during the first couple of seconds where it is useful for diagnosis.
+        var glErr = _frameCounter <= 120 ? egl.PollGlError() : 0u;
         if (glErr != 0 && _glErrorsLogged < 30)
         {
             _glErrorsLogged++;
