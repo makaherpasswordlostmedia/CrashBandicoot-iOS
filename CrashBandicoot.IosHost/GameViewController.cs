@@ -141,12 +141,74 @@ sealed class GameViewController : UIViewController, IStatusSink
         int pxHeight = (int)(View.Bounds.Height * scale);
         Checkpoint($"StartGameThread: view {View.Bounds.Width}x{View.Bounds.Height} pt, scale {scale}, {pxWidth}x{pxHeight} px");
 
+        PrepareRuntimePaths();
+
         _gameThread = new Thread(() => RunGame(pxWidth, pxHeight))
         {
             IsBackground = true,
             Name = "crash-game-main",
         };
         _gameThread.Start();
+    }
+
+    /// <summary>
+    /// MUST run before anything touches RecompOne.Runtime.Runtime: its static
+    /// fields (memory cards) read AppPaths in the type initializer. Under full
+    /// AOT the runtime executes that initializer on ENTRY to any method that
+    /// references the type (RunGame does), i.e. before the SetRoot call inside
+    /// it - which crashed with UnauthorizedAccess on the read-only app bundle.
+    /// Keeping this in its own non-inlined method, called from the main
+    /// thread before the game thread exists, guarantees the order.
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    static void PrepareRuntimePaths()
+    {
+        var docsDir = NSFileManager.DefaultManager
+            .GetUrls(NSSearchPathDirectory.DocumentDirectory, NSSearchPathDomain.User)[0]
+            .Path;
+        if (!string.IsNullOrEmpty(docsDir))
+        {
+            var dataRoot = System.IO.Path.Combine(docsDir, "runtime");
+            RecompOne.Runtime.AppPaths.SetRoot(dataRoot);
+            RecompOne.Runtime.AppPaths.EnsureCreated();
+            Checkpoint($"RunGame: AppPaths.Root set to {dataRoot}");
+
+            // Mirror AndroidRuntimeHost.MainActivity.StartGameAsync's
+            // full pre-launch sequence, not just SetRoot/EnsureCreated -
+            // ConfigManager.Load() reads settings.json/interface.ini
+            // (safe no-ops on first run, since ConfigManager.Game/View
+            // already default to `new()`), and
+            // ApplyRuntimeGraphicsSettings mirrors ConfigManager.View
+            // into RecompOne.Runtime.Hle.GpuHle's static fields
+            // (TextureFilter, Dedither, PresentNearest, IntegerScale,
+            // wide-aspect, etc.) that GlShaders' PrimFs (uFilterMode,
+            // uDedither, ...) and GlBackend read at draw time. Skipping
+            // this doesn't crash - those statics just stay at their C#
+            // default values - but it silently produces a
+            // visually-wrong render (no widescreen, no texture
+            // filtering, no dedither) that would otherwise look like a
+            // brand new, unrelated bug.
+            RecompOne.Runtime.Config.ConfigManager.Load();
+            // iPhone 8 (A11) cannot sustain the runtime's default 4x
+            // internal resolution - it is the biggest single source of
+            // lag. Default to native 1x unless the user has explicitly
+            // chosen a value in settings.json.
+            var viewCfg = RecompOne.Runtime.Config.ConfigManager.View;
+            if (!viewCfg.Values.ContainsKey("InternalResolution"))
+                viewCfg.InternalResolution = 1;
+            // Same idea for the optional post effects: extra fragment
+            // work on every pixel, off unless explicitly configured.
+            if (!viewCfg.Values.ContainsKey("TextureFilter")) viewCfg.TextureFilter = 0;
+            if (!viewCfg.Values.ContainsKey("Dedither")) viewCfg.Dedither = false;
+            if (!viewCfg.Values.ContainsKey("Dejitter")) viewCfg.Dejitter = false;
+            if (!viewCfg.Values.ContainsKey("Widescreen")) viewCfg.Widescreen = false;
+            ApplyRuntimeGraphicsSettings();
+            Checkpoint("RunGame: ConfigManager.Load + ApplyRuntimeGraphicsSettings done");
+        }
+        else
+        {
+            Checkpoint("RunGame: WARNING could not resolve Documents dir, AppPaths.Root left at bundle default (read-only)");
+        }
     }
 
     void RunGame(int width, int height)
@@ -208,52 +270,7 @@ sealed class GameViewController : UIViewController, IStatusSink
             // pair - before anything reaches RecompOne.Runtime.Runtime,
             // mirroring what AndroidRuntimeHost.MainActivity already does
             // with FilesDir before its own runtime init.
-            var docsDir = NSFileManager.DefaultManager
-                .GetUrls(NSSearchPathDirectory.DocumentDirectory, NSSearchPathDomain.User)[0]
-                .Path;
-            if (!string.IsNullOrEmpty(docsDir))
-            {
-                var dataRoot = System.IO.Path.Combine(docsDir, "runtime");
-                RecompOne.Runtime.AppPaths.SetRoot(dataRoot);
-                RecompOne.Runtime.AppPaths.EnsureCreated();
-                Checkpoint($"RunGame: AppPaths.Root set to {dataRoot}");
-
-                // Mirror AndroidRuntimeHost.MainActivity.StartGameAsync's
-                // full pre-launch sequence, not just SetRoot/EnsureCreated -
-                // ConfigManager.Load() reads settings.json/interface.ini
-                // (safe no-ops on first run, since ConfigManager.Game/View
-                // already default to `new()`), and
-                // ApplyRuntimeGraphicsSettings mirrors ConfigManager.View
-                // into RecompOne.Runtime.Hle.GpuHle's static fields
-                // (TextureFilter, Dedither, PresentNearest, IntegerScale,
-                // wide-aspect, etc.) that GlShaders' PrimFs (uFilterMode,
-                // uDedither, ...) and GlBackend read at draw time. Skipping
-                // this doesn't crash - those statics just stay at their C#
-                // default values - but it silently produces a
-                // visually-wrong render (no widescreen, no texture
-                // filtering, no dedither) that would otherwise look like a
-                // brand new, unrelated bug.
-                RecompOne.Runtime.Config.ConfigManager.Load();
-                // iPhone 8 (A11) cannot sustain the runtime's default 4x
-                // internal resolution - it is the biggest single source of
-                // lag. Default to native 1x unless the user has explicitly
-                // chosen a value in settings.json.
-                var viewCfg = RecompOne.Runtime.Config.ConfigManager.View;
-                if (!viewCfg.Values.ContainsKey("InternalResolution"))
-                    viewCfg.InternalResolution = 1;
-                // Same idea for the optional post effects: extra fragment
-                // work on every pixel, off unless explicitly configured.
-                if (!viewCfg.Values.ContainsKey("TextureFilter")) viewCfg.TextureFilter = 0;
-                if (!viewCfg.Values.ContainsKey("Dedither")) viewCfg.Dedither = false;
-                if (!viewCfg.Values.ContainsKey("Dejitter")) viewCfg.Dejitter = false;
-                if (!viewCfg.Values.ContainsKey("Widescreen")) viewCfg.Widescreen = false;
-                ApplyRuntimeGraphicsSettings();
-                Checkpoint("RunGame: ConfigManager.Load + ApplyRuntimeGraphicsSettings done");
-            }
-            else
-            {
-                Checkpoint("RunGame: WARNING could not resolve Documents dir, AppPaths.Root left at bundle default (read-only)");
-            }
+            // AppPaths/ConfigManager are prepared in PrepareRuntimePaths(), called BEFORE this thread starts.
 
             // Enable the runtime's own SessionLog now that AppPaths points at
             // a writable directory. It was compiled-in but OFF, which made
