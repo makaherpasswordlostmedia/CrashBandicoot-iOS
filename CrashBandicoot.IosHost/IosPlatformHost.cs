@@ -226,7 +226,7 @@ sealed class IosPlatformHost(
         // per-phase logging on the frames immediately after a resize/
         // pause/resume (the known trigger candidates from earlier in this
         // investigation) covers that without flooding the log.
-        bool verbose = _frameCounter <= 10 || _frameCounter % 300 == 0;
+        bool verbose = DiskLog.Enabled && (_frameCounter <= 10 || _frameCounter % 300 == 0);
         if (verbose)
         {
             DiskLog.Log($"Present: frame {_frameCounter} begin, gpu {nativeWidth}x{nativeHeight}, Runtime.PresentFrameCalls={Runtime.PresentFrameCalls}");
@@ -312,7 +312,7 @@ sealed class IosPlatformHost(
 
         // ~4x/sec at 60fps - frequent enough to visibly confirm the render
         // loop is alive without a per-frame InvokeOnMainThread flood.
-        if (_frameCounter % 15 == 0)
+        if (DiskLog.Enabled && _frameCounter % 15 == 0)
         {
             status.UpdateDebugOverlay(
                 $"frame {_frameCounter}  disp={gpu.DisplayWidth}x{gpu.DisplayHeight}  hadRt={backend.LastPresentHadRt}\n" +
@@ -343,7 +343,8 @@ sealed class IosPlatformHost(
         {
             var frames = Math.Max(1, _fpsFrames);
             LastFps = _fpsFrames / elapsed;
-            DiskLog.Log($"Present: {_fpsFrames / elapsed:F1} FPS at frame {_frameCounter}, surface {surfaceWidth}x{surfaceHeight}");
+            if (DiskLog.Enabled)
+                DiskLog.Log($"Present: {_fpsFrames / elapsed:F1} FPS at frame {_frameCounter}, surface {surfaceWidth}x{surfaceHeight}");
             SessionLog.Info($"{_fpsFrames / elapsed:F1} FPS, surface {surfaceWidth}x{surfaceHeight}, " +
                      $"present {presented.w}x{presented.h}, CPU submit " +
                      $"{_prepareMilliseconds / frames:F2}+{_surfaceMilliseconds / frames:F2} ms, " +

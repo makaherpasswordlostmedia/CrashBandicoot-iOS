@@ -93,6 +93,7 @@ sealed class GameViewController : UIViewController, IStatusSink
             Text = "debug: waiting for first frame…\n" + DiskLog.Status,
             BackgroundColor = UIColor.Black.ColorWithAlpha(0.5f),
         };
+        _debugOverlay.Hidden = !DiskLog.Enabled;
         View.AddSubview(_debugOverlay);
         Checkpoint("ViewDidLoad: debug overlay added");
     }
@@ -162,10 +163,31 @@ sealed class GameViewController : UIViewController, IStatusSink
         // draw command is ever issued - these logs should show whether
         // WriteGp0 is ever reached at all, and what DriveStatus() bits are
         // actually being reported back to the game on every CD command.
-        RecompOne.Runtime.Log.Sink = DiskLog.Log;
-        RecompOne.Runtime.Log.GpuOn = true;
-        RecompOne.Runtime.Log.CdOn = true;
-        RecompOne.Runtime.Log.SdkOn = true;
+        if (DiskLog.Enabled)
+        {
+            RecompOne.Runtime.Log.Sink = DiskLog.Log;
+            RecompOne.Runtime.Log.GpuOn = true;
+            RecompOne.Runtime.Log.CdOn = true;
+            RecompOne.Runtime.Log.SdkOn = true;
+        }
+        else
+        {
+            // Performance mode: every category log off, and any stray
+            // Console.WriteLine in the runtime goes nowhere instead of
+            // through the (slow) stdout pipe.
+            RecompOne.Runtime.Log.Sink = null;
+            RecompOne.Runtime.Log.GpuOn = false;
+            RecompOne.Runtime.Log.CdOn = false;
+            RecompOne.Runtime.Log.SdkOn = false;
+            RecompOne.Runtime.Log.OverlayOn = false;
+            RecompOne.Runtime.Log.OverlayOnDefaultTrue = false;
+            try
+            {
+                Console.SetOut(System.IO.TextWriter.Null);
+                Console.SetError(System.IO.TextWriter.Null);
+            }
+            catch { /* not fatal */ }
+        }
 
         try
         {
@@ -212,6 +234,13 @@ sealed class GameViewController : UIViewController, IStatusSink
                 // filtering, no dedither) that would otherwise look like a
                 // brand new, unrelated bug.
                 RecompOne.Runtime.Config.ConfigManager.Load();
+                // iPhone 8 (A11) cannot sustain the runtime's default 4x
+                // internal resolution - it is the biggest single source of
+                // lag. Default to native 1x unless the user has explicitly
+                // chosen a value in settings.json.
+                var viewCfg = RecompOne.Runtime.Config.ConfigManager.View;
+                if (!viewCfg.Values.ContainsKey("InternalResolution"))
+                    viewCfg.InternalResolution = 1;
                 ApplyRuntimeGraphicsSettings();
                 Checkpoint("RunGame: ConfigManager.Load + ApplyRuntimeGraphicsSettings done");
             }
@@ -226,9 +255,12 @@ sealed class GameViewController : UIViewController, IStatusSink
             // inside the runtime never reached any log).
             try
             {
-                RecompOne.Runtime.Diagnostics.SessionLog.Enabled = true;
-                RecompOne.Runtime.Diagnostics.SessionLog.Start("iOS host");
-                Checkpoint($"RunGame: SessionLog -> {RecompOne.Runtime.Diagnostics.SessionLog.CurrentPath ?? "(failed to open)"}");
+                RecompOne.Runtime.Diagnostics.SessionLog.Enabled = DiskLog.Enabled;
+                if (DiskLog.Enabled)
+                {
+                    RecompOne.Runtime.Diagnostics.SessionLog.Start("iOS host");
+                    Checkpoint($"RunGame: SessionLog -> {RecompOne.Runtime.Diagnostics.SessionLog.CurrentPath ?? "(failed to open)"}");
+                }
             }
             catch (Exception logEx) { Checkpoint($"RunGame: SessionLog.Start FAILED: {logEx.Message}"); }
 
@@ -367,7 +399,7 @@ sealed class GameViewController : UIViewController, IStatusSink
             Checkpoint($"RunGame: disc found at {cuePath}, calling Recompiled.Entry.Run");
             host.Initialize("Crash Bandicoot");
 
-            StartStallWatchdog();
+            if (DiskLog.Enabled) StartStallWatchdog();
 
             // NOTE: no reflection, no AssemblyLoadContext - Recompiled.Entry
             // is an ordinary type statically compiled into this binary
@@ -489,6 +521,7 @@ sealed class GameViewController : UIViewController, IStatusSink
             return null;
         }
 
+        if (DiskLog.Enabled)
         try
         {
             var entries = Directory.GetFileSystemEntries(docs);
@@ -555,6 +588,7 @@ sealed class GameViewController : UIViewController, IStatusSink
     /// </summary>
     public void UpdateDebugOverlay(string text)
     {
+        if (!DiskLog.Enabled) return;
         InvokeOnMainThread(() =>
         {
             if (_debugOverlay != null) _debugOverlay.Text = text;

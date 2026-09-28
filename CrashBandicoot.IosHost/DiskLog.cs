@@ -51,6 +51,29 @@ static class DiskLog
     // Called with exactly one argument (already-escaped format) - see class doc.
     [DllImport(FoundationLib, EntryPoint = "NSLog")] static extern void NSLogNative(IntPtr format);
 
+    /// <summary>
+    /// Master switch. OFF by default so the game thread never pays for file
+    /// I/O / NSLog / string formatting on iPhone 8-class hardware. To turn
+    /// logging back on for debugging, drop an empty file called
+    /// "enable_log.txt" into the app's Documents folder (Files.app) and
+    /// relaunch. Even when OFF, [FATAL] / EXCEPTION lines are still written
+    /// to checkpoint.log (rare, so it costs nothing) - just not mirrored to NSLog.
+    /// </summary>
+    public static readonly bool Enabled = DetectEnabled();
+
+    static bool DetectEnabled()
+    {
+        try
+        {
+            var docs = NSFileManager.DefaultManager
+                .GetUrls(NSSearchPathDirectory.DocumentDirectory, NSSearchPathDomain.User)
+                .FirstOrDefault()?.Path;
+            return !string.IsNullOrEmpty(docs) &&
+                   System.IO.File.Exists(System.IO.Path.Combine(docs, "enable_log.txt"));
+        }
+        catch { return false; }
+    }
+
     static readonly object Gate = new();
     static IntPtr _file;
     static string? _path;
@@ -88,6 +111,18 @@ static class DiskLog
     {
         try
         {
+            if (!Enabled)
+            {
+                // Fast path: nothing but hard failures ever reach the disk.
+                if (!IsFatal(stage)) return;
+                lock (Gate)
+                {
+                    if (!_initTried) OpenLocked();
+                    WriteLocked(stage);
+                }
+                return;
+            }
+
             var critical = IsCritical(stage);
             lock (Gate)
             {
@@ -120,6 +155,10 @@ static class DiskLog
         }
     }
 
+    static bool IsFatal(string s) =>
+        s.StartsWith("[FATAL]", StringComparison.Ordinal) ||
+        s.Contains("EXCEPTION", StringComparison.Ordinal);
+
     static bool IsCritical(string s) =>
         s.StartsWith("[FATAL]", StringComparison.Ordinal) ||
         s.StartsWith("[STALL]", StringComparison.Ordinal) ||
@@ -136,7 +175,7 @@ static class DiskLog
 
         // Mirror to the system log: reaches Console.app / idevicesyslog even
         // if every file location turns out to be unwritable.
-        NSLogSafe(line);
+        if (Enabled) NSLogSafe(line);
 
         if (_file == IntPtr.Zero) return;
 
@@ -198,6 +237,7 @@ static class DiskLog
                 _path = path;
                 _lastError = "ok";
                 _bytesWritten = 0;
+                if (!Enabled) return;
                 WriteLocked("==================== new session ====================");
                 WriteLocked($"[LOG] writing to {path}" +
                             (attempts.Length > 0 ? $" (earlier locations failed: {attempts})" : ""));
