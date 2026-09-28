@@ -36,6 +36,16 @@ sealed class IosEglContext : INativeContext, IDisposable
     uint _framebuffer;
     uint _colorRenderbuffer;
 
+    /// <summary>
+    /// The FBO wrapping the CAEAGLLayer renderbuffer. iOS has no default
+    /// framebuffer (FBO 0), so GlBackend must present into THIS one.
+    /// Changes every time CreateFramebuffer runs (resize / foreground).
+    /// </summary>
+    public uint Framebuffer => _framebuffer;
+
+    /// <summary>Pops one GL error from the current context (0 = GL_NO_ERROR). Render thread only.</summary>
+    public uint PollGlError() => glGetError();
+
     public int SurfaceWidth { get; private set; }
     public int SurfaceHeight { get; private set; }
 
@@ -53,6 +63,7 @@ sealed class IosEglContext : INativeContext, IDisposable
     [DllImport(GlesLib)] static extern void glGetRenderbufferParameteriv(uint target, uint pname, out int param);
     [DllImport(GlesLib)] static extern uint glCheckFramebufferStatus(uint target);
     [DllImport(GlesLib)] static extern void glViewport(int x, int y, int width, int height);
+    [DllImport(GlesLib)] static extern uint glGetError();
 
     const uint GL_FRAMEBUFFER = 0x8D40;
     const uint GL_RENDERBUFFER = 0x8D41;
@@ -97,8 +108,13 @@ sealed class IosEglContext : INativeContext, IDisposable
                 new NSObject[] { NSNumber.FromBoolean(false), EAGLColorFormat.RGBA8 },
                 new NSObject[] { EAGLDrawableProperty.RetainedBacking, EAGLDrawableProperty.ColorFormat }),
         };
-        hostView.Layer.AddSublayer(_layer);
-        DiskLog.Log("IosEglContext.Initialize: CAEAGLLayer created and attached");
+        // Insert at index 0 (bottom), NOT AddSublayer (top). AddSublayer put
+        // the opaque CAEAGLLayer ABOVE the status label, spinner, debug
+        // overlay and touch controls (their layers were added earlier in
+        // ViewDidLoad), so all of them were painted over with solid black -
+        // which looked exactly like "black screen, no debug info".
+        hostView.Layer.InsertSublayer(_layer, 0);
+        DiskLog.Log($"IosEglContext.Initialize: CAEAGLLayer created and attached at z=0 (sublayers={hostView.Layer.Sublayers?.Length ?? 0})");
 
         CreateFramebuffer(width, height);
         DiskLog.Log($"IosEglContext.Initialize: CreateFramebuffer done, surface {SurfaceWidth}x{SurfaceHeight}");
@@ -178,7 +194,9 @@ sealed class IosEglContext : INativeContext, IDisposable
             throw new InvalidOperationException($"EAGL framebuffer incomplete: 0x{status:X}");
 
         glViewport(0, 0, SurfaceWidth, SurfaceHeight);
-        DiskLog.Log($"IosEglContext.CreateFramebuffer: exit, {SurfaceWidth}x{SurfaceHeight}");
+        var glErr = glGetError();
+        DiskLog.Log($"IosEglContext.CreateFramebuffer: exit, {SurfaceWidth}x{SurfaceHeight}, fbo={_framebuffer} rb={_colorRenderbuffer} status=0x{status:X} glError=0x{glErr:X}" +
+                    $" layerFrame={_layer.Frame} contentsScale={_layer.ContentsScale}");
     }
 
     /// <summary>
@@ -231,21 +249,65 @@ sealed class IosEglContext : INativeContext, IDisposable
         lock (_glLock) MakeCurrentOnCallingThreadLocked();
     }
 
+    // A context may only be current on ONE thread at a time. The render
+    // thread (crash-game-main) keeps it current permanently, so a resize
+    // requested from the main thread (ViewDidLayoutSubviews, foreground)
+    // must NOT call SetCurrentContext there - that steals the context out
+    // from under an in-flight frame (native abort / GL errors / black
+    // screen). Main-thread requests are queued here and applied by the
+    // render thread itself via ApplyPendingResize().
+    volatile bool _resizePending;
+    int _pendingWidth, _pendingHeight;
+    bool _pendingForce;
+
     public void SetExpectedSize(int width, int height, bool force = false)
     {
         if (_layer == null || _context == null) return;
         if (width <= 0 || height <= 0) return;
-        if (!force && width == SurfaceWidth && height == SurfaceHeight) return;
+        if (!force && width == SurfaceWidth && height == SurfaceHeight && !_resizePending) return;
 
-        DiskLog.Log($"IosEglContext.SetExpectedSize: {width}x{height} (was {SurfaceWidth}x{SurfaceHeight}, force={force})");
+        if (NSThread.IsMain)
+        {
+            lock (_glLock)
+            {
+                _pendingWidth = width;
+                _pendingHeight = height;
+                _pendingForce |= force;
+                _resizePending = true;
+            }
+            DiskLog.Log($"IosEglContext.SetExpectedSize: queued {width}x{height} force={force} for render thread (was {SurfaceWidth}x{SurfaceHeight})");
+            return;
+        }
+
+        lock (_glLock) ApplyResizeLocked(width, height, force);
+    }
+
+    /// <summary>
+    /// Render thread only, call at the top of every Present() while holding
+    /// GlLockObject. Applies a resize queued by the main thread.
+    /// </summary>
+    public void ApplyPendingResize()
+    {
+        if (!_resizePending) return;
         lock (_glLock)
         {
-            MakeCurrentOnCallingThreadLocked();
-            glBindRenderbuffer(GL_RENDERBUFFER, 0);
-            glBindFramebuffer(GL_FRAMEBUFFER, 0);
-            CreateFramebuffer(width, height);
+            if (!_resizePending) return;
+            var w = _pendingWidth; var h = _pendingHeight; var force = _pendingForce;
+            _resizePending = false; _pendingForce = false;
+            ApplyResizeLocked(w, h, force);
         }
-        DiskLog.Log($"IosEglContext.SetExpectedSize: done, now {SurfaceWidth}x{SurfaceHeight}");
+    }
+
+    void ApplyResizeLocked(int width, int height, bool force)
+    {
+        if (_layer == null || _context == null) return;
+        if (!force && width == SurfaceWidth && height == SurfaceHeight) return;
+        DiskLog.Log($"IosEglContext.ApplyResize: {width}x{height} (was {SurfaceWidth}x{SurfaceHeight}, force={force})");
+        MakeCurrentOnCallingThreadLocked();
+        glBindRenderbuffer(GL_RENDERBUFFER, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        CreateFramebuffer(width, height);
+        DiskLog.Log($"IosEglContext.ApplyResize: done, now {SurfaceWidth}x{SurfaceHeight}");
     }
 
     /// <summary>

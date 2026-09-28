@@ -28,6 +28,13 @@
         <string>UIInterfaceOrientationLandscapeLeft</string>
         <string>UIInterfaceOrientationLandscapeRight</string>
     </array>
+    <!-- Without a launch screen iOS runs the app in legacy compatibility
+         mode (old fixed screen size, letterboxed black bars). An empty
+         UILaunchScreen dict opts in to the real device screen size. -->
+    <key>UILaunchScreen</key>
+    <dict/>
+    <key>UIRequiresFullScreen</key>
+    <true/>
     <key>UIStatusBarHidden</key>
     <true/>
     <key>UIViewControllerBasedStatusBarAppearance</key>

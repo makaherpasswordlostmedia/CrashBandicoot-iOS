@@ -126,6 +126,7 @@ sealed class IosPlatformHost(
     // these guards produced zero log output and looked indistinguishable
     // from "app just isn't calling Present anymore" after the fact.
     string? _lastPresentSkipReason;
+    int _glErrorsLogged;
 
     void LogSkipReasonChange(string? reason)
     {
@@ -265,6 +266,9 @@ sealed class IosPlatformHost(
 
         lock (GlLock)
         {
+        // Resizes requested from the main thread are queued and applied HERE,
+        // on the thread that owns the EAGL context (see IosEglContext.SetExpectedSize).
+        egl.ApplyPendingResize();
         var surfaceWidth = egl.SurfaceWidth;
         var surfaceHeight = egl.SurfaceHeight;
         if (verbose) DiskLog.Log($"Present: frame {_frameCounter} got GlLock, surface {surfaceWidth}x{surfaceHeight}");
@@ -284,8 +288,23 @@ sealed class IosPlatformHost(
         }
         if (verbose) DiskLog.Log($"Present: frame {_frameCounter} PresentDisplay done ({presented.w}x{presented.h}), hadRt={backend.LastPresentHadRt}, begin={backend.BeginCalls}, classifyNull={backend.ClassifyNullCount}");
         var prepared = System.Diagnostics.Stopwatch.GetTimestamp();
+        // iOS has no default framebuffer (FBO 0 is invalid under EAGL): the
+        // composite pass must target the FBO wrapping the CAEAGLLayer
+        // renderbuffer. This was THE black-screen bug - the game could render
+        // perfectly into its internal render targets and none of it ever
+        // reached the layer. Re-read every frame: the FBO is recreated on
+        // resize / foreground.
+        backend.DefaultFramebuffer = egl.Framebuffer;
         backend.PresentToDefaultFramebuffer(surfaceWidth, surfaceHeight, presented.aspect);
-        if (verbose) DiskLog.Log($"Present: frame {_frameCounter} PresentToDefaultFramebuffer done");
+        var glErr = egl.PollGlError();
+        if (glErr != 0 && _glErrorsLogged < 30)
+        {
+            _glErrorsLogged++;
+            DiskLog.Log($"Present: frame {_frameCounter} GL ERROR 0x{glErr:X} after PresentToDefaultFramebuffer " +
+                        $"(fbo={egl.Framebuffer}, surface {surfaceWidth}x{surfaceHeight}, backend.LastDiagnostic='{backend.LastDiagnostic}')" +
+                        (_glErrorsLogged == 30 ? " - further GL errors suppressed" : ""));
+        }
+        if (verbose) DiskLog.Log($"Present: frame {_frameCounter} PresentToDefaultFramebuffer done (fbo={egl.Framebuffer}, glError=0x{glErr:X}, backend.LastDiagnostic='{backend.LastDiagnostic}')");
         var composited = System.Diagnostics.Stopwatch.GetTimestamp();
         egl.SwapBuffers();
         if (verbose) DiskLog.Log($"Present: frame {_frameCounter} SwapBuffers done");
@@ -297,7 +316,8 @@ sealed class IosPlatformHost(
         {
             status.UpdateDebugOverlay(
                 $"frame {_frameCounter}  disp={gpu.DisplayWidth}x{gpu.DisplayHeight}  hadRt={backend.LastPresentHadRt}\n" +
-                $"begin={backend.BeginCalls}  classifyNull={backend.ClassifyNullCount}");
+                $"begin={backend.BeginCalls}  classifyNull={backend.ClassifyNullCount}  fbo={egl.Framebuffer}\n" +
+                DiskLog.Status);
         }
 
         double ticksToMilliseconds = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
@@ -323,6 +343,7 @@ sealed class IosPlatformHost(
         {
             var frames = Math.Max(1, _fpsFrames);
             LastFps = _fpsFrames / elapsed;
+            DiskLog.Log($"Present: {_fpsFrames / elapsed:F1} FPS at frame {_frameCounter}, surface {surfaceWidth}x{surfaceHeight}");
             SessionLog.Info($"{_fpsFrames / elapsed:F1} FPS, surface {surfaceWidth}x{surfaceHeight}, " +
                      $"present {presented.w}x{presented.h}, CPU submit " +
                      $"{_prepareMilliseconds / frames:F2}+{_surfaceMilliseconds / frames:F2} ms, " +

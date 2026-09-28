@@ -90,7 +90,7 @@ sealed class GameViewController : UIViewController, IStatusSink
             TextColor = UIColor.Green,
             Font = UIFont.SystemFontOfSize(11),
             Lines = 3,
-            Text = "debug: waiting for first frame…",
+            Text = "debug: waiting for first frame…\n" + DiskLog.Status,
             BackgroundColor = UIColor.Black.ColorWithAlpha(0.5f),
         };
         View.AddSubview(_debugOverlay);
@@ -128,18 +128,23 @@ sealed class GameViewController : UIViewController, IStatusSink
     {
         base.ViewDidAppear(animated);
         Checkpoint("ViewDidAppear: enter");
-        if (_gameThread != null) return; // already started
+        StartGameThreadIfNeeded();
+    }
+
+    void StartGameThreadIfNeeded()
+    {
+        if (_gameThread != null || View == null) return; // already started
 
         var scale = UIScreen.MainScreen.Scale;
-        int pxWidth = (int)(View!.Bounds.Width * scale);
+        int pxWidth = (int)(View.Bounds.Width * scale);
         int pxHeight = (int)(View.Bounds.Height * scale);
+        Checkpoint($"StartGameThread: view {View.Bounds.Width}x{View.Bounds.Height} pt, scale {scale}, {pxWidth}x{pxHeight} px");
 
         _gameThread = new Thread(() => RunGame(pxWidth, pxHeight))
         {
             IsBackground = true,
             Name = "crash-game-main",
         };
-        Checkpoint("ViewDidAppear: starting game thread");
         _gameThread.Start();
     }
 
@@ -214,6 +219,31 @@ sealed class GameViewController : UIViewController, IStatusSink
             {
                 Checkpoint("RunGame: WARNING could not resolve Documents dir, AppPaths.Root left at bundle default (read-only)");
             }
+
+            // Enable the runtime's own SessionLog now that AppPaths points at
+            // a writable directory. It was compiled-in but OFF, which made
+            // SessionLog.Exception/Info silent no-ops (exceptions caught
+            // inside the runtime never reached any log).
+            try
+            {
+                RecompOne.Runtime.Diagnostics.SessionLog.Enabled = true;
+                RecompOne.Runtime.Diagnostics.SessionLog.Start("iOS host");
+                Checkpoint($"RunGame: SessionLog -> {RecompOne.Runtime.Diagnostics.SessionLog.CurrentPath ?? "(failed to open)"}");
+            }
+            catch (Exception logEx) { Checkpoint($"RunGame: SessionLog.Start FAILED: {logEx.Message}"); }
+
+            // Check for the disc BEFORE spending time on GL setup, and log
+            // exactly what is in Documents - "no disc found" and "disc found
+            // but wrong name/location" look identical from the outside.
+            var cuePath = LocateDiscCue();
+            if (cuePath == null)
+            {
+                Checkpoint("RunGame: no .cue found in Documents");
+                SetStatus("No disc image found in Documents. Add a .cue/.bin pair via Files.app, then reopen the app.", visible: true);
+                _gameThread = null;
+                return;
+            }
+            Checkpoint($"RunGame: disc found at {cuePath}");
 
             _egl = new IosEglContext();
             Checkpoint("RunGame: IosEglContext constructed");
@@ -291,7 +321,12 @@ sealed class GameViewController : UIViewController, IStatusSink
             {
                 glExtensions = System.Runtime.InteropServices.Marshal.PtrToStringAnsi(
                     (nint)gl.GetString(Silk.NET.OpenGL.StringName.Extensions)) ?? string.Empty;
+                string Str(Silk.NET.OpenGL.StringName n) =>
+                    System.Runtime.InteropServices.Marshal.PtrToStringAnsi((nint)gl.GetString(n)) ?? "?";
+                Checkpoint($"RunGame: GL_VENDOR={Str(Silk.NET.OpenGL.StringName.Vendor)} GL_RENDERER={Str(Silk.NET.OpenGL.StringName.Renderer)} " +
+                           $"GL_VERSION={Str(Silk.NET.OpenGL.StringName.Version)} GLSL={Str(Silk.NET.OpenGL.StringName.ShadingLanguageVersion)}");
             }
+            Checkpoint($"RunGame: GL extensions ({glExtensions.Length} chars): {glExtensions}");
             var fetchPath = glExtensions.Contains("GL_EXT_shader_framebuffer_fetch", StringComparison.Ordinal)
                 ? RecompOne.Runtime.Hle.GlesFramebufferFetchPath.Ext
                 : glExtensions.Contains("GL_ARM_shader_framebuffer_fetch", StringComparison.Ordinal)
@@ -310,19 +345,6 @@ sealed class GameViewController : UIViewController, IStatusSink
             _host = host;
             Runtime.SetPlatformHost(host);
             Checkpoint("RunGame: platform host attached");
-
-            var cuePath = LocateDiscCue();
-            if (cuePath == null)
-            {
-                Checkpoint("RunGame: no .cue found in Documents");
-                SetStatus("No disc image found in Documents. Add a .cue/.bin pair via Files.app, then tap to retry.", visible: true);
-                // Allow ViewDidAppear to spin up a fresh game thread on the
-                // next attempt (e.g. user adds the file and re-triggers via
-                // foregrounding) instead of leaving _gameThread permanently
-                // non-null with no way to retry without relaunching the app.
-                _gameThread = null;
-                return;
-            }
 
             Checkpoint($"RunGame: disc found at {cuePath}, calling Recompiled.Entry.Run");
             host.Initialize("Crash Bandicoot");
@@ -437,10 +459,53 @@ sealed class GameViewController : UIViewController, IStatusSink
     static string? LocateDiscCue()
     {
         var docs = NSFileManager.DefaultManager
-            .GetUrls(NSSearchPathDirectory.DocumentDirectory, NSSearchPathDomain.User)[0]
-            .Path;
-        if (docs == null) return null;
-        var cue = Directory.GetFiles(docs, "*.cue").FirstOrDefault();
+            .GetUrls(NSSearchPathDirectory.DocumentDirectory, NSSearchPathDomain.User)
+            .FirstOrDefault()?.Path;
+        if (string.IsNullOrEmpty(docs))
+        {
+            DiskLog.Log("LocateDiscCue: Documents directory could not be resolved");
+            return null;
+        }
+
+        try
+        {
+            var entries = Directory.GetFileSystemEntries(docs);
+            DiskLog.Log($"LocateDiscCue: {docs} contains {entries.Length} entries:");
+            foreach (var e in entries.Take(40))
+            {
+                long size = File.Exists(e) ? new FileInfo(e).Length : -1;
+                DiskLog.Log($"LocateDiscCue:   {System.IO.Path.GetFileName(e)}{(size >= 0 ? $" ({size} bytes)" : "/")}");
+            }
+        }
+        catch (Exception ex)
+        {
+            DiskLog.Log($"LocateDiscCue: listing {docs} FAILED: {ex.Message}");
+        }
+
+        // Case-insensitive: Files.app / iTunes can preserve ".CUE".
+        var cue = Directory.GetFiles(docs)
+            .FirstOrDefault(f => f.EndsWith(".cue", StringComparison.OrdinalIgnoreCase));
+        if (cue == null) return null;
+
+        // The .cue must reference a .bin that actually exists next to it,
+        // otherwise the run dies deep inside CueBin with an opaque error.
+        try
+        {
+            foreach (var line in File.ReadAllLines(cue))
+            {
+                var t = line.Trim();
+                if (!t.StartsWith("FILE", StringComparison.OrdinalIgnoreCase)) continue;
+                var a = t.IndexOf('"'); var b = t.LastIndexOf('"');
+                if (a < 0 || b <= a) continue;
+                var bin = t.Substring(a + 1, b - a - 1);
+                var binPath = System.IO.Path.Combine(System.IO.Path.GetDirectoryName(cue)!, bin);
+                DiskLog.Log($"LocateDiscCue: cue references '{bin}' -> {(File.Exists(binPath) ? "exists" : "MISSING (fix the FILE line in the .cue)")}");
+            }
+        }
+        catch (Exception ex)
+        {
+            DiskLog.Log($"LocateDiscCue: reading cue FAILED: {ex.Message}");
+        }
         return cue;
     }
 
@@ -507,6 +572,10 @@ sealed class GameViewController : UIViewController, IStatusSink
     /// </summary>
     public void OnWillEnterForeground()
     {
+        // RunGame bails out early (and clears _gameThread) when no disc is
+        // present yet; coming back from Files.app after copying it in is the
+        // natural moment to retry.
+        if (_gameThread == null) StartGameThreadIfNeeded();
         Checkpoint("GameViewController.OnWillEnterForeground: rebuilding surface");
         var egl = _egl;
         if (egl != null)
