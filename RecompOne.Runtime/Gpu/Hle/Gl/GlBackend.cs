@@ -51,6 +51,14 @@ public sealed class GlBackend : IGpuBackend
     int _uPresentOrigin, _uPresentSize, _uPresentTexSize, _uPresent24Origin, _uPresent24Size;
 
     public bool Ready { get; private set; }
+
+    /// <summary>
+    /// Framebuffer object that PresentToDefaultFramebuffer composites into.
+    /// 0 (the default) is correct for EGL/desktop window surfaces; hosts
+    /// without a real default framebuffer (iOS EAGL) must set this to their
+    /// own on-screen FBO before every present (it changes on resize).
+    /// </summary>
+    public uint DefaultFramebuffer { get; set; }
     public string LastDiagnostic { get; private set; } = "ok";
     public int LastFrameFlushes { get; private set; }
     public int LastFrameWritebacks { get; private set; }
@@ -906,7 +914,12 @@ public sealed class GlBackend : IGpuBackend
         if (!Ready || _presentTex == 0 || surfaceWidth <= 0 || surfaceHeight <= 0)
             return;
 
-        _gl.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
+        // Android/desktop: 0 == the window surface's default framebuffer.
+        // iOS (EAGL): there is NO default framebuffer - FBO 0 is invalid and
+        // every draw/clear into it fails with GL_INVALID_FRAMEBUFFER_OPERATION,
+        // so the screen stays black forever. The iOS host sets
+        // DefaultFramebuffer to the FBO that wraps the CAEAGLLayer renderbuffer.
+        _gl.BindFramebuffer(FramebufferTarget.Framebuffer, DefaultFramebuffer);
         _gl.Viewport(0, 0, (uint)surfaceWidth, (uint)surfaceHeight);
         _gl.Disable(EnableCap.DepthTest);
         _gl.Disable(EnableCap.Blend);
