@@ -114,8 +114,55 @@ public sealed class GlVram
         _gl.Disable(EnableCap.ScissorTest);
     }
 
+    uint _scratchFbo;
+
+    /// <summary>
+    /// GLES 3.0 (iOS/EAGL) has no glCopyImageSubData - that entry point is
+    /// GLES 3.2 / an extension, so the symbol does not resolve and the first
+    /// GP0 MoveImage would throw on the render thread. BlitFramebuffer IS core
+    /// in ES 3.0, but source and destination must not be the same FBO when the
+    /// rects overlap, so overlapping copies go through the scratch texture.
+    /// </summary>
+    void CopyRectBlit(int sx, int sy, int dx, int dy, int w, int h)
+    {
+        int sw = w * Scale, sh = h * Scale;
+        int sx0 = sx * Scale, sy0 = sy * Scale, dx0 = dx * Scale, dy0 = dy * Scale;
+        _gl.Disable(EnableCap.ScissorTest);
+
+        bool overlap = sx < dx + w && dx < sx + w && sy < dy + h && dy < sy + h;
+        if (!overlap)
+        {
+            // Same texture as read and draw target is only legal when the
+            // regions do not overlap.
+            _gl.BindFramebuffer(FramebufferTarget.ReadFramebuffer, _fbo);
+            _gl.BindFramebuffer(FramebufferTarget.DrawFramebuffer, _fbo);
+            _gl.BlitFramebuffer(sx0, sy0, sx0 + sw, sy0 + sh, dx0, dy0, dx0 + sw, dy0 + sh,
+                ClearBufferMask.ColorBufferBit, BlitFramebufferFilter.Nearest);
+            _gl.BindFramebuffer(FramebufferTarget.Framebuffer, _fbo);
+            return;
+        }
+
+        EnsureScratch();
+        if (_scratchFbo == 0) _scratchFbo = CreateFbo(_scratchTex);
+        // VRAM -> scratch (same rect), then scratch -> VRAM at destination.
+        _gl.BindFramebuffer(FramebufferTarget.ReadFramebuffer, _fbo);
+        _gl.BindFramebuffer(FramebufferTarget.DrawFramebuffer, _scratchFbo);
+        _gl.BlitFramebuffer(sx0, sy0, sx0 + sw, sy0 + sh, 0, 0, sw, sh,
+            ClearBufferMask.ColorBufferBit, BlitFramebufferFilter.Nearest);
+        _gl.BindFramebuffer(FramebufferTarget.ReadFramebuffer, _scratchFbo);
+        _gl.BindFramebuffer(FramebufferTarget.DrawFramebuffer, _fbo);
+        _gl.BlitFramebuffer(0, 0, sw, sh, dx0, dy0, dx0 + sw, dy0 + sh,
+            ClearBufferMask.ColorBufferBit, BlitFramebufferFilter.Nearest);
+        _gl.BindFramebuffer(FramebufferTarget.Framebuffer, _fbo);
+    }
+
     public void CopyRect(int sx, int sy, int dx, int dy, int w, int h)
     {
+        if (_gles)
+        {
+            CopyRectBlit(sx, sy, dx, dy, w, h);
+            return;
+        }
         int sw = w * Scale, sh = h * Scale;
         bool overlap = sx < dx + w && dx < sx + w && sy < dy + h && dy < sy + h;
         if (!overlap)
@@ -177,6 +224,7 @@ public sealed class GlVram
         if (_stageFbo != 0) _gl.DeleteFramebuffer(_stageFbo);
         if (_tex != 0) _gl.DeleteTexture(_tex);
         if (_stageTex != 0) _gl.DeleteTexture(_stageTex);
+        if (_scratchFbo != 0) _gl.DeleteFramebuffer(_scratchFbo);
         if (_scratchTex != 0) _gl.DeleteTexture(_scratchTex);
     }
 }
