@@ -126,7 +126,7 @@ sealed class IosAudioOutput : IDisposable
             {
                 var session = AVAudioSession.SharedInstance();
                 // Playback: audio also plays with the hardware silent switch on.
-                session.SetCategory(AVAudioSessionCategory.Playback, out _);
+                session.SetCategory(AVAudioSession.CategoryPlayback, out _);
                 session.SetActive(true, out _);
 
                 // Standard format = Float32, non-interleaved, 2 channels.
