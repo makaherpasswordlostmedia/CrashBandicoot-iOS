@@ -1,203 +1,149 @@
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Latest Release](https://img.shields.io/github/v/release/Matteo842/CrashBandicoot-Launcher)](https://github.com/Matteo842/CrashBandicoot-Launcher/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/Matteo842/CrashBandicoot-Launcher/total.svg)](https://github.com/Matteo842/CrashBandicoot-Launcher/releases)
-[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/V7V61GBYAX)
+# Crash Bandicoot — iOS Host (iPhone 8 / iOS 14.7 / TrollStore)
 
-# Crash Bandicoot Launcher (unofficial)
+Port of the statically recompiled Crash Bandicoot (PS1) to iOS.
+Target device: iPhone 8, iOS 14.7, installed via TrollStore.
 
-> **Unofficial fan project.** Not affiliated with, endorsed by, or connected to Sony Interactive Entertainment, Activision, Naughty Dog, or any rights holder of *Crash Bandicoot*.  
-> *Crash Bandicoot* and related names/marks belong to their respective owners.
-
-This repository contains **tools and a launcher** that work with a copy of *Crash Bandicoot* you already own (PS1, NTSC-U, **SCUS-94900**). It does **not** include the game, disc images, or a ready-made game binary.
-
-Built on [RecompOne](https://github.com/BlackLabelHQ/RecompOne) (static PS1 recompilation + runtime). Current release: **1.7.0** (native WinForms launcher on Windows; CLI on Linux; Android). Still experimental — expect bugs.
-
----
-<img width="1920" height="800" alt="Crash-Launcher1" src="https://github.com/user-attachments/assets/3682fe9c-0deb-466c-adbe-285a1fd7bbcc" />
-
----
-## What this is
-
-A small host application that:
-
-1. Asks you for your own dumped disc (`.cue` + `.bin`).
-2. On first run, **recompiles and compiles on your PC** into a `game/` folder next to the exe (it is not uploaded anywhere by this app).
-3. Afterwards, starts from that prepared game folder.
-
-Think of it as a **convenience shell around tools**, not a redistribution of *Crash Bandicoot*.
-
-## What this is not
-
-| Not this | Meaning |
-|----------|---------|
-| Not the game | We do not ship retail assets, ISOs, or `.bin`/`.cue` files |
-| Not a piracy kit | You need a dump of a disc **you own** |
-| Not an official port | No Sony / Activision involvement |
-| Not “download and play without a disc” | The disc image is still required at runtime |
-| Not finished | UI and compatibility are work in progress |
-
-If someone offers you this project **bundled with a ROM/ISO**, that is not from this repository — don’t use it, don’t upload it here.
+> No game data ships with this repo. You need your own disc dump
+> (`.cue` + `.bin`).
 
 ---
 
-## Requirements
+## Quick start
 
-### Windows
-
-- Windows 10/11 x64  
-- A **legal** dump of *Crash Bandicoot* NTSC-U (`SCUS_949.00` / SCUS-94900) as `.cue` + matching `.bin` in the same folder  
-- Audio uses **OpenAL Soft** bundled with the release (`soft_oal.dll`) — no separate OpenAL install required  
-
-### Linux
-
-- x64 Linux with **OpenGL 4.3+** (Mesa / NVIDIA / AMD — a real GPU or working VM 3D accel)  
-- Audio uses **OpenAL Soft** bundled with the release (`libopenal.so`) — no `libopenal1` / system OpenAL install required  
-- Same legal `.cue` + `.bin` dump as above  
-
-On Linux there is **no graphical launcher menu** yet — use the CLI (`--prepare` / `--run`). The game opens in a standalone Silk/GLFW window. The painted WinForms UI remains Windows-only.
-
-**VMware / weak GL:** if you get an instant `Segmentation fault` right after `launching … game.recomp.dll`, the VM likely cannot create an OpenGL 4.3 context. Check with `glxinfo -B`, enable 3D acceleration, or try software GL for a smoke test:
-
-```bash
-sudo apt install mesa-utils
-LIBGL_ALWAYS_SOFTWARE=1 ./CrashBandicoot --run /path/to/game.cue
-```
-
-We only aim to support that specific NTSC-U version for now.
+1. Prepare your own disc dump (`game.cue` + `.bin`).
+2. Generate C# from the disc (once, on any machine):
+   ```bash
+   ./scripts/prerecompile.sh /path/to/game.cue
+   ```
+3. Build the `.ipa`:
+   - on a Mac: `dotnet build CrashBandicoot.IosHost -c Release -f net9.0-ios -r ios-arm64 -p:BuildIpa=true`
+     (requires Xcode and `dotnet workload install ios`);
+   - or via GitHub Actions: `.github/workflows/ios-build.yml`, the artifact is the `.ipa`.
+4. Install the `.ipa` on the iPhone via TrollStore.
+5. Using Files.app, copy `game.cue` and the `.bin` into the app's **Documents** folder.
+6. Launch the game.
 
 ---
 
-## How to play
+## Controls
 
-### Windows
+An on-screen gamepad is drawn over the game (`TouchControllerView.cs`).
 
-1. Download the **release** `.exe` from this GitHub repo (not a random reupload).  
-2. Run `CrashBandicoot.exe`.  
-3. **Select disc** → choose your `.cue`.  
-4. **Start Game**.  
-   - First time: local prepare into `game\` next to the exe (can take a bit).  
-   - Next times: reuses that prepared game folder.  
+| Area | Buttons |
+|------|---------|
+| Top left | L2, L1 |
+| Top right | R2, R1 |
+| Bottom left | D-pad, 8 directions (slide your thumb across it) |
+| Bottom right | △ ○ ✕ □ |
+| Bottom centre | SELECT, START |
 
-Optional (advanced):
+- Touching between two buttons presses both (e.g. jump + spin).
+- A pressed button is highlighted and triggers a light haptic tap.
+- Sizes and positions adapt to the screen and safe area.
+- Holding **three fingers** for ~0.5 s triggers the `ThreeFingerHold` action.
+- Input is written to `Controller.SetVirtualPadState(ushort)`, the same
+  active-high bitmask as on Android. Nothing downstream was changed.
 
-```powershell
-CrashBandicoot.exe --prepare "D:\path\to\your\game.cue"
-CrashBandicoot.exe --run "D:\path\to\your\game.cue"
-```
-
-### Linux
-
-```bash
-./CrashBandicoot --prepare /path/to/your/game.cue
-./CrashBandicoot --run /path/to/your/game.cue
-```
-
-If `settings.json` already has a valid `CdPath`, `--run` / `--smoke` can omit the cue path.
+Not implemented: physical / MFi gamepad (`GameController.framework`).
 
 ---
 
-## Building from source (developers)
+## Performance (iPhone 8 / A11)
 
-Needs [.NET 10 SDK](https://dotnet.microsoft.com/download).
+Defaults:
 
-```powershell
-dotnet build CrashBandicoot.Launcher -c Release
-dotnet run --project CrashBandicoot.Launcher -c Release -f net10.0-windows
+- **Logging is off**: no file writes, no `NSLog`, no string formatting,
+  no debug overlay, no stall watchdog. `Console.Out/Error` are redirected to nowhere.
+- **1x internal resolution** (the runtime default is 4x, which is the biggest source of lag on A11).
+- **Texture filter, dedither, dejitter and widescreen are off.**
+  All of them add per-pixel fragment shader work.
+- `glGetError` is only called during the first 120 frames
+  (on a tile-based GPU it forces a CPU/GPU sync).
+- **Interpreter is off** (`UseInterpreter=false`): all code runs as native AOT.
+
+Any of these can be overridden by setting the value explicitly in `settings.json`
+(located in `Documents/runtime/`). Settings that are not present there get the defaults above.
+
+### About JIT
+
+A real JIT is not available here: the iOS device .NET runtime does not ship a JIT compiler.
+TrollStore grants entitlements, but it does not add a compiler that is missing from the runtime.
+AOT without the interpreter is the fastest option available.
+
+### If the app crashes because of AOT
+
+If `checkpoint.log` shows `attempting to JIT compile method ...`,
+restore this in `CrashBandicoot.IosHost.csproj`:
+
+```xml
+<UseInterpreter>true</UseInterpreter>
 ```
 
-Linux / CLI framework:
+To keep the hot assemblies native while doing so, also add:
 
-```bash
-dotnet build CrashBandicoot.Launcher -c Release -f net10.0
-dotnet run --project CrashBandicoot.Launcher -c Release -f net10.0 -- --run /path/to/game.cue
+```xml
+<MtouchInterpreter>-CrashBandicoot.IosHost,-RecompOne.Runtime</MtouchInterpreter>
 ```
-
-Single-file / store release (from repo root):
-
-```powershell
-python publish_release.py
-```
-
-The script asks which platform to build:
-
-1. **Windows** — `publish-single\CrashBandicoot.exe`
-2. **Linux** — `publish-linux\CrashBandicoot`
-3. **Android** — `publish-android\CrashBandicoot-<version>.apk` (arm64, signed)
-4. All three
-
-Non-interactive:
-
-```powershell
-python publish_release.py --platform windows
-python publish_release.py --platform linux
-python publish_release.py --platform android
-python publish_release.py --platform all
-```
-
-The first Android publish creates `signing/android-release.keystore` (gitignored). Back that folder up; losing the keystore means you cannot update the same app.
-
-Options: `python publish_release.py --out my-folder`, `python publish_release.py --clean`.
-
-Equivalent raw commands:
-
-```powershell
-dotnet publish CrashBandicoot.Launcher -c Release -f net10.0-windows -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:IncludeAllContentForSelfExtract=true -p:EnableCompressionInSingleFile=true -o .\publish-single
-```
-
-```bash
-dotnet publish CrashBandicoot.Launcher -c Release -f net10.0 -r linux-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:IncludeAllContentForSelfExtract=true -p:EnableCompressionInSingleFile=true -o ./publish-linux
-```
-
-The published binary extracts bundled deps at runtime; **user data** (`save/`, `game/`, `settings.json`) is always written next to the real exe (not in the temp extract folder).
-
-Before you upload a release, check that you are shipping tools/UI only — **no** `.bin`/`.cue`, **no** `main.cs`, **no** `game.recomp.dll` / `game/` folder.
-
-### Repo layout
-
-| Path | Role |
-|------|------|
-| `CrashBandicoot.Launcher/` | Native WinForms launcher (Windows) + CLI + local recomp pipeline |
-| `RecompOne.Runtime/` | PS1 HLE runtime (from RecompOne) |
-| `RecompOne.Recompiler/` | Recompiler library (from RecompOne) |
-| `examples/mods/` | Sample mods (`auto-spin`, `disc-overlay-stub`, `vram-transfer-stub`, `spu-dma-stub`, `catalog-stub`, `texture-replace-stub`) — see [`docs/MODDING.md`](docs/MODDING.md) |
-| `CrashBandicoot.Recompiled/` | Placeholder only (gitignored) — not used for consumer builds |
 
 ---
 
-## Privacy / local data
+## Logs and debugging
 
-All next to the binary (portable; gitignored):
+Logging is off by default. To turn it on:
 
-- Config: `settings.json` (+ `interface.ini` for UI layout)  
-- Saves: `save/carda.sav`, `save/cardb.sav`  
-- Prepared game: `game/{fingerprint}/` (DLL + generated sources — persistent until you delete them)  
-- Mods: `mods/` (enable/disable from the launcher **MODS** menu; see [`docs/MODDING.md`](docs/MODDING.md))  
+1. Put an **empty file named `enable_log.txt`** into the app's Documents folder (via Files.app).
+2. Relaunch the game.
 
-This project does not include telemetry in the launcher path described here. Don’t commit those folders or dumps to git.
+After that:
+- a detailed `checkpoint.log` is written (in Documents);
+- the debug overlay is visible;
+- a `Present: XX.X FPS` line is logged roughly every 2 seconds.
 
----
+Even with logging off, critical `[FATAL]` and `EXCEPTION` lines still go to `checkpoint.log`,
+so crashes are never lost.
 
-## Contributing / issues
-
-Bug reports and PRs that improve **tools, runtime, UI, or docs** are welcome.  
-Please **do not** open issues asking where to download the game, and **do not** attach or link disc images or generated game sources.
-
----
-
-## Credits
-
-- [RecompOne](https://github.com/BlackLabelHQ/RecompOne) — recompiler & runtime (MIT)  
-- Inspired by the wider static-recompilation community (e.g. N64Recomp-style projects)  
-
-## License
-
-This repository’s original launcher code is under the **MIT License** (see [`LICENSE`](LICENSE)).  
-RecompOne components retain their upstream MIT license and copyright notices.  
-
-The MIT license applies to **our software**. It does **not** grant any rights to *Crash Bandicoot* itself.
+Attach `checkpoint.log` when reporting a bug.
 
 ---
 
-## Legal
+## Known limitations
 
-This project distributes **tools and runtime**, not Crash Bandicoot. Do not upload disc dumps or generated recompiled game code to public remotes. Trademark and copyright belong to their respective owners; this is an unofficial fan project.
+- **Audio is disabled**: `IosAudioOutput` is currently a no-op (stubs in the source).
+- No launcher or menu: the game starts immediately if a `.cue` is found in Documents.
+- No physical gamepad support.
+- No dev menu or cheats.
+- No save states or memory card UI.
+- Mod hot-reload and on-device mod compilation do not work
+  (they depend on Roslyn at runtime, which is impossible on iOS).
+
+---
+
+## Architecture (short)
+
+- **Rendering:** native `EAGLContext` / `CAEAGLLayer` (OpenGL ES). Same `GlBackend.cs`
+  as on Windows and Android. Not Metal, not ANGLE. GLES functions are resolved via `dlsym`
+  from `OpenGLES.framework`. The framebuffer fetch extension (`Ext`) is used.
+- **Ahead-of-time recompilation:** iOS forbids runtime code generation and loading assemblies
+  on the fly, so ELF → C# is done ahead of time (`tools/CrashBandicoot.PreRecompiler`), and the
+  generated `.cs` files live in `CrashBandicoot.IosHost/Recompiled/` and are compiled as ordinary code.
+  `RunGame()` calls `Recompiled.Entry.Run(...)` directly.
+- **Paths:** `PrepareRuntimePaths()` in `GameViewController.cs` sets `AppPaths.Root`
+  (`Documents/runtime`) and loads the config **before** the game thread starts. This matters under AOT:
+  the static constructor of `Runtime` (memory cards) reads `AppPaths` on method entry,
+  and without this the game crashes with `UnauthorizedAccess` on the read-only `.app` bundle.
+
+---
+
+## Layout of `CrashBandicoot.IosHost/`
+
+| File | Purpose |
+|------|---------|
+| `AppDelegate.cs` | Entry point, window, lifecycle |
+| `GameViewController.cs` | Game startup, path and config preparation, overlays |
+| `IosEglContext.cs` | EAGL context, layer, framebuffer |
+| `IosPlatformHost.cs` | Present, FPS, glue to the runtime |
+| `IosAudioOutput.cs` | Audio (currently no-op) |
+| `TouchControllerView.cs` | On-screen gamepad |
+| `DiskLog.cs` | Logging (off by default) |
+| `Info.plist`, `Entitlements.plist` | App metadata and entitlements |
+| `CrashBandicoot.IosHost.csproj` | Build settings (AOT, optimizations) |
