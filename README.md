@@ -112,7 +112,6 @@ Attach `checkpoint.log` when reporting a bug.
 - No launcher or menu: the game starts immediately if a `.cue` is found in Documents.
 - No physical gamepad support.
 - No dev menu or cheats.
-- No save states or memory card UI.
 - Mod hot-reload and on-device mod compilation do not work
   (they depend on Roslyn at runtime, which is impossible on iOS).
 
