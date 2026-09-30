@@ -28,7 +28,7 @@ ADDITIONAL_CFLAGS += -fno-modules -fno-implicit-modules -fno-implicit-module-map
 	-Wno-tautological-compare -Wno-implicit-fallthrough -Wno-misleading-indentation \
 	-Wno-unknown-warning-option -Wno-constant-logical-operand -fno-strict-aliasing
 
-CrashBandicootARMv7_CFLAGS = -Isrc -Igen -Ihost -std=gnu11 -DNDEBUG
+CrashBandicootARMv7_CFLAGS = -Isrc -Igen -Ihost -std=gnu11 -DNDEBUG -DPSX_GLES2
 
 # Hot software-rasteriser / GTE / SPU / MDEC code: full -O3. The huge generated
 # gen/*.c stays at the default level (bigger code hurts the A5's 32 KB I-cache).
