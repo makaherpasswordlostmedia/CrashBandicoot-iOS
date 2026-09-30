@@ -28,9 +28,12 @@ ADDITIONAL_CFLAGS += -fno-modules -fno-implicit-modules -fno-implicit-module-map
 	-Wno-tautological-compare -Wno-implicit-fallthrough -Wno-misleading-indentation \
 	-Wno-unknown-warning-option -Wno-constant-logical-operand -fno-strict-aliasing
 
+# PSX_GLES2 selects the only GPU backend on iOS (src/gpu_gles2.inc). There is no software
+# rasterizer here: src/gpu.c fails with #error if PSX_GLES2 is missing, and the software
+# backend (tests/gpu_soft.inc) is not on this include path.
 CrashBandicootARMv7_CFLAGS = -Isrc -Igen -Ihost -std=gnu11 -DNDEBUG -DPSX_GLES2
 
-# Hot software-rasteriser / GTE / SPU / MDEC code: full -O3. The huge generated
+# Hot GPU-command / GTE / SPU / MDEC code: full -O3. The huge generated
 # gen/*.c stays at the default level (bigger code hurts the A5's 32 KB I-cache).
 gpu.c_CFLAGS += -O3
 gte.c_CFLAGS += -O3
