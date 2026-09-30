@@ -29,7 +29,7 @@ uint16_t *g_vram;            /* CPU scratch only (image read-back); the real VRA
 volatile int g_gpu_dirty;
 
 /* ------------------------------------------------------------------ */
-/* GPU register state (identical semantics to the software backend)     */
+/* GPU register state (PSX GPU register state)     */
 /* ------------------------------------------------------------------ */
 static int draw_left, draw_top, draw_right = VRAM_W - 1, draw_bottom = VRAM_H - 1;
 static int draw_ofs_x, draw_ofs_y;
@@ -61,7 +61,7 @@ static bool stat_field;
 /* ------------------------------------------------------------------ */
 typedef struct {
     GLuint id;
-    GLint vram, dith, dither, setmask, chk, tp, depth, clut, raw, pass, twin, twand, twor, rect, rgb24, off;
+    GLint vram, dith, setmask, chk, pass, twin, twand, twor, rect, rgb24, off;
 } Prog;
 
 static GLuint tex_a, tex_b, tex_dith, fbo_a;
@@ -71,6 +71,8 @@ static uint16_t *load_buf;
 static uint8_t *scr_a, *scr_b, *scr_c;    /* 1024*512*4 scratch buffers */
 
 static unsigned st_frames, st_draws, st_tris, st_syncs, st_uploads, st_reads, st_fills, st_copies;
+static unsigned st_last_draws, st_last_tris;
+static uint64_t st_last_ns;
 static bool first_draw_logged;
 
 static inline int imin(int a, int b) { return a < b ? a : b; }
@@ -81,8 +83,9 @@ static inline int imax(int a, int b) { return a > b ? a : b; }
 /* ------------------------------------------------------------------ */
 static const char VS_MAIN[] =
     "attribute vec2 a_pos; attribute vec4 a_col; attribute vec2 a_uv;\n"
-    "varying vec4 v_col; varying vec2 v_uv;\n"
-    "void main(){ v_col = a_col; v_uv = a_uv;\n"
+    "attribute vec4 a_tp; attribute vec4 a_cl;\n"
+    "varying vec4 v_col; varying vec2 v_uv; varying vec4 v_tp; varying vec4 v_cl;\n"
+    "void main(){ v_col = a_col; v_uv = a_uv; v_tp = a_tp; v_cl = a_cl;\n"
     "  gl_Position = vec4(a_pos.x * 0.001953125 - 1.0, a_pos.y * 0.00390625 - 1.0, 0.0, 1.0); }\n";
 
 static const char VS_DISP[] =
@@ -93,11 +96,11 @@ static const char VS_DISP[] =
  * Bit-exact tricks: every division is a multiplication by a power of two. */
 static const char FS_MAIN[] =
     "precision highp float;\n"
-    "varying vec4 v_col; varying vec2 v_uv;\n"
+    "varying vec4 v_col; varying vec2 v_uv; varying vec4 v_tp; varying vec4 v_cl;\n"
     "uniform sampler2D u_vram; uniform sampler2D u_dith;\n"
-    "uniform float u_dither; uniform float u_setmask; uniform float u_chk;\n"
+    "uniform float u_setmask; uniform float u_chk;\n"
     "#ifdef TEXTURED\n"
-    "uniform vec2 u_tp; uniform float u_depth; uniform vec2 u_clut; uniform float u_raw; uniform float u_pass;\n"
+    "uniform float u_pass;\n"
     "uniform float u_twin; uniform vec2 u_twand; uniform vec2 u_twor;\n"
     "vec4 fetch(vec2 p){ p = mod(p, vec2(1024.0, 512.0));\n"
     "  return texture2D(u_vram, (p + 0.5) * vec2(0.0009765625, 0.001953125)); }\n"
@@ -109,6 +112,11 @@ static const char FS_MAIN[] =
     "float twin(float x, float a, float o){ float t = band(x, a); return t + o - band(t, o); }\n"
     "#endif\n"
     "void main(){\n"
+    "  float u_dither = floor(v_cl.z + 0.5);\n"
+    "#ifdef TEXTURED\n"
+    "  vec2 u_tp = floor(v_tp.xy + 0.5); float u_depth = floor(v_tp.z + 0.5); float u_raw = floor(v_tp.w + 0.5);\n"
+    "  vec2 u_clut = floor(v_cl.xy + 0.5);\n"
+    "#endif\n"
     "  float d = 0.0;\n"
     "  if (u_dither > 0.5) {\n"
     "    vec2 q = mod(floor(gl_FragCoord.xy), 4.0);\n"
@@ -217,6 +225,8 @@ static void build_prog(Prog *P, const char *vs, const char *defs, const char *fs
     glBindAttribLocation(P->id, 0, "a_pos");
     glBindAttribLocation(P->id, 1, "a_col");
     glBindAttribLocation(P->id, 2, "a_uv");
+    glBindAttribLocation(P->id, 3, "a_tp");
+    glBindAttribLocation(P->id, 4, "a_cl");
     glLinkProgram(P->id);
     GLint ok = 0; glGetProgramiv(P->id, GL_LINK_STATUS, &ok);
     if (!ok) {
@@ -226,8 +236,7 @@ static void build_prog(Prog *P, const char *vs, const char *defs, const char *fs
         plat_fatal("GLES2 shader link failed (see crash.log, line \"[GPU] shader error\")");
     }
 #define U(n, s) P->n = glGetUniformLocation(P->id, s)
-    U(vram, "u_vram"); U(dith, "u_dith"); U(dither, "u_dither"); U(setmask, "u_setmask"); U(chk, "u_chk");
-    U(tp, "u_tp"); U(depth, "u_depth"); U(clut, "u_clut"); U(raw, "u_raw"); U(pass, "u_pass");
+    U(vram, "u_vram"); U(dith, "u_dith"); U(setmask, "u_setmask"); U(chk, "u_chk"); U(pass, "u_pass");
     U(twin, "u_twin"); U(twand, "u_twand"); U(twor, "u_twor");
     U(rect, "u_rect"); U(rgb24, "u_rgb24"); U(off, "u_off");
 #undef U
@@ -333,13 +342,15 @@ static bool dirty_hit(int x, int y, int w, int h)
 /* ------------------------------------------------------------------ */
 /* Vertex batching                                                      */
 /* ------------------------------------------------------------------ */
-typedef struct { float x, y; uint8_t r, g, b, a; float u, v; } GVert;   /* 20 bytes */
+/* tp = (texpage x, texpage y, depth, raw), cl = (clut x, clut y, dither, 0): per-vertex copies of
+ * per-primitive state, so primitives with different texpage/CLUT/dither share one draw call. */
+typedef struct { float x, y; uint8_t r, g, b, a; float u, v; float tp[4]; float cl[4]; } GVert;   /* 52 bytes */
 #define MAXV 6144
 static GVert vb[MAXV];
 static int vn;
 
 typedef struct {
-    int prim, tex, depth, tpx, tpy, clutx, cluty, raw, dither, pass, blend_on, blend, setmask, chk;
+    int prim, tex, pass, blend_on, blend, setmask, chk;
     int twin, twax, tway, twox, twoy;
     int scl, sct, scr, scb;
 } Key;
@@ -356,9 +367,12 @@ static void bind_vram_target(void)
 static void set_attribs(const GVert *p)
 {
     glEnableVertexAttribArray(0); glEnableVertexAttribArray(1); glEnableVertexAttribArray(2);
+    glEnableVertexAttribArray(3); glEnableVertexAttribArray(4);
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(GVert), &p->x);
     glVertexAttribPointer(1, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(GVert), &p->r);
     glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(GVert), &p->u);
+    glVertexAttribPointer(3, 4, GL_FLOAT, GL_FALSE, sizeof(GVert), p->tp);
+    glVertexAttribPointer(4, 4, GL_FLOAT, GL_FALSE, sizeof(GVert), p->cl);
 }
 
 static void flush_batch(void)
@@ -372,14 +386,9 @@ static void flush_batch(void)
     glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, tex_dith);
     glActiveTexture(GL_TEXTURE0);
     glUniform1i(P->vram, 0); glUniform1i(P->dith, 1);
-    glUniform1f(P->dither, k->dither ? 1.0f : 0.0f);
     glUniform1f(P->setmask, k->setmask ? 1.0f : 0.0f);
     glUniform1f(P->chk, k->chk ? 1.0f : 0.0f);
     if (k->tex) {
-        glUniform2f(P->tp, (float)k->tpx, (float)k->tpy);
-        glUniform1f(P->depth, (float)k->depth);
-        glUniform2f(P->clut, (float)k->clutx, (float)k->cluty);
-        glUniform1f(P->raw, k->raw ? 1.0f : 0.0f);
         glUniform1f(P->pass, (float)k->pass);
         glUniform1f(P->twin, k->twin ? 1.0f : 0.0f);
         glUniform2f(P->twand, (float)k->twax, (float)k->tway);
@@ -445,6 +454,7 @@ static void submit(const GVert *v, int n, int prim, bool tex, bool semi, bool ra
     if (bx1 <= bx0 || by1 <= by0) return;       /* entirely outside the drawing area */
 
     int depth = tp_depth > 2 ? 2 : tp_depth;
+    int clutx = (clut & 0x3F) * 16, cluty = (clut >> 6) & 0x1FF;
     int npass = (tex && semi) ? 2 : 1;
     for (int pi = 0; pi < npass; pi++) {
         Key k; memset(&k, 0, sizeof k);
@@ -452,31 +462,35 @@ static void submit(const GVert *v, int n, int prim, bool tex, bool semi, bool ra
         k.pass = (tex && semi) ? pi + 1 : 0;
         k.blend_on = semi && (!tex || pi == 1);
         k.blend = k.blend_on ? (blend_mode & 3) : 0;
-        k.dither = dither; k.setmask = set_mask; k.chk = check_mask;
+        k.setmask = set_mask; k.chk = check_mask;
         k.scl = l; k.sct = t; k.scr = r; k.scb = b;
         if (tex) {
-            k.depth = depth; k.tpx = tp_x; k.tpy = tp_y;
-            k.clutx = (clut & 0x3F) * 16; k.cluty = (clut >> 6) & 0x1FF;
-            k.raw = raw;
             int ua = (~(tw_mask_x * 8)) & 0xFF, uo = ((tw_off_x & tw_mask_x) * 8) & 0xFF;
             int va = (~(tw_mask_y * 8)) & 0xFF, vo = ((tw_off_y & tw_mask_y) * 8) & 0xFF;
             k.twin = (tw_mask_x || tw_mask_y);
             k.twax = ua; k.tway = va; k.twox = uo; k.twoy = vo;
             int wid = depth == 0 ? 64 : depth == 1 ? 128 : 256;
             int cw = depth == 0 ? 16 : depth == 1 ? 256 : 0;
-            if (dirty_hit(tp_x, tp_y, wid, 256) || dirty_hit(k.clutx, k.cluty, cw, 1)) sync_snapshot();
+            if (dirty_hit(tp_x, tp_y, wid, 256) || dirty_hit(clutx, cluty, cw, 1)) sync_snapshot();
         }
         if (check_mask && dirty_hit(bx0, by0, bx1 - bx0, by1 - by0)) sync_snapshot();
 
         if (vn + n > MAXV || memcmp(&k, &ck, sizeof k) != 0) { flush_batch(); ck = k; }
-        memcpy(vb + vn, v, (size_t)n * sizeof(GVert));
+        GVert *dv = vb + vn;
+        memcpy(dv, v, (size_t)n * sizeof(GVert));
+        for (int i = 0; i < n; i++) {
+            dv[i].tp[0] = tex ? (float)tp_x : 0.0f;  dv[i].tp[1] = tex ? (float)tp_y : 0.0f;
+            dv[i].tp[2] = (float)depth;              dv[i].tp[3] = raw ? 1.0f : 0.0f;
+            dv[i].cl[0] = (float)clutx;              dv[i].cl[1] = (float)cluty;
+            dv[i].cl[2] = dither ? 1.0f : 0.0f;      dv[i].cl[3] = 0.0f;
+        }
         vn += n;
         dirty_add(bx0, by0, bx1, by1);
     }
 }
 
 /* ------------------------------------------------------------------ */
-/* Register / helpers (same as software backend)                        */
+/* Register / helpers (GP0/GP1 handling)                        */
 /* ------------------------------------------------------------------ */
 bool gpu_pal(void) { return pal; }
 void gpu_end_frame(void) { g_gpu_dirty = 1; }
@@ -573,6 +587,7 @@ static inline int imin3(int a, int b, int c) { int m = a < b ? a : b; return m <
 static inline GVert mkv(const Vert *p)
 {
     GVert o;
+    memset(&o, 0, sizeof o);
     o.x = (float)p->x + 0.5f; o.y = (float)p->y + 0.5f;     /* +0.5: PSX tests pixel corners, GL tests centers */
     o.r = (uint8_t)p->r; o.g = (uint8_t)p->g; o.b = (uint8_t)p->b; o.a = 255;
     o.u = (float)p->u; o.v = (float)p->v;
@@ -979,6 +994,7 @@ void gpu_present(int dx, int dy, int dw, int dh, bool rgb24, bool enabled)
         glUniform1f(pd.rgb24, rgb24 ? 1.0f : 0.0f);
         glBindBuffer(GL_ARRAY_BUFFER, 0);
         glEnableVertexAttribArray(0); glDisableVertexAttribArray(1); glEnableVertexAttribArray(2);
+        glDisableVertexAttribArray(3); glDisableVertexAttribArray(4);
         glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, quad);
         glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 16, quad + 2);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
@@ -986,7 +1002,15 @@ void gpu_present(int dx, int dy, int dw, int dh, bool rgb24, bool enabled)
     }
 
     st_frames++;
-    if (st_frames == 1 || (st_frames % 600) == 0)
-        plat_log("[GPU] GLES2 frame %u: draws=%u tris=%u syncs=%u uploads=%u reads=%u fills=%u copies=%u",
-                 st_frames, st_draws, st_tris, st_syncs, st_uploads, st_reads, st_fills, st_copies);
+    if (st_frames == 1) st_last_ns = plat_time_ns();
+    if (st_frames == 1 || (st_frames % 600) == 0) {
+        uint64_t now = plat_time_ns();
+        unsigned win = st_frames == 1 ? 1 : 600;
+        double secs = (double)(now - st_last_ns) / 1e9;
+        plat_log("[GPU] GLES2 frame %u: fps=%.1f draws/frame=%u tris/frame=%u | total draws=%u tris=%u syncs=%u uploads=%u reads=%u fills=%u copies=%u",
+                 st_frames, (secs > 0.0 && st_frames > 1) ? win / secs : 0.0,
+                 (st_draws - st_last_draws) / win, (st_tris - st_last_tris) / win,
+                 st_draws, st_tris, st_syncs, st_uploads, st_reads, st_fills, st_copies);
+        st_last_draws = st_draws; st_last_tris = st_tris; st_last_ns = now;
+    }
 }
