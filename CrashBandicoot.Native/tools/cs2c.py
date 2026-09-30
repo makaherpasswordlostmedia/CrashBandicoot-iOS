@@ -45,6 +45,8 @@ def conv_expr(line):
     line = re.sub(r'\bvar (_r) = \(uint64_t\)', r'uint64_t \1 = (uint64_t)', line)
     line = re.sub(r'\bvar (\w+) = ', r'int32_t \1 = ', line)
     line = re.sub(r'Dispatcher\.Call\(c, m, ', 'disp_call(c, ', line)
+    line = re.sub(r'\bBios\.Syscall\(', 'bios_syscall(', line)
+    line = re.sub(r'\bBios\.Break\(', 'bios_break(', line)
     line = re.sub(r'RecompOne\.Runtime\.Gte\.(\w+)\(', r'Gte_\1(', line)
     line = re.sub(r'\(c, m\)', '(c)', line)
     line = re.sub(r'\(c, m, ', '(c, ', line)
