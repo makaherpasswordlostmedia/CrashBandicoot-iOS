@@ -62,6 +62,7 @@ static bool stat_field;
 typedef struct {
     GLuint id;
     GLint vram, dith, setmask, chk, pass, twin, twand, twor, rect, rgb24, off;
+    float cv[8]; unsigned cmask;      /* last uniform values sent (flush_batch only) */
 } Prog;
 
 static GLuint tex_a, tex_b, tex_dith, fbo_a;
@@ -73,7 +74,13 @@ static uint8_t *scr_a, *scr_b, *scr_c;    /* 1024*512*4 scratch buffers */
 static unsigned st_frames, st_draws, st_tris, st_syncs, st_uploads, st_reads, st_fills, st_copies;
 static unsigned st_last_draws, st_last_tris;
 static uint64_t st_last_ns;
+/* why a batch was flushed (submit): 0 tex/flat program, 1 pass, 2 blend, 3 prim, 4 tex window, 5 scissor, 6 mask, 7 vertex cap */
+enum { FR_TEX, FR_PASS, FR_BLEND, FR_PRIM, FR_TW, FR_SCISSOR, FR_MASK, FR_CAP, FR_N };
+static unsigned st_fr[FR_N], st_fr_last[FR_N];
+static uint64_t st_flush_ns, st_flush_ns_last, st_present_ns, st_present_ns_last;
+static unsigned st_new_frames, st_new_last, st_work_last;
 static bool first_draw_logged;
+static void gl_invalidate(void);     /* defined with the GL state shadow, below */
 
 static inline int imin(int a, int b) { return a < b ? a : b; }
 static inline int imax(int a, int b) { return a > b ? a : b; }
@@ -295,6 +302,9 @@ static void gl_init(void)
     build_prog(&pt, VS_MAIN, "#define TEXTURED 1\n", FS_MAIN, "textured");
     build_prog(&pd, VS_DISP, "\n", FS_DISP, "display");
     build_prog(&pc, VS_MAIN, "\n", FS_COPY, "copy");
+    glUseProgram(pf.id); glUniform1i(pf.vram, 0); glUniform1i(pf.dith, 1);      /* never change */
+    glUseProgram(pt.id); glUniform1i(pt.vram, 0); glUniform1i(pt.dith, 1);
+    gl_invalidate();
 
     glClearColor(0, 0, 0, 0);
     glViewport(0, 0, VRAM_W, VRAM_H);
@@ -356,12 +366,38 @@ typedef struct {
 } Key;
 static Key ck = { .prim = -1 };
 
+/* Shadow of the GL state flush_batch() relies on. Everything else that touches GL (fills, copies,
+ * uploads, readbacks, present) calls gl_invalidate() when done, so the next flush re-sends it. */
+static struct { GLuint prog; bool tex_ok, target_ok, attribs_vb, sc_ok; int blend; int sc[4]; } gs = { .blend = -2 };
+
+static void gl_invalidate(void)
+{
+    memset(&gs, 0, sizeof gs);
+    gs.blend = -2;
+}
+
 static void bind_vram_target(void)
 {
+    if (gs.target_ok) return;
     glBindFramebuffer(GL_FRAMEBUFFER, fbo_a);
     glViewport(0, 0, VRAM_W, VRAM_H);
     glEnable(GL_SCISSOR_TEST);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
+    gs.target_ok = true;
+}
+
+static inline void u1f(Prog *P, int slot, GLint loc, float v)
+{
+    if (((P->cmask >> slot) & 1u) && P->cv[slot] == v) return;
+    P->cv[slot] = v; P->cmask |= 1u << slot;
+    glUniform1f(loc, v);
+}
+
+static inline void u2f(Prog *P, int slot, GLint loc, float a, float b)
+{
+    if (((P->cmask >> slot) & 3u) == 3u && P->cv[slot] == a && P->cv[slot + 1] == b) return;
+    P->cv[slot] = a; P->cv[slot + 1] = b; P->cmask |= 3u << slot;
+    glUniform2f(loc, a, b);
 }
 
 static void set_attribs(const GVert *p)
@@ -380,37 +416,50 @@ static void flush_batch(void)
     if (vn == 0) return;
     const Key *k = &ck;
     Prog *P = k->tex ? &pt : &pf;
+    const bool timed = (st_draws & 15u) == 0;          /* sample 1 in 16 flushes for the CPU-time estimate */
+    uint64_t t0 = timed ? plat_time_ns() : 0;
+
     bind_vram_target();
-    glUseProgram(P->id);
-    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex_b);
-    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, tex_dith);
-    glActiveTexture(GL_TEXTURE0);
-    glUniform1i(P->vram, 0); glUniform1i(P->dith, 1);
-    glUniform1f(P->setmask, k->setmask ? 1.0f : 0.0f);
-    glUniform1f(P->chk, k->chk ? 1.0f : 0.0f);
-    if (k->tex) {
-        glUniform1f(P->pass, (float)k->pass);
-        glUniform1f(P->twin, k->twin ? 1.0f : 0.0f);
-        glUniform2f(P->twand, (float)k->twax, (float)k->tway);
-        glUniform2f(P->twor, (float)k->twox, (float)k->twoy);
+    if (gs.prog != P->id) { glUseProgram(P->id); gs.prog = P->id; }
+    if (!gs.tex_ok) {
+        glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, tex_dith);
+        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex_b);
+        gs.tex_ok = true;
     }
-    glScissor(k->scl, k->sct, k->scr - k->scl + 1, k->scb - k->sct + 1);
-    if (k->blend_on) {
-        glEnable(GL_BLEND);
-        switch (k->blend) {
-        case 0: glBlendColor(0.5f, 0.5f, 0.5f, 0.5f);
-                glBlendFuncSeparate(GL_CONSTANT_COLOR, GL_ONE_MINUS_CONSTANT_COLOR, GL_ONE, GL_ZERO);
-                glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD); break;
-        case 1: glBlendFuncSeparate(GL_ONE, GL_ONE, GL_ONE, GL_ZERO);
-                glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD); break;
-        case 2: glBlendFuncSeparate(GL_ONE, GL_ONE, GL_ONE, GL_ZERO);
-                glBlendEquationSeparate(GL_FUNC_REVERSE_SUBTRACT, GL_FUNC_ADD); break;
-        default: glBlendColor(0.25f, 0.25f, 0.25f, 0.25f);
-                glBlendFuncSeparate(GL_CONSTANT_COLOR, GL_ONE, GL_ONE, GL_ZERO);
-                glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD); break;
+    u1f(P, 0, P->setmask, k->setmask ? 1.0f : 0.0f);
+    u1f(P, 1, P->chk, k->chk ? 1.0f : 0.0f);
+    if (k->tex) {
+        u1f(P, 2, P->pass, (float)k->pass);
+        u1f(P, 3, P->twin, k->twin ? 1.0f : 0.0f);
+        u2f(P, 4, P->twand, (float)k->twax, (float)k->tway);
+        u2f(P, 6, P->twor, (float)k->twox, (float)k->twoy);
+    }
+    int sc[4] = { k->scl, k->sct, k->scr - k->scl + 1, k->scb - k->sct + 1 };
+    if (!gs.sc_ok || memcmp(gs.sc, sc, sizeof sc) != 0) {
+        glScissor(sc[0], sc[1], sc[2], sc[3]);
+        memcpy(gs.sc, sc, sizeof sc); gs.sc_ok = true;
+    }
+    int wb = k->blend_on ? (k->blend & 3) : -1;
+    if (gs.blend != wb) {
+        if (wb < 0) glDisable(GL_BLEND);
+        else {
+            glEnable(GL_BLEND);
+            switch (wb) {
+            case 0: glBlendColor(0.5f, 0.5f, 0.5f, 0.5f);
+                    glBlendFuncSeparate(GL_CONSTANT_COLOR, GL_ONE_MINUS_CONSTANT_COLOR, GL_ONE, GL_ZERO);
+                    glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD); break;
+            case 1: glBlendFuncSeparate(GL_ONE, GL_ONE, GL_ONE, GL_ZERO);
+                    glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD); break;
+            case 2: glBlendFuncSeparate(GL_ONE, GL_ONE, GL_ONE, GL_ZERO);
+                    glBlendEquationSeparate(GL_FUNC_REVERSE_SUBTRACT, GL_FUNC_ADD); break;
+            default: glBlendColor(0.25f, 0.25f, 0.25f, 0.25f);
+                    glBlendFuncSeparate(GL_CONSTANT_COLOR, GL_ONE, GL_ONE, GL_ZERO);
+                    glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD); break;
+            }
         }
-    } else glDisable(GL_BLEND);
-    set_attribs(vb);
+        gs.blend = wb;
+    }
+    if (!gs.attribs_vb) { set_attribs(vb); gs.attribs_vb = true; }
     glDrawArrays(k->prim ? GL_LINES : GL_TRIANGLES, 0, vn);
     st_draws++; st_tris += (unsigned)(vn / 3);
     vn = 0;
@@ -419,6 +468,7 @@ static void flush_batch(void)
         GLenum e = glGetError();
         plat_log("[GPU] first draw call submitted to GLES2 (glGetError=0x%x)", (unsigned)e);
     }
+    if (timed) st_flush_ns += (plat_time_ns() - t0) * 16u;
 }
 
 static void sync_snapshot(void)
@@ -433,6 +483,7 @@ static void sync_snapshot(void)
     glBindTexture(GL_TEXTURE_2D, tex_b);
     glCopyTexSubImage2D(GL_TEXTURE_2D, 0, x0, y0, x0, y0, x1 - x0, y1 - y0);
     st_syncs++;
+    gl_invalidate();
 }
 
 /* Queue n vertices. tex/semi/raw/dither describe the primitive, prim 0=triangles 1=lines. */
@@ -475,7 +526,19 @@ static void submit(const GVert *v, int n, int prim, bool tex, bool semi, bool ra
         }
         if (check_mask && dirty_hit(bx0, by0, bx1 - bx0, by1 - by0)) sync_snapshot();
 
-        if (vn + n > MAXV || memcmp(&k, &ck, sizeof k) != 0) { flush_batch(); ck = k; }
+        if (vn + n > MAXV) { st_fr[FR_CAP]++; flush_batch(); ck = k; }
+        else if (memcmp(&k, &ck, sizeof k) != 0) {
+            if (vn > 0) {
+                if (ck.prim != k.prim) st_fr[FR_PRIM]++;
+                else if (ck.tex != k.tex) st_fr[FR_TEX]++;
+                else if (ck.pass != k.pass) st_fr[FR_PASS]++;
+                else if (ck.blend_on != k.blend_on || ck.blend != k.blend) st_fr[FR_BLEND]++;
+                else if (ck.twin != k.twin || ck.twax != k.twax || ck.tway != k.tway || ck.twox != k.twox || ck.twoy != k.twoy) st_fr[FR_TW]++;
+                else if (ck.scl != k.scl || ck.sct != k.sct || ck.scr != k.scr || ck.scb != k.scb) st_fr[FR_SCISSOR]++;
+                else st_fr[FR_MASK]++;
+            }
+            flush_batch(); ck = k;
+        }
         GVert *dv = vb + vn;
         memcpy(dv, v, (size_t)n * sizeof(GVert));
         for (int i = 0; i < n; i++) {
@@ -730,6 +793,7 @@ static void fill_rect(void)
         oy += ph;
     }
     st_fills++;
+    gl_invalidate();
 }
 
 static void copy_vram(void)
@@ -766,6 +830,7 @@ static void copy_vram(void)
         oy += ph;
     }
     st_copies++;
+    gl_invalidate();
 }
 
 /* read tex_a region (with wrap) into out as RGBA bytes, w*h*4 */
@@ -787,6 +852,7 @@ static void read_rect_rgba(int x, int y, int w, int h, uint8_t *out)
         oy += ph;
     }
     st_reads++;
+    gl_invalidate();
 }
 
 static void upload_piece(int x, int y, int w, int h, const void *px)
@@ -796,6 +862,7 @@ static void upload_piece(int x, int y, int w, int h, const void *px)
     glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
     glBindTexture(GL_TEXTURE_2D, tex_b);
     glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    gl_invalidate();
 }
 
 /* CPU -> VRAM (written into both the render target and the snapshot, so no sync is needed) */
@@ -969,6 +1036,7 @@ void gpu_write_gp1(uint32_t word)
 /* ------------------------------------------------------------------ */
 void gpu_present(int dx, int dy, int dw, int dh, bool rgb24, bool enabled)
 {
+    uint64_t t_begin = plat_time_ns();
     flush_batch();
     int fbo = 0, sw = 0, sh = 0;
     plat_gl_screen(&fbo, &sw, &sh);
@@ -1001,16 +1069,33 @@ void gpu_present(int dx, int dy, int dw, int dh, bool rgb24, bool enabled)
         glDisableVertexAttribArray(2);
     }
 
+    uint64_t t_end = plat_time_ns();
+    st_present_ns += t_end - t_begin;
+    gl_invalidate();
+
     st_frames++;
-    if (st_frames == 1) st_last_ns = plat_time_ns();
+    unsigned work = st_draws + st_fills + st_uploads + st_copies;
+    if (work != st_work_last) { st_new_frames++; st_work_last = work; }
+    if (st_frames == 1) st_last_ns = t_end;
     if (st_frames == 1 || (st_frames % 600) == 0) {
-        uint64_t now = plat_time_ns();
         unsigned win = st_frames == 1 ? 1 : 600;
-        double secs = (double)(now - st_last_ns) / 1e9;
-        plat_log("[GPU] GLES2 frame %u: fps=%.1f draws/frame=%u tris/frame=%u | total draws=%u tris=%u syncs=%u uploads=%u reads=%u fills=%u copies=%u",
-                 st_frames, (secs > 0.0 && st_frames > 1) ? win / secs : 0.0,
-                 (st_draws - st_last_draws) / win, (st_tris - st_last_tris) / win,
+        double secs = (double)(t_end - st_last_ns) / 1e9;
+        double vs = (secs > 0.0 && st_frames > 1) ? win / secs : 0.0;
+        double nw = (secs > 0.0 && st_frames > 1) ? (st_new_frames - st_new_last) / secs : 0.0;
+        double per = 1.0 / (double)win;
+        plat_log("[GPU] frame %u: vsync/s=%.1f (%.0f%% of 60) new-frames/s=%.1f | draws/f=%.1f tris/f=%.0f | cpu-in-GL ms/f: flush~%.2f present~%.2f (period %.1f)",
+                 st_frames, vs, vs * (100.0 / 60.0), nw,
+                 (st_draws - st_last_draws) * per, (st_tris - st_last_tris) * per,
+                 (double)(st_flush_ns - st_flush_ns_last) * 1e-6 * per, (double)(st_present_ns - st_present_ns_last) * 1e-6 * per,
+                 vs > 0.0 ? 1000.0 / vs : 0.0);
+        plat_log("[GPU]   flush causes /f: tex=%.1f pass=%.1f blend=%.1f prim=%.1f tw=%.1f scissor=%.1f mask=%.1f cap=%.1f | totals draws=%u tris=%u syncs=%u uploads=%u reads=%u fills=%u copies=%u",
+                 (st_fr[FR_TEX] - st_fr_last[FR_TEX]) * per, (st_fr[FR_PASS] - st_fr_last[FR_PASS]) * per,
+                 (st_fr[FR_BLEND] - st_fr_last[FR_BLEND]) * per, (st_fr[FR_PRIM] - st_fr_last[FR_PRIM]) * per,
+                 (st_fr[FR_TW] - st_fr_last[FR_TW]) * per, (st_fr[FR_SCISSOR] - st_fr_last[FR_SCISSOR]) * per,
+                 (st_fr[FR_MASK] - st_fr_last[FR_MASK]) * per, (st_fr[FR_CAP] - st_fr_last[FR_CAP]) * per,
                  st_draws, st_tris, st_syncs, st_uploads, st_reads, st_fills, st_copies);
-        st_last_draws = st_draws; st_last_tris = st_tris; st_last_ns = now;
+        memcpy(st_fr_last, st_fr, sizeof st_fr);
+        st_last_draws = st_draws; st_last_tris = st_tris; st_last_ns = t_end;
+        st_flush_ns_last = st_flush_ns; st_present_ns_last = st_present_ns; st_new_last = st_new_frames;
     }
 }
