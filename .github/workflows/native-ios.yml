@@ -54,7 +54,7 @@ jobs:
         working-directory: CrashBandicoot.Native
         run: |
           gcc -std=gnu11 -O1 -g -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation \
-              -Wno-format-truncation -Wno-tautological-compare -Isrc -Itests \
+              -Wno-format-truncation -Wno-tautological-compare -DPSX_ALLOW_SOFT_GPU -Isrc -Itests \
               -o /tmp/smoke src/*.c tests/host_stub.c tests/test_main.c -lpthread
           /tmp/smoke
 
@@ -152,6 +152,9 @@ jobs:
           TOOLBIN="$THEOS/toolchain/linux/iphone/bin"
           OTOOL="$(ls "$TOOLBIN"/*otool* 2>/dev/null | head -n1)"
           [ -n "$OTOOL" ] && "$OTOOL" -hv -l "$BIN" | grep -E "cputype|ARM|LC_VERSION_MIN|version" | head -10 || true
+          # The iOS binary must contain the GLES2 backend and must not be a software-render build.
+          strings "$BIN" | grep -q "GLES2 renderer ready" || { echo "::error::GLES2 renderer is not in the binary"; exit 1; }
+          strings "$BIN" | grep -q "GPU_BACKEND=GLES2" || { echo "::error::GPU backend tag missing"; exit 1; }
 
       - name: Pack .ipa
         working-directory: CrashBandicoot.Native

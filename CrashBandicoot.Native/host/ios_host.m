@@ -82,19 +82,10 @@ void plat_input_poll(void) {}
 
 static GLView *g_glview;
 static EAGLContext *g_ctx;
-static GLuint g_fbo, g_rbo, g_tex, g_prog, g_vbo;
+static GLuint g_fbo, g_rbo;
 static GLint g_view_w, g_view_h;
-static uint16_t *g_conv;   /* RGB565, 1024x512 */
 
-static GLuint compile(GLenum type, const char *src)
-{
-    GLuint s = glCreateShader(type);
-    glShaderSource(s, 1, &src, NULL);
-    glCompileShader(s);
-    GLint ok = 0; glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
-    if (!ok) { char log[512]; glGetShaderInfoLog(s, sizeof log, NULL, log); plat_log("[GL] shader error: %s", log); }
-    return s;
-}
+void gpu_present(int dx, int dy, int dw, int dh, bool rgb24, bool enabled);   /* gpu.c */
 
 static void gl_setup(void)
 {
@@ -114,81 +105,29 @@ static void gl_setup(void)
     glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, g_rbo);
     glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_WIDTH, &g_view_w);
     glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_HEIGHT, &g_view_h);
-
-    const char *vs = "attribute vec2 p; attribute vec2 t; varying vec2 uv;"
-                     "void main(){ uv = t; gl_Position = vec4(p, 0.0, 1.0); }";
-    const char *fs = "precision mediump float; varying vec2 uv; uniform sampler2D tex;"
-                     "void main(){ gl_FragColor = texture2D(tex, uv); }";
-    g_prog = glCreateProgram();
-    glAttachShader(g_prog, compile(GL_VERTEX_SHADER, vs));
-    glAttachShader(g_prog, compile(GL_FRAGMENT_SHADER, fs));
-    glBindAttribLocation(g_prog, 0, "p"); glBindAttribLocation(g_prog, 1, "t");
-    glLinkProgram(g_prog);
-    glUseProgram(g_prog);
-    glUniform1i(glGetUniformLocation(g_prog, "tex"), 0);
-
-    glGenTextures(1, &g_tex);
-    glBindTexture(GL_TEXTURE_2D, g_tex);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 1024, 512, 0, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, NULL);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glGenBuffers(1, &g_vbo);
-    g_conv = (uint16_t *)calloc(1024 * 512, 2);
-    plat_log("[GL] ready %dx%d", g_view_w, g_view_h);
+    plat_log("[GL] screen %dx%d", g_view_w, g_view_h);
 }
 
-static inline uint16_t px555_to_565(uint16_t v)
+/* Called by gpu.c (emulation thread) before it touches GL. */
+void plat_gl_make_current(void)
 {
-    uint32_t r = v & 31, g = (v >> 5) & 31, b = (v >> 10) & 31;
-    return (uint16_t)((r << 11) | ((g << 1 | g >> 4) << 5) | b);
-}
-
-void plat_present(const uint16_t *vram, int dx, int dy, int dw, int dh, bool rgb24, bool enabled)
-{
-    while (g_paused) usleep(10000);
     if (!g_ctx) gl_setup();
     [EAGLContext setCurrentContext:g_ctx];
+}
+
+void plat_gl_screen(int *fbo, int *w, int *h)
+{
+    *fbo = (int)g_fbo; *w = (int)g_view_w; *h = (int)g_view_h;
+}
+
+/* vram pointer is unused: the renderer keeps VRAM on the GPU. */
+void plat_present(const uint16_t *vram, int dx, int dy, int dw, int dh, bool rgb24, bool enabled)
+{
+    (void)vram;
+    while (g_paused) usleep(10000);
+    plat_gl_make_current();
+    gpu_present(dx, dy, dw, dh, rgb24, enabled);
     glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
-    glViewport(0, 0, g_view_w, g_view_h);
-    glClearColor(0, 0, 0, 1);
-    glClear(GL_COLOR_BUFFER_BIT);
-
-    if (enabled && dw > 0 && dh > 0) {
-        if (dw > 1024) dw = 1024;
-        if (dh > 512) dh = 512;
-        for (int y = 0; y < dh; y++) {
-            const uint16_t *row = vram + ((dy + y) & 511) * 1024;
-            uint16_t *out = g_conv + y * dw;
-            if (!rgb24) {
-                for (int x = 0; x < dw; x++) out[x] = px555_to_565(row[(dx + x) & 1023]);
-            } else {
-                const uint8_t *bytes = (const uint8_t *)row + ((dx * 2) & 2047);
-                for (int x = 0; x < dw; x++) {
-                    const uint8_t *p = bytes + x * 3;
-                    out[x] = (uint16_t)(((p[0] >> 3) << 11) | ((p[1] >> 2) << 5) | (p[2] >> 3));
-                }
-            }
-        }
-        glBindTexture(GL_TEXTURE_2D, g_tex);
-        glPixelStorei(GL_UNPACK_ALIGNMENT, 2);
-        /* rows are packed dw px apart in g_conv: upload only the visible width */
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, dw, dh, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, g_conv);
-
-        /* fit 4:3 inside the view */
-        float vw = (float)g_view_w, vh = (float)g_view_h, sx, sy;
-        if (vw / vh > 4.0f / 3.0f) { sy = 1.0f; sx = (vh * 4.0f / 3.0f) / vw; }
-        else { sx = 1.0f; sy = (vw * 3.0f / 4.0f) / vh; }
-        float u1 = (float)dw / 1024.0f, v1 = (float)dh / 512.0f;
-        float quad[16] = { -sx, -sy, 0, v1,   sx, -sy, u1, v1,   -sx, sy, 0, 0,   sx, sy, u1, 0 };
-        glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
-        glBufferData(GL_ARRAY_BUFFER, sizeof quad, quad, GL_STREAM_DRAW);
-        glEnableVertexAttribArray(0); glEnableVertexAttribArray(1);
-        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, (void *)0);
-        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 16, (void *)8);
-        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-    }
     glBindRenderbuffer(GL_RENDERBUFFER, g_rbo);
     [g_ctx presentRenderbuffer:GL_RENDERBUFFER];
 }
