@@ -358,6 +358,15 @@ typedef struct { float x, y; uint8_t r, g, b, a; float u, v; float tp[4]; float 
 #define MAXV 6144
 static GVert vb[MAXV];
 static int vn;
+/* Deferred blended pass: textured semi-transparent primitives need two passes (opaque texels, then
+ * blended texels). Instead of alternating passes per primitive (= 2 draw calls + GL state changes PER
+ * PRIMITIVE, which is what killed SGX535), pass-1 vertices go to vb and pass-2 vertices to vb2, and a
+ * whole run is drawn as [all pass 1][all pass 2]. Reordering is only unsafe where a later primitive
+ * overlaps an already-queued blended one, so that case flushes (bbox test). */
+static GVert vb2[MAXV];
+static int vn2;
+static bool pair_active;
+static int b2x0, b2y0, b2x1, b2y1;
 
 typedef struct {
     int prim, tex, pass, blend_on, blend, setmask, chk;
@@ -365,10 +374,11 @@ typedef struct {
     int scl, sct, scr, scb;
 } Key;
 static Key ck = { .prim = -1 };
+static Key ck2;
 
 /* Shadow of the GL state flush_batch() relies on. Everything else that touches GL (fills, copies,
  * uploads, readbacks, present) calls gl_invalidate() when done, so the next flush re-sends it. */
-static struct { GLuint prog; bool tex_ok, target_ok, attribs_vb, sc_ok; int blend; int sc[4]; } gs = { .blend = -2 };
+static struct { GLuint prog; bool tex_ok, target_ok, sc_ok; const GVert *attribs_ptr; int blend; int sc[4]; } gs = { .blend = -2 };
 
 static void gl_invalidate(void)
 {
@@ -411,10 +421,9 @@ static void set_attribs(const GVert *p)
     glVertexAttribPointer(4, 4, GL_FLOAT, GL_FALSE, sizeof(GVert), p->cl);
 }
 
-static void flush_batch(void)
+static void draw_buf(const GVert *buf, int cnt, const Key *k)
 {
-    if (vn == 0) return;
-    const Key *k = &ck;
+    if (cnt == 0) return;
     Prog *P = k->tex ? &pt : &pf;
     const bool timed = (st_draws & 15u) == 0;          /* sample 1 in 16 flushes for the CPU-time estimate */
     uint64_t t0 = timed ? plat_time_ns() : 0;
@@ -459,16 +468,22 @@ static void flush_batch(void)
         }
         gs.blend = wb;
     }
-    if (!gs.attribs_vb) { set_attribs(vb); gs.attribs_vb = true; }
-    glDrawArrays(k->prim ? GL_LINES : GL_TRIANGLES, 0, vn);
-    st_draws++; st_tris += (unsigned)(vn / 3);
-    vn = 0;
+    if (gs.attribs_ptr != buf) { set_attribs(buf); gs.attribs_ptr = buf; }
+    glDrawArrays(k->prim ? GL_LINES : GL_TRIANGLES, 0, cnt);
+    st_draws++; st_tris += (unsigned)(cnt / 3);
     if (!first_draw_logged) {
         first_draw_logged = true;
         GLenum e = glGetError();
         plat_log("[GPU] first draw call submitted to GLES2 (glGetError=0x%x)", (unsigned)e);
     }
     if (timed) st_flush_ns += (plat_time_ns() - t0) * 16u;
+}
+
+static void flush_batch(void)
+{
+    if (vn) { int n = vn; vn = 0; draw_buf(vb, n, &ck); }
+    if (vn2) { int n = vn2; vn2 = 0; draw_buf(vb2, n, &ck2); }
+    pair_active = false;
 }
 
 static void sync_snapshot(void)
@@ -506,32 +521,73 @@ static void submit(const GVert *v, int n, int prim, bool tex, bool semi, bool ra
 
     int depth = tp_depth > 2 ? 2 : tp_depth;
     int clutx = (clut & 0x3F) * 16, cluty = (clut >> 6) & 0x1FF;
-    int npass = (tex && semi) ? 2 : 1;
-    for (int pi = 0; pi < npass; pi++) {
-        Key k; memset(&k, 0, sizeof k);
-        k.prim = prim; k.tex = tex ? 1 : 0;
-        k.pass = (tex && semi) ? pi + 1 : 0;
-        k.blend_on = semi && (!tex || pi == 1);
-        k.blend = k.blend_on ? (blend_mode & 3) : 0;
-        k.setmask = set_mask; k.chk = check_mask;
-        k.scl = l; k.sct = t; k.scr = r; k.scb = b;
-        if (tex) {
-            int ua = (~(tw_mask_x * 8)) & 0xFF, uo = ((tw_off_x & tw_mask_x) * 8) & 0xFF;
-            int va = (~(tw_mask_y * 8)) & 0xFF, vo = ((tw_off_y & tw_mask_y) * 8) & 0xFF;
-            k.twin = (tw_mask_x || tw_mask_y);
-            k.twax = ua; k.tway = va; k.twox = uo; k.twoy = vo;
-            int wid = depth == 0 ? 64 : depth == 1 ? 128 : 256;
-            int cw = depth == 0 ? 16 : depth == 1 ? 256 : 0;
-            if (dirty_hit(tp_x, tp_y, wid, 256) || dirty_hit(clutx, cluty, cw, 1)) sync_snapshot();
-        }
-        if (check_mask && dirty_hit(bx0, by0, bx1 - bx0, by1 - by0)) sync_snapshot();
 
+    Key kb; memset(&kb, 0, sizeof kb);
+    kb.prim = prim; kb.tex = tex ? 1 : 0;
+    kb.setmask = set_mask; kb.chk = check_mask;
+    kb.scl = l; kb.sct = t; kb.scr = r; kb.scb = b;
+    if (tex) {
+        int ua = (~(tw_mask_x * 8)) & 0xFF, uo = ((tw_off_x & tw_mask_x) * 8) & 0xFF;
+        int va = (~(tw_mask_y * 8)) & 0xFF, vo = ((tw_off_y & tw_mask_y) * 8) & 0xFF;
+        kb.twin = (tw_mask_x || tw_mask_y);
+        kb.twax = ua; kb.tway = va; kb.twox = uo; kb.twoy = vo;
+        int wid = depth == 0 ? 64 : depth == 1 ? 128 : 256;
+        int cw = depth == 0 ? 16 : depth == 1 ? 256 : 0;
+        if (dirty_hit(tp_x, tp_y, wid, 256) || dirty_hit(clutx, cluty, cw, 1)) sync_snapshot();
+    }
+    if (check_mask && dirty_hit(bx0, by0, bx1 - bx0, by1 - by0)) sync_snapshot();
+
+    GVert *dv;
+    if (tex && semi) {
+        Key k1 = kb, k2 = kb;
+        k1.pass = 1; k1.blend_on = 0; k1.blend = 0;
+        k2.pass = 2; k2.blend_on = 1; k2.blend = blend_mode & 3;
+        if (vn + vn2 > 0) {
+            bool same = pair_active && memcmp(&ck, &k1, sizeof k1) == 0 && memcmp(&ck2, &k2, sizeof k2) == 0;
+            bool overlap = pair_active && vn2 > 0 && bx0 < b2x1 && bx1 > b2x0 && by0 < b2y1 && by1 > b2y0;
+            bool full = vn + n > MAXV || vn2 + n > MAXV;
+            if (full) { st_fr[FR_CAP]++; flush_batch(); }
+            else if (overlap) { st_fr[FR_PASS]++; flush_batch(); }
+            else if (!same) {
+                if (!pair_active || ck.prim != k1.prim) st_fr[FR_PRIM]++;
+                else if (ck.tex != k1.tex) st_fr[FR_TEX]++;
+                else if (ck.blend != k2.blend || ck2.blend != k2.blend) st_fr[FR_BLEND]++;
+                else if (ck.twin != k1.twin || ck.twax != k1.twax || ck.tway != k1.tway || ck.twox != k1.twox || ck.twoy != k1.twoy) st_fr[FR_TW]++;
+                else if (ck.scl != k1.scl || ck.sct != k1.sct || ck.scr != k1.scr || ck.scb != k1.scb) st_fr[FR_SCISSOR]++;
+                else st_fr[FR_MASK]++;
+                flush_batch();
+            }
+        }
+        if (!pair_active) {
+            ck = k1; ck2 = k2; pair_active = true;
+            b2x0 = bx0; b2y0 = by0; b2x1 = bx1; b2y1 = by1;
+        } else {
+            if (bx0 < b2x0) b2x0 = bx0;
+            if (by0 < b2y0) b2y0 = by0;
+            if (bx1 > b2x1) b2x1 = bx1;
+            if (by1 > b2y1) b2y1 = by1;
+        }
+        dv = vb + vn;
+        memcpy(dv, v, (size_t)n * sizeof(GVert));
+        for (int i = 0; i < n; i++) {
+            dv[i].tp[0] = (float)tp_x;  dv[i].tp[1] = (float)tp_y;
+            dv[i].tp[2] = (float)depth; dv[i].tp[3] = raw ? 1.0f : 0.0f;
+            dv[i].cl[0] = (float)clutx; dv[i].cl[1] = (float)cluty;
+            dv[i].cl[2] = dither ? 1.0f : 0.0f; dv[i].cl[3] = 0.0f;
+        }
+        memcpy(vb2 + vn2, dv, (size_t)n * sizeof(GVert));
+        vn += n; vn2 += n;
+    } else {
+        Key k = kb;
+        k.pass = 0;
+        k.blend_on = semi ? 1 : 0;              /* textured semi handled above, so this is flat semi only */
+        k.blend = k.blend_on ? (blend_mode & 3) : 0;
+        if (pair_active) { st_fr[FR_PASS]++; flush_batch(); }
         if (vn + n > MAXV) { st_fr[FR_CAP]++; flush_batch(); ck = k; }
         else if (memcmp(&k, &ck, sizeof k) != 0) {
             if (vn > 0) {
                 if (ck.prim != k.prim) st_fr[FR_PRIM]++;
                 else if (ck.tex != k.tex) st_fr[FR_TEX]++;
-                else if (ck.pass != k.pass) st_fr[FR_PASS]++;
                 else if (ck.blend_on != k.blend_on || ck.blend != k.blend) st_fr[FR_BLEND]++;
                 else if (ck.twin != k.twin || ck.twax != k.twax || ck.tway != k.tway || ck.twox != k.twox || ck.twoy != k.twoy) st_fr[FR_TW]++;
                 else if (ck.scl != k.scl || ck.sct != k.sct || ck.scr != k.scr || ck.scb != k.scb) st_fr[FR_SCISSOR]++;
@@ -539,7 +595,7 @@ static void submit(const GVert *v, int n, int prim, bool tex, bool semi, bool ra
             }
             flush_batch(); ck = k;
         }
-        GVert *dv = vb + vn;
+        dv = vb + vn;
         memcpy(dv, v, (size_t)n * sizeof(GVert));
         for (int i = 0; i < n; i++) {
             dv[i].tp[0] = tex ? (float)tp_x : 0.0f;  dv[i].tp[1] = tex ? (float)tp_y : 0.0f;
@@ -548,8 +604,8 @@ static void submit(const GVert *v, int n, int prim, bool tex, bool semi, bool ra
             dv[i].cl[2] = dither ? 1.0f : 0.0f;      dv[i].cl[3] = 0.0f;
         }
         vn += n;
-        dirty_add(bx0, by0, bx1, by1);
     }
+    dirty_add(bx0, by0, bx1, by1);
 }
 
 /* ------------------------------------------------------------------ */
