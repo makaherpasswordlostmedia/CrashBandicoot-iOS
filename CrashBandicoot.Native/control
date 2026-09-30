@@ -1,0 +1,9 @@
+Package: com.example.crashbandicoot.armv7
+Name: Crash Bandicoot (armv7)
+Version: 0.1.0-1
+Architecture: iphoneos-arm
+Description: Native armv7 static recompilation of Crash Bandicoot for iOS 7-9.3.5 (iPad mini 1). Requires your own disc image.
+Maintainer: You
+Author: RecompOne contributors
+Section: Games
+Depends: firmware (>= 7.0)
