@@ -199,3 +199,10 @@ CrashBandicoot.IosHost/Recompiled/
 CrashBandicoot.IosHost/Frameworks/
 CrashBandicoot.IosHost/bin/
 CrashBandicoot.IosHost/obj/
+
+# native armv7 port: generated from the user's own disc, never commit
+CrashBandicoot.Native/gen/
+CrashBandicoot.Native/.theos/
+CrashBandicoot.Native/packages/
+CrashBandicoot.Native/ipa/
+build/
