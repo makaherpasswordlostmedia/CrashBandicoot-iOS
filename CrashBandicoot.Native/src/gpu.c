@@ -219,6 +219,78 @@ static Plane make_plane(int32_t va, int32_t vb, int32_t vc, int32_t w0row, int32
     return p;
 }
 
+/* ---- span helpers -------------------------------------------------- */
+static inline int floor_div_pos(int n, int d) { return n >= 0 ? n / d : -((-n + d - 1) / d); }
+static inline int ceil_div_pos(int n, int d)  { return n > 0 ? (n + d - 1) / d : -((-n) / d); }
+
+/* Restrict [lo,hi] (offsets from min_x) to where A + s*t >= 0. Same test the
+ * old per-pixel loop did (w + bias >= 0), solved once per row instead. */
+static inline bool clip_edge(int A, int s, int *lo, int *hi)
+{
+    if (s == 0) return A >= 0;
+    if (s > 0) { int t = ceil_div_pos(-A, s); if (t > *lo) *lo = t; }
+    else       { int t = floor_div_pos(A, -s); if (t < *hi) *hi = t; }
+    return *lo <= *hi;
+}
+
+static inline void fill16(uint16_t *p, uint16_t v, int n)
+{
+    if (n <= 0) return;
+    if ((uintptr_t)p & 2u) { *p++ = v; n--; }
+    uint32_t vv = (uint32_t)v | ((uint32_t)v << 16);
+    uint32_t *q = (uint32_t *)p;
+    for (; n >= 2; n -= 2) *q++ = vv;
+    if (n) *(uint16_t *)q = v;
+}
+
+typedef struct {
+    uint16_t *vram;
+    int tpx, tpy, clut_x, clut_row;
+    int u_and, u_or, v_and, v_or;
+    uint16_t maskbit;
+} SpanCtx;
+
+/* Opaque, undithered, unmasked textured span. depth/raw/gouraud are
+ * compile-time constants at every call site so each combo is its own tight loop. */
+static inline __attribute__((always_inline))
+void span_tex(const SpanCtx *S, uint16_t *row, int x0, int x1,
+              int32_t fr, int32_t fg, int32_t fb, int32_t fu, int32_t fv,
+              const Plane *pr, const Plane *pg, const Plane *pb, const Plane *pu, const Plane *pv,
+              int flat_r, int flat_g, int flat_b,
+              const int depth, const bool raw, const bool gouraud)
+{
+    uint16_t *const vram = S->vram;
+    const int tpx = S->tpx, tpy = S->tpy, cx = S->clut_x, crow = S->clut_row;
+    const int ua = S->u_and, uo = S->u_or, va = S->v_and, vo = S->v_or;
+    const uint16_t maskbit = S->maskbit;
+    const int32_t dr = pr->dx, dg = pg->dx, db = pb->dx, du = pu->dx, dv = pv->dx;
+    for (int x = x0; x <= x1; x++, fr += dr, fg += dg, fb += db, fu += du, fv += dv) {
+        int u = ((fu >> 16) & ua) | uo; u &= 0xFF;
+        int v = ((fv >> 16) & va) | vo; v &= 0xFF;
+        const uint16_t *rowp = vram + ((tpy + v) & (VRAM_H - 1)) * VRAM_W;
+        uint16_t texel;
+        if (depth >= 2) texel = rowp[(tpx + u) & (VRAM_W - 1)];
+        else if (depth == 0) {
+            uint16_t block = rowp[(tpx + (u >> 2)) & (VRAM_W - 1)];
+            int index = (block >> ((u & 3) * 4)) & 0xF;
+            texel = vram[crow + ((cx + index) & (VRAM_W - 1))];
+        } else {
+            uint16_t block = rowp[(tpx + (u >> 1)) & (VRAM_W - 1)];
+            int index = (block >> ((u & 1) * 8)) & 0xFF;
+            texel = vram[crow + ((cx + index) & (VRAM_W - 1))];
+        }
+        if (texel == 0) continue;
+        int tr = (texel & 0x1F) << 3, tg = ((texel >> 5) & 0x1F) << 3, tb = ((texel >> 10) & 0x1F) << 3;
+        if (!raw) {
+            int r = gouraud ? (fr >> 16) : flat_r, g = gouraud ? (fg >> 16) : flat_g, b = gouraud ? (fb >> 16) : flat_b;
+            tr = tr * r >> 7; tg = tg * g >> 7; tb = tb * b >> 7;
+        }
+        int r5 = tr >> 3, g5 = tg >> 3, b5 = tb >> 3;
+        if (r5 > 31) r5 = 31; if (g5 > 31) g5 = 31; if (b5 > 31) b5 = 31;
+        row[x] = (uint16_t)(r5 | (g5 << 5) | (b5 << 10) | (texel & 0x8000) | maskbit);
+    }
+}
+
 static void raster_triangle(Vert a, Vert b, Vert c, bool tex, bool gouraud, bool semi, bool raw, int clut)
 {
     int span_x = imax3(a.x, b.x, c.x) - imin3(a.x, b.x, c.x);
@@ -258,12 +330,71 @@ static void raster_triangle(Vert a, Vert b, Vert c, bool tex, bool gouraud, bool
         pv = make_plane(a.v, b.v, c.v, w0row, w1row, w2row, sx0, sx1, sx2, sy0, sy1, sy2, area);
     }
 
-    for (int y = min_y; y <= max_y; y++, w0row += sy0, w1row += sy1, w2row += sy2) {
-        int32_t w0 = w0row, w1 = w1row, w2 = w2row;
-        int32_t fr = pr.base, fg = pg.base, fb = pb.base, fu = pu.base, fv = pv.base;
-        for (int x = min_x; x <= max_x; x++, w0 += sx0, w1 += sx1, w2 += sx2,
-             fr += pr.dx, fg += pg.dx, fb += pb.dx, fu += pu.dx, fv += pv.dx) {
-            if (w0 + bias0 < 0 || w1 + bias1 < 0 || w2 + bias2 < 0) continue;
+    /* Hoist everything the pixel loops read. The old code re-read these
+     * globals after every VRAM store (built with -fno-strict-aliasing). */
+    const bool sdither = tex ? dither_tex : (dither_on && gouraud);
+    const bool simple = !semi && !check_mask && !sdither;
+    const int depth = tp_depth;
+    SpanCtx S;
+    S.vram = g_vram;
+    S.tpx = tp_x; S.tpy = tp_y;
+    S.clut_x = (clut & 0x3F) * 16;
+    S.clut_row = ((clut >> 6) & 0x1FF & (VRAM_H - 1)) * VRAM_W;
+    S.u_and = ~(tw_mask_x * 8); S.u_or = (tw_off_x & tw_mask_x) * 8;
+    S.v_and = ~(tw_mask_y * 8); S.v_or = (tw_off_y & tw_mask_y) * 8;
+    S.maskbit = set_mask ? 0x8000 : 0;
+
+    uint16_t flat_color = 0;
+    if (!tex && !gouraud) {
+        int r5 = a.r >> 3, g5 = a.g >> 3, b5 = a.b >> 3;
+        if (r5 > 31) r5 = 31; if (g5 > 31) g5 = 31; if (b5 > 31) b5 = 31;
+        flat_color = (uint16_t)(r5 | (g5 << 5) | (b5 << 10) | S.maskbit);
+    }
+
+    const int width = max_x - min_x;
+    for (int y = min_y; y <= max_y; y++, w0row += sy0, w1row += sy1, w2row += sy2,
+         pr.base += pr.dy, pg.base += pg.dy, pb.base += pb.dy, pu.base += pu.dy, pv.base += pv.dy) {
+        int lo = 0, hi = width;
+        if (!clip_edge(w0row + bias0, sx0, &lo, &hi)) continue;
+        if (!clip_edge(w1row + bias1, sx1, &lo, &hi)) continue;
+        if (!clip_edge(w2row + bias2, sx2, &lo, &hi)) continue;
+        const int x0 = min_x + lo, x1 = min_x + hi;
+        uint16_t *row = S.vram + y * VRAM_W;
+        const uint32_t ulo = (uint32_t)lo;
+        int32_t fr = (int32_t)((uint32_t)pr.base + (uint32_t)pr.dx * ulo);
+        int32_t fg = (int32_t)((uint32_t)pg.base + (uint32_t)pg.dx * ulo);
+        int32_t fb = (int32_t)((uint32_t)pb.base + (uint32_t)pb.dx * ulo);
+        int32_t fu = (int32_t)((uint32_t)pu.base + (uint32_t)pu.dx * ulo);
+        int32_t fv = (int32_t)((uint32_t)pv.base + (uint32_t)pv.dx * ulo);
+
+        if (simple && !tex) {
+            if (!gouraud) { fill16(row + x0, flat_color, x1 - x0 + 1); continue; }
+            const int32_t dr = pr.dx, dg = pg.dx, db = pb.dx;
+            for (int x = x0; x <= x1; x++, fr += dr, fg += dg, fb += db) {
+                int r5 = (fr >> 16) >> 3, g5 = (fg >> 16) >> 3, b5 = (fb >> 16) >> 3;
+                if (r5 > 31) r5 = 31; if (g5 > 31) g5 = 31; if (b5 > 31) b5 = 31;
+                row[x] = (uint16_t)(r5 | (g5 << 5) | (b5 << 10) | S.maskbit);
+            }
+            continue;
+        }
+        if (simple && tex) {
+#define TS(D, R, G) span_tex(&S, row, x0, x1, fr, fg, fb, fu, fv, &pr, &pg, &pb, &pu, &pv, a.r, a.g, a.b, D, R, G)
+            if (depth >= 2) {
+                if (raw) { TS(2, true, false); }
+                else if (gouraud) { TS(2, false, true); } else { TS(2, false, false); }
+            } else if (depth == 0) {
+                if (raw) { TS(0, true, false); }
+                else if (gouraud) { TS(0, false, true); } else { TS(0, false, false); }
+            } else {
+                if (raw) { TS(1, true, false); }
+                else if (gouraud) { TS(1, false, true); } else { TS(1, false, false); }
+            }
+#undef TS
+            continue;
+        }
+
+        /* generic path (semi-transparent / dithered / mask-checked): unchanged maths */
+        for (int x = x0; x <= x1; x++, fr += pr.dx, fg += pg.dx, fb += pb.dx, fu += pu.dx, fv += pv.dx) {
             int r, g, bl;
             if (gouraud) { r = fr >> 16; g = fg >> 16; bl = fb >> 16; }
             else { r = a.r; g = a.g; bl = a.b; }
@@ -278,7 +409,6 @@ static void raster_triangle(Vert a, Vert b, Vert c, bool tex, bool gouraud, bool
                 plot(x, y, r, g, bl, semi, dither_on && gouraud, false);
             }
         }
-        pr.base += pr.dy; pg.base += pg.dy; pb.base += pb.dy; pu.base += pu.dy; pv.base += pv.dy;
     }
 }
 
