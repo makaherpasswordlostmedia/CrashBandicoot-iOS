@@ -149,8 +149,9 @@ static inline void heal_geom(CpuContext *c)
 void disp_call(CpuContext *c, uint32_t addr)
 {
     g_last_call_addr = addr;
-    g_call_count++;
-    libetc_maybe_catch_up_vblank();
+    /* Reading the clock costs a syscall-ish mach call plus a 64-bit divide on
+     * armv7, so only look at it every 64th call (vblank is 16 ms apart). */
+    if ((++g_call_count & 63u) == 0) libetc_maybe_catch_up_vblank();
     cd_advance_streaming();
     if (bios_try_dispatch(c, addr)) return;
     RecompFn fn = fmap_get(addr);
