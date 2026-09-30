@@ -41,7 +41,9 @@ uint64_t plat_time_ns(void)
 {
     static mach_timebase_info_data_t tb;
     if (tb.denom == 0) mach_timebase_info(&tb);
-    return mach_absolute_time() * tb.numer / tb.denom;
+    uint64_t t = mach_absolute_time();
+    if (tb.numer == tb.denom) return t;   /* skip the 64-bit divide (slow on armv7) */
+    return t * tb.numer / tb.denom;
 }
 void plat_sleep_us(unsigned us) { usleep(us); }
 
@@ -158,7 +160,7 @@ void plat_present(const uint16_t *vram, int dx, int dy, int dw, int dh, bool rgb
         if (dh > 512) dh = 512;
         for (int y = 0; y < dh; y++) {
             const uint16_t *row = vram + ((dy + y) & 511) * 1024;
-            uint16_t *out = g_conv + y * 1024;
+            uint16_t *out = g_conv + y * dw;
             if (!rgb24) {
                 for (int x = 0; x < dw; x++) out[x] = px555_to_565(row[(dx + x) & 1023]);
             } else {
@@ -171,8 +173,8 @@ void plat_present(const uint16_t *vram, int dx, int dy, int dw, int dh, bool rgb
         }
         glBindTexture(GL_TEXTURE_2D, g_tex);
         glPixelStorei(GL_UNPACK_ALIGNMENT, 2);
-        /* rows are 1024 px apart in g_conv, so upload the full-width strip */
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 1024, dh, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, g_conv);
+        /* rows are packed dw px apart in g_conv: upload only the visible width */
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, dw, dh, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, g_conv);
 
         /* fit 4:3 inside the view */
         float vw = (float)g_view_w, vh = (float)g_view_h, sx, sy;
