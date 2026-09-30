@@ -30,6 +30,13 @@ ADDITIONAL_CFLAGS += -fno-modules -fno-implicit-modules -fno-implicit-module-map
 
 CrashBandicootARMv7_CFLAGS = -Isrc -Igen -Ihost -std=gnu11 -DNDEBUG
 
+# Hot software-rasteriser / GTE / SPU / MDEC code: full -O3. The huge generated
+# gen/*.c stays at the default level (bigger code hurts the A5's 32 KB I-cache).
+gpu.c_CFLAGS += -O3
+gte.c_CFLAGS += -O3
+spu.c_CFLAGS += -O3
+mdec.c_CFLAGS += -O3
+
 CrashBandicootARMv7_LDFLAGS = \
 	-framework UIKit -framework Foundation -framework QuartzCore -framework CoreGraphics \
 	-framework OpenGLES -framework AudioToolbox -framework AVFoundation \
