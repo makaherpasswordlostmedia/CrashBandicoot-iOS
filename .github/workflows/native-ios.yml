@@ -1,0 +1,145 @@
+name: Native armv7 build (iPad mini 1 / iOS 9.3.5)
+
+# C port of the RecompOne runtime (CrashBandicoot.Native) built with Theos
+# on a plain Linux runner. The disc image is used ONLY to recompile the game
+# executable during the build; the resulting .ipa/.deb contains no game data.
+# Put game.cue + game.bin into the app's Documents folder on the device.
+
+on:
+  workflow_dispatch:
+    inputs:
+      cue_file_id:
+        description: "Google Drive file ID of your own game .cue (shared 'Anyone with the link')"
+        required: true
+      bin_file_id:
+        description: "Google Drive file ID of your own game .bin (shared 'Anyone with the link')"
+        required: true
+
+env:
+  IOS_SDK_VERSION: "9.3"
+  IOS_DEPLOY_TARGET: "7.0"
+
+jobs:
+  desktop-smoke:
+    name: Runtime smoke tests (x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run tests
+        working-directory: CrashBandicoot.Native
+        run: |
+          gcc -std=gnu11 -O1 -g -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation \
+              -Wno-format-truncation -Wno-tautological-compare -Isrc -Itests \
+              -o /tmp/smoke src/*.c tests/host_stub.c tests/test_main.c -lpthread
+          /tmp/smoke
+
+  build-ios-armv7:
+    name: Recompile + build (Theos / armv7)
+    needs: desktop-smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential perl curl ca-certificates zip unzip xz-utils bzip2 git fakeroot make python3 python3-pip
+
+      - name: Install .NET 10
+        run: |
+          curl -sSL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel 10.0 --install-dir "$HOME/.dotnet10"
+          echo "$HOME/.dotnet10" >> "$GITHUB_PATH"
+
+      - name: Fetch disc image (yours, from Google Drive)
+        env:
+          CUE_FILE_ID: ${{ inputs.cue_file_id }}
+          BIN_FILE_ID: ${{ inputs.bin_file_id }}
+        run: |
+          set -e
+          mkdir -p "$RUNNER_TEMP/disc"
+          pip install -q gdown
+          gdown "$CUE_FILE_ID" -O "$RUNNER_TEMP/disc/game.cue"
+          gdown "$BIN_FILE_ID" -O "$RUNNER_TEMP/disc/game.bin"
+          sed -i -E 's/^FILE "[^"]+"/FILE "game.bin"/' "$RUNNER_TEMP/disc/game.cue"
+          grep -q TRACK "$RUNNER_TEMP/disc/game.cue" || { echo "::error::game.cue has no TRACK line"; cat "$RUNNER_TEMP/disc/game.cue"; exit 1; }
+          ls -la "$RUNNER_TEMP/disc"
+
+      - name: Recompile (ELF -> C# -> C)
+        run: ./scripts/prerecompile_native.sh "$RUNNER_TEMP/disc/game.cue" 2>&1 | tee build-recomp.log
+
+      - name: Host compile check of generated C (gcc, syntax only)
+        working-directory: CrashBandicoot.Native
+        run: |
+          for f in gen/*.c; do gcc -std=gnu11 -fsyntax-only -Isrc -Igen -Wno-unused-label "$f" || exit 1; done
+
+      - name: Install Theos + iOS toolchain
+        env:
+          THEOS: ${{ github.workspace }}/theos
+        run: |
+          git clone --recursive https://github.com/theos/theos.git "$THEOS"
+          mkdir -p "$THEOS/toolchain/linux/iphone"
+          curl -fsSL "https://github.com/L1ghtmann/llvm-project/releases/download/main-update_3-eabca92/iOSToolchain-x86_64.tar.xz" -o /tmp/ios-toolchain.tar.xz
+          tar -xf /tmp/ios-toolchain.tar.xz -C "$THEOS/toolchain"
+          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+
+      - name: Install iPhoneOS 9.3 SDK
+        env:
+          THEOS: ${{ github.workspace }}/theos
+        run: |
+          mkdir -p "$THEOS/sdks"
+          curl -fsSL -o /tmp/iphoneos9.3.sdk.tbz2 "https://raw.githubusercontent.com/Sn0wCooder/theos-sdks/master/iPhoneOS9.3.sdk.tbz2"
+          tar -xjf /tmp/iphoneos9.3.sdk.tbz2 -C "$THEOS/sdks"
+          SDK="$THEOS/sdks/iPhoneOS9.3.sdk"
+          for fw in "$SDK"/System/Library/Frameworks/*.framework; do
+            if [ -f "$fw/module.map" ]; then mkdir -p "$fw/Modules"; mv "$fw/module.map" "$fw/Modules/module.modulemap"; fi
+          done
+          find "$SDK/usr/include" -name module.map | while read -r m; do mv "$m" "$(dirname "$m")/module.modulemap"; done
+
+      - name: Build .deb / .app with Theos
+        working-directory: CrashBandicoot.Native
+        env:
+          THEOS: ${{ github.workspace }}/theos
+          FINALPACKAGE: "1"
+        run: |
+          set -o pipefail
+          make -f Makefile clean
+          make -f Makefile package FINALPACKAGE=1 V=1 2>&1 | tee ../build-theos.log
+          ls -la packages
+
+      - name: Verify Mach-O
+        working-directory: CrashBandicoot.Native
+        run: |
+          BIN="$(find .theos -type f -name CrashBandicootARMv7 | head -n1)"
+          file "$BIN" || true
+          TOOLBIN="$THEOS/toolchain/linux/iphone/bin"
+          OTOOL="$(ls "$TOOLBIN"/*otool* 2>/dev/null | head -n1)"
+          [ -n "$OTOOL" ] && "$OTOOL" -hv -l "$BIN" | grep -E "cputype|ARM|LC_VERSION_MIN|version" | head -10 || true
+
+      - name: Pack .ipa
+        working-directory: CrashBandicoot.Native
+        run: |
+          APP="$(find .theos -type d -name CrashBandicootARMv7.app | head -n1)"
+          rm -rf ipa && mkdir -p ipa/Payload
+          cp -a "$APP" ipa/Payload/
+          (cd ipa && zip -rq "../packages/CrashBandicoot-armv7-$(git rev-parse --short HEAD).ipa" Payload)
+          ls -la packages
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: CrashBandicoot-armv7-iOS9
+          path: |
+            CrashBandicoot.Native/packages/*.ipa
+            CrashBandicoot.Native/packages/*.deb
+          if-no-files-found: error
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            build-recomp.log
+            build-theos.log
+          if-no-files-found: ignore
