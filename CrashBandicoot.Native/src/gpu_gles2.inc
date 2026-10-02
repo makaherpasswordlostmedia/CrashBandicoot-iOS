@@ -74,7 +74,8 @@ static uint8_t *scr_a, *scr_b, *scr_c;    /* 1024*512*4 scratch buffers */
 static unsigned st_frames, st_draws, st_tris, st_syncs, st_uploads, st_reads, st_fills, st_copies;
 static unsigned st_last_draws, st_last_tris;
 static uint64_t st_last_ns;
-/* why a batch was flushed (submit): 0 tex/flat program, 1 pass, 2 blend, 3 prim, 4 tex window, 5 scissor, 6 mask, 7 vertex cap */
+/* why a batch was flushed (bucket_queue): tex = out of bucket slots, pass = would reorder over an overlapping
+ * later bucket, cap = bucket full; blend/prim/tw/scissor/mask are no longer flush causes (they open a new bucket) */
 enum { FR_TEX, FR_PASS, FR_BLEND, FR_PRIM, FR_TW, FR_SCISSOR, FR_MASK, FR_CAP, FR_N };
 static unsigned st_fr[FR_N], st_fr_last[FR_N];
 static uint64_t st_flush_ns, st_flush_ns_last, st_present_ns, st_present_ns_last;
@@ -353,32 +354,39 @@ static bool dirty_hit(int x, int y, int w, int h)
 /* Vertex batching                                                      */
 /* ------------------------------------------------------------------ */
 /* tp = (texpage x, texpage y, depth, raw), cl = (clut x, clut y, dither, 0): per-vertex copies of
- * per-primitive state, so primitives with different texpage/CLUT/dither share one draw call. */
-typedef struct { float x, y; uint8_t r, g, b, a; float u, v; float tp[4]; float cl[4]; } GVert;   /* 52 bytes */
-#define MAXV 6144
-static GVert vb[MAXV];
-static int vn;
-/* Deferred blended pass: textured semi-transparent primitives need two passes (opaque texels, then
- * blended texels). Instead of alternating passes per primitive (= 2 draw calls + GL state changes PER
- * PRIMITIVE, which is what killed SGX535), pass-1 vertices go to vb and pass-2 vertices to vb2, and a
- * whole run is drawn as [all pass 1][all pass 2]. Reordering is only unsafe where a later primitive
- * overlaps an already-queued blended one, so that case flushes (bbox test). */
-static GVert vb2[MAXV];
-static int vn2;
-static bool pair_active;
-static int b2x0, b2y0, b2x1, b2y1;
+ * per-primitive state, so primitives with different texpage/CLUT/dither share one draw call.
+ * tp/cl are int16 (GL_SHORT, unnormalized -> the shader still sees the same float values):
+ * 36 bytes per vertex instead of 52, which cuts the CPU copy the driver does for every
+ * client-side-array draw. */
+typedef struct { float x, y; uint8_t r, g, b, a; float u, v; int16_t tp[4]; int16_t cl[4]; } GVert;   /* 36 bytes */
 
 typedef struct {
     int prim, tex, pass, blend_on, blend, setmask, chk;
     int twin, twax, tway, twox, twoy;
     int scl, sct, scr, scb;
 } Key;
-static Key ck = { .prim = -1 };
-static Key ck2;
+
+/* Bucketed batching.
+ * Instead of one open batch that is flushed whenever the GL state key changes, up to NBUCK
+ * buckets (one per distinct Key) stay open. A primitive joins the bucket with its key, or opens a
+ * new one. Buckets are drawn in creation order. Moving a primitive P into bucket i means it is
+ * drawn BEFORE everything queued in buckets j > i, so that is only legal if P's bounding box does
+ * not overlap any bucket j > i (otherwise painter's order would break). In that case, or when a
+ * bucket / the slot table is full, everything is flushed. This never flushes more often than the
+ * old single-key batcher (a conflict implies the key had changed since bucket i was opened), and
+ * HUD / sprites / flat / textured primitives that do not overlap each other now merge.
+ * Textured semi-transparent primitives go into two buckets (pass 1 = opaque texels, pass 2 =
+ * blended texels); pass-1 buckets are always created before their pass-2 buckets, so a run is
+ * drawn as [all pass 1][all pass 2] exactly like before, and the overlap rule protects it. */
+#define NBUCK 6
+#define BUCKV 3072                   /* vertices per bucket (multiple of 6) */
+typedef struct { Key k; int n; int x0, y0, x1, y1; GVert v[BUCKV]; } Bucket;
+static Bucket bk[NBUCK];
+static int nbk;
 
 /* Shadow of the GL state flush_batch() relies on. Everything else that touches GL (fills, copies,
  * uploads, readbacks, present) calls gl_invalidate() when done, so the next flush re-sends it. */
-static struct { GLuint prog; bool tex_ok, target_ok, sc_ok; const GVert *attribs_ptr; int blend; int sc[4]; } gs = { .blend = -2 };
+static struct { GLuint prog; bool tex_ok, target_ok, sc_ok, arrays_on; const GVert *attribs_ptr; int blend; int sc[4]; } gs = { .blend = -2 };
 
 static void gl_invalidate(void)
 {
@@ -410,15 +418,25 @@ static inline void u2f(Prog *P, int slot, GLint loc, float a, float b)
     glUniform2f(loc, a, b);
 }
 
-static void set_attribs(const GVert *p)
+static void set_attrib_ptrs(const GVert *p)
 {
-    glEnableVertexAttribArray(0); glEnableVertexAttribArray(1); glEnableVertexAttribArray(2);
-    glEnableVertexAttribArray(3); glEnableVertexAttribArray(4);
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(GVert), &p->x);
     glVertexAttribPointer(1, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(GVert), &p->r);
     glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(GVert), &p->u);
-    glVertexAttribPointer(3, 4, GL_FLOAT, GL_FALSE, sizeof(GVert), p->tp);
-    glVertexAttribPointer(4, 4, GL_FLOAT, GL_FALSE, sizeof(GVert), p->cl);
+    glVertexAttribPointer(3, 4, GL_SHORT, GL_FALSE, sizeof(GVert), p->tp);
+    glVertexAttribPointer(4, 4, GL_SHORT, GL_FALSE, sizeof(GVert), p->cl);
+}
+
+static void enable_attribs(void)
+{
+    glEnableVertexAttribArray(0); glEnableVertexAttribArray(1); glEnableVertexAttribArray(2);
+    glEnableVertexAttribArray(3); glEnableVertexAttribArray(4);
+}
+
+static void set_attribs(const GVert *p)
+{
+    enable_attribs();
+    set_attrib_ptrs(p);
 }
 
 static void draw_buf(const GVert *buf, int cnt, const Key *k)
@@ -468,7 +486,8 @@ static void draw_buf(const GVert *buf, int cnt, const Key *k)
         }
         gs.blend = wb;
     }
-    if (gs.attribs_ptr != buf) { set_attribs(buf); gs.attribs_ptr = buf; }
+    if (!gs.arrays_on) { enable_attribs(); gs.arrays_on = true; }
+    if (gs.attribs_ptr != buf) { set_attrib_ptrs(buf); gs.attribs_ptr = buf; }
     glDrawArrays(k->prim ? GL_LINES : GL_TRIANGLES, 0, cnt);
     st_draws++; st_tris += (unsigned)(cnt / 3);
     if (!first_draw_logged) {
@@ -481,9 +500,13 @@ static void draw_buf(const GVert *buf, int cnt, const Key *k)
 
 static void flush_batch(void)
 {
-    if (vn) { int n = vn; vn = 0; draw_buf(vb, n, &ck); }
-    if (vn2) { int n = vn2; vn2 = 0; draw_buf(vb2, n, &ck2); }
-    pair_active = false;
+    int n = nbk;
+    nbk = 0;
+    for (int i = 0; i < n; i++) {
+        int c = bk[i].n;
+        bk[i].n = 0;
+        draw_buf(bk[i].v, c, &bk[i].k);
+    }
 }
 
 static void sync_snapshot(void)
@@ -501,9 +524,45 @@ static void sync_snapshot(void)
     gl_invalidate();
 }
 
-/* Queue n vertices. tex/semi/raw/dither describe the primitive, prim 0=triangles 1=lines. */
+/* Copy n vertices (already carrying tp/cl) into the bucket for key k. Flush causes are counted as:
+ * FR_PASS = would reorder over an overlapping later bucket, FR_CAP = bucket full, FR_TEX = out of slots. */
+static void bucket_queue(const Key *k, const GVert *src, int n, int x0, int y0, int x1, int y1)
+{
+    int i;
+    for (i = 0; i < nbk; i++)
+        if (memcmp(&bk[i].k, k, sizeof *k) == 0) break;
+
+    if (i < nbk) {
+        bool bad = false;
+        if (bk[i].n + n > BUCKV) { st_fr[FR_CAP]++; bad = true; }
+        else {
+            for (int j = i + 1; j < nbk; j++) {
+                if (x0 < bk[j].x1 && x1 > bk[j].x0 && y0 < bk[j].y1 && y1 > bk[j].y0) { st_fr[FR_PASS]++; bad = true; break; }
+            }
+        }
+        if (bad) { flush_batch(); i = nbk; }
+    } else if (nbk == NBUCK) {
+        st_fr[FR_TEX]++; flush_batch();
+    }
+
+    if (i == nbk) {                                   /* open a new bucket at the end (always order-safe) */
+        i = nbk++;
+        bk[i].k = *k; bk[i].n = 0;
+        bk[i].x0 = x0; bk[i].y0 = y0; bk[i].x1 = x1; bk[i].y1 = y1;
+    } else {
+        if (x0 < bk[i].x0) bk[i].x0 = x0;
+        if (y0 < bk[i].y0) bk[i].y0 = y0;
+        if (x1 > bk[i].x1) bk[i].x1 = x1;
+        if (y1 > bk[i].y1) bk[i].y1 = y1;
+    }
+    memcpy(bk[i].v + bk[i].n, src, (size_t)n * sizeof(GVert));
+    bk[i].n += n;
+}
+
+/* Queue n (<= 6) vertices. tex/semi/raw/dither describe the primitive, prim 0=triangles 1=lines. */
 static void submit(const GVert *v, int n, int prim, bool tex, bool semi, bool raw, bool dither, int clut)
 {
+    if (n > 6) return;
     int l = imax(draw_left, 0), t = imax(draw_top, 0);
     int r = imin(draw_right, VRAM_W - 1), b = imin(draw_bottom, VRAM_H - 1);
     if (r < l || b < t) return;
@@ -533,77 +592,52 @@ static void submit(const GVert *v, int n, int prim, bool tex, bool semi, bool ra
         kb.twax = ua; kb.tway = va; kb.twox = uo; kb.twoy = vo;
         int wid = depth == 0 ? 64 : depth == 1 ? 128 : 256;
         int cw = depth == 0 ? 16 : depth == 1 ? 256 : 0;
-        if (dirty_hit(tp_x, tp_y, wid, 256) || dirty_hit(clutx, cluty, cw, 1)) sync_snapshot();
+        /* Texture footprint: the UV bounding box of this primitive, not the whole 256x256 page. A
+         * full-page test made almost every textured draw "hit" the dirty rectangle, forcing a
+         * flush + glCopyTexSubImage2D (a tile-GPU stall). Falls back to the whole page with a
+         * texture window or when UVs run past the page (rectangles that tile). */
+        int px0 = tp_x, py0 = tp_y, pw = wid, ph = 256;
+        if (!kb.twin) {
+            float umn = v[0].u, umx = umn, vmn = v[0].v, vmx = vmn;
+            for (int i = 1; i < n; i++) {
+                if (v[i].u < umn) umn = v[i].u;
+                if (v[i].u > umx) umx = v[i].u;
+                if (v[i].v < vmn) vmn = v[i].v;
+                if (v[i].v > vmx) vmx = v[i].v;
+            }
+            if (umn >= 0.0f && umx <= 255.0f && vmn >= 0.0f && vmx <= 255.0f) {
+                int u0 = imax((int)umn - 1, 0), u1 = imin((int)umx + 1, 255);
+                int v0 = imax((int)vmn - 1, 0), v1 = imin((int)vmx + 1, 255);
+                int sh = depth == 0 ? 2 : depth == 1 ? 1 : 0;      /* texels per VRAM halfword = 1 << sh */
+                px0 = tp_x + (u0 >> sh); pw = (u1 >> sh) - (u0 >> sh) + 1;
+                py0 = tp_y + v0;         ph = v1 - v0 + 1;
+            }
+        }
+        if (dirty_hit(px0, py0, pw, ph) || dirty_hit(clutx, cluty, cw, 1)) sync_snapshot();
     }
     if (check_mask && dirty_hit(bx0, by0, bx1 - bx0, by1 - by0)) sync_snapshot();
 
-    GVert *dv;
+    GVert tv[6];
+    memcpy(tv, v, (size_t)n * sizeof(GVert));
+    for (int i = 0; i < n; i++) {
+        tv[i].tp[0] = (int16_t)(tex ? tp_x : 0); tv[i].tp[1] = (int16_t)(tex ? tp_y : 0);
+        tv[i].tp[2] = (int16_t)depth;            tv[i].tp[3] = (int16_t)(raw ? 1 : 0);
+        tv[i].cl[0] = (int16_t)clutx;            tv[i].cl[1] = (int16_t)cluty;
+        tv[i].cl[2] = (int16_t)(dither ? 1 : 0); tv[i].cl[3] = 0;
+    }
+
     if (tex && semi) {
         Key k1 = kb, k2 = kb;
         k1.pass = 1; k1.blend_on = 0; k1.blend = 0;
         k2.pass = 2; k2.blend_on = 1; k2.blend = blend_mode & 3;
-        if (vn + vn2 > 0) {
-            bool same = pair_active && memcmp(&ck, &k1, sizeof k1) == 0 && memcmp(&ck2, &k2, sizeof k2) == 0;
-            bool overlap = pair_active && vn2 > 0 && bx0 < b2x1 && bx1 > b2x0 && by0 < b2y1 && by1 > b2y0;
-            bool full = vn + n > MAXV || vn2 + n > MAXV;
-            if (full) { st_fr[FR_CAP]++; flush_batch(); }
-            else if (overlap) { st_fr[FR_PASS]++; flush_batch(); }
-            else if (!same) {
-                if (!pair_active || ck.prim != k1.prim) st_fr[FR_PRIM]++;
-                else if (ck.tex != k1.tex) st_fr[FR_TEX]++;
-                else if (ck.blend != k2.blend || ck2.blend != k2.blend) st_fr[FR_BLEND]++;
-                else if (ck.twin != k1.twin || ck.twax != k1.twax || ck.tway != k1.tway || ck.twox != k1.twox || ck.twoy != k1.twoy) st_fr[FR_TW]++;
-                else if (ck.scl != k1.scl || ck.sct != k1.sct || ck.scr != k1.scr || ck.scb != k1.scb) st_fr[FR_SCISSOR]++;
-                else st_fr[FR_MASK]++;
-                flush_batch();
-            }
-        }
-        if (!pair_active) {
-            ck = k1; ck2 = k2; pair_active = true;
-            b2x0 = bx0; b2y0 = by0; b2x1 = bx1; b2y1 = by1;
-        } else {
-            if (bx0 < b2x0) b2x0 = bx0;
-            if (by0 < b2y0) b2y0 = by0;
-            if (bx1 > b2x1) b2x1 = bx1;
-            if (by1 > b2y1) b2y1 = by1;
-        }
-        dv = vb + vn;
-        memcpy(dv, v, (size_t)n * sizeof(GVert));
-        for (int i = 0; i < n; i++) {
-            dv[i].tp[0] = (float)tp_x;  dv[i].tp[1] = (float)tp_y;
-            dv[i].tp[2] = (float)depth; dv[i].tp[3] = raw ? 1.0f : 0.0f;
-            dv[i].cl[0] = (float)clutx; dv[i].cl[1] = (float)cluty;
-            dv[i].cl[2] = dither ? 1.0f : 0.0f; dv[i].cl[3] = 0.0f;
-        }
-        memcpy(vb2 + vn2, dv, (size_t)n * sizeof(GVert));
-        vn += n; vn2 += n;
+        bucket_queue(&k1, tv, n, bx0, by0, bx1, by1);   /* vertices are copied before the 2nd call can flush */
+        bucket_queue(&k2, tv, n, bx0, by0, bx1, by1);
     } else {
         Key k = kb;
         k.pass = 0;
         k.blend_on = semi ? 1 : 0;              /* textured semi handled above, so this is flat semi only */
         k.blend = k.blend_on ? (blend_mode & 3) : 0;
-        if (pair_active) { st_fr[FR_PASS]++; flush_batch(); }
-        if (vn + n > MAXV) { st_fr[FR_CAP]++; flush_batch(); ck = k; }
-        else if (memcmp(&k, &ck, sizeof k) != 0) {
-            if (vn > 0) {
-                if (ck.prim != k.prim) st_fr[FR_PRIM]++;
-                else if (ck.tex != k.tex) st_fr[FR_TEX]++;
-                else if (ck.blend_on != k.blend_on || ck.blend != k.blend) st_fr[FR_BLEND]++;
-                else if (ck.twin != k.twin || ck.twax != k.twax || ck.tway != k.tway || ck.twox != k.twox || ck.twoy != k.twoy) st_fr[FR_TW]++;
-                else if (ck.scl != k.scl || ck.sct != k.sct || ck.scr != k.scr || ck.scb != k.scb) st_fr[FR_SCISSOR]++;
-                else st_fr[FR_MASK]++;
-            }
-            flush_batch(); ck = k;
-        }
-        dv = vb + vn;
-        memcpy(dv, v, (size_t)n * sizeof(GVert));
-        for (int i = 0; i < n; i++) {
-            dv[i].tp[0] = tex ? (float)tp_x : 0.0f;  dv[i].tp[1] = tex ? (float)tp_y : 0.0f;
-            dv[i].tp[2] = (float)depth;              dv[i].tp[3] = raw ? 1.0f : 0.0f;
-            dv[i].cl[0] = (float)clutx;              dv[i].cl[1] = (float)cluty;
-            dv[i].cl[2] = dither ? 1.0f : 0.0f;      dv[i].cl[3] = 0.0f;
-        }
-        vn += n;
+        bucket_queue(&k, tv, n, bx0, by0, bx1, by1);
     }
     dirty_add(bx0, by0, bx1, by1);
 }
