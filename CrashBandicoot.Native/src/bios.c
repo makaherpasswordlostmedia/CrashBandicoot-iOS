@@ -48,7 +48,7 @@ static void format_string(CpuContext *c, const char *fmt, char *out, size_t max)
 /* ------------------------------------------------------------------ */
 /* Heap (BIOS A(33h)... malloc family)                                  */
 /* ------------------------------------------------------------------ */
-#define HEAP_MAX 4096
+#define HEAP_MAX 16384
 typedef struct { uint32_t start, end; } Span;
 static Span g_free[HEAP_MAX]; static int g_free_n;
 typedef struct { uint32_t addr, size; } Busy;
@@ -58,7 +58,7 @@ static void free_insert(uint32_t s, uint32_t e)
 {
     int i = 0;
     while (i < g_free_n && g_free[i].start < s) i++;
-    if (g_free_n >= HEAP_MAX) return;
+    if (g_free_n >= HEAP_MAX) { LOG("[HEAP] free table full, span 0x%08X-0x%08X lost", s, e); return; }
     memmove(&g_free[i + 1], &g_free[i], (size_t)(g_free_n - i) * sizeof(Span));
     g_free[i].start = s; g_free[i].end = e; g_free_n++;
 }
@@ -76,10 +76,11 @@ static uint32_t h_malloc(uint32_t size)
             uint32_t addr = g_free[i].start, end = g_free[i].end;
             memmove(&g_free[i], &g_free[i + 1], (size_t)(g_free_n - i - 1) * sizeof(Span)); g_free_n--;
             if (end - addr > size) free_insert(addr + size, end);
-            if (g_busy_n < HEAP_MAX) { g_busy[g_busy_n].addr = addr; g_busy[g_busy_n].size = size; g_busy_n++; }
+            if (g_busy_n < HEAP_MAX) { g_busy[g_busy_n].addr = addr; g_busy[g_busy_n].size = size; g_busy_n++; } else LOG("[HEAP] busy table full, block 0x%08X can never be freed", addr);
             return addr;
         }
     }
+    LOG("[HEAP] malloc(%u) failed, free spans=%d busy=%d", size, g_free_n, g_busy_n);
     return 0;
 }
 static int busy_find(uint32_t addr) { for (int i = 0; i < g_busy_n; i++) if (g_busy[i].addr == addr) return i; return -1; }
@@ -89,14 +90,16 @@ static void h_free(uint32_t addr)
     int bi = busy_find(addr); if (bi < 0) return;
     uint32_t size = g_busy[bi].size;
     g_busy[bi] = g_busy[--g_busy_n];
-    uint32_t end = addr + size;
-    for (int i = 0; i < g_free_n; i++)
-        if (g_free[i].start == end) {
-            end = g_free[i].end;
-            memmove(&g_free[i], &g_free[i + 1], (size_t)(g_free_n - i - 1) * sizeof(Span)); g_free_n--;
-            break;
-        }
-    free_insert(addr, end);
+    uint32_t start = addr, end = addr + size;
+    /* coalesce with BOTH neighbours (the old code only merged the next span,
+     * so freed blocks fragmented the heap until malloc started returning 0) */
+    for (int i = 0; i < g_free_n; ) {
+        if (g_free[i].end == start)      { start = g_free[i].start; }
+        else if (g_free[i].start == end) { end = g_free[i].end; }
+        else { i++; continue; }
+        memmove(&g_free[i], &g_free[i + 1], (size_t)(g_free_n - i - 1) * sizeof(Span)); g_free_n--;
+    }
+    free_insert(start, end);
 }
 
 /* byte-wise memory helpers over emulated RAM */
