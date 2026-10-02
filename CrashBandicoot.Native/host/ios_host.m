@@ -19,6 +19,7 @@
 /* ------------------------------------------------------------------ */
 /* Paths / logging                                                      */
 /* ------------------------------------------------------------------ */
+static void *wd_thread(void *arg);
 static char g_docs[512], g_cue[600], g_saves[600], g_logpath[600];
 static FILE *g_logf;
 static pthread_mutex_t g_log_mx = PTHREAD_MUTEX_INITIALIZER;
@@ -368,11 +369,34 @@ void plat_fatal(const char *msg)
     t.stackSize = 16 * 1024 * 1024;
     t.name = @"emu";
     [t start];
+    { pthread_t wt; pthread_create(&wt, NULL, wd_thread, NULL); pthread_detach(wt); }
     return YES;
 }
 - (void)applicationWillResignActive:(UIApplication *)a { g_paused = 1; if (g_aq) AudioQueuePause(g_aq); if (g_card_a) card_flush(g_card_a); if (g_card_b) card_flush(g_card_b); }
 - (void)applicationDidBecomeActive:(UIApplication *)a { g_paused = 0; if (g_aq) AudioQueueStart(g_aq, NULL); }
 @end
+
+
+/* Freeze watchdog: if the emulation thread stops presenting frames for >3 s
+ * (and the app is not paused) write where the guest CPU is stuck to crash.log. */
+static void *wd_thread(void *arg)
+{
+    (void)arg;
+    int64_t last = -1; int stalled = 0;
+    for (;;) {
+        sleep(1);
+        if (g_paused) { stalled = 0; continue; }
+        int64_t now = g_present_calls;
+        if (now == last) {
+            if (++stalled == 3 || (stalled > 3 && (stalled % 10) == 0)) {
+                CpuContext *c = &g_cpu;
+                plat_log("[WATCHDOG] no frame for %ds | present=%lld RA=%08X SP=%08X GP=%08X A0=%08X A1=%08X V0=%08X S0=%08X",
+                         stalled, (long long)now, c->RA, c->SP, c->GP, c->A0, c->A1, c->V0, c->S0);
+            }
+        } else { stalled = 0; last = now; }
+    }
+    return NULL;
+}
 
 int main(int argc, char *argv[])
 {
