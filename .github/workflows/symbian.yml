@@ -573,6 +573,10 @@ jobs:
               CleanupStack::PushL(self);
               self->CreateWindowL();
               self->SetExtentToWholeScreen();
+              // Black comes from the window background, NOT from Draw(): a WSERV window paints its own
+              // content (gc commands) on top of the EGL surface (EKA2L1 does exactly that), so a black
+              // Clear() in Draw() hides every GL frame -> permanent black screen.
+              self->Window().SetBackgroundColor(KRgbBlack);
               self->SetRect(aRect);
               self->ActivateL();
               CleanupStack::Pop(self);
@@ -581,11 +585,7 @@ jobs:
 
           void CCrashGlView::Draw(const TRect& /*aRect*/) const
               {
-              // Black until the first GL frame; afterwards EGL owns the window contents.
-              CWindowGc& gc = SystemGc();
-              gc.SetBrushStyle(CGraphicsContext::ESolidBrush);
-              gc.SetBrushColor(KRgbBlack);
-              gc.Clear(Rect());
+              // Intentionally empty: the EGL window surface owns this window's pixels.
               }
 
           CCrashContainer* CCrashContainer::NewL(const TRect& aRect, CCrashGlView* aView)
@@ -898,7 +898,7 @@ jobs:
               aGc.SetBrushStyle(CGraphicsContext::ESolidBrush);
               aGc.SetBrushColor(KFill);
               TRect pad(iDpadCentre.iX - iDpadR, iDpadCentre.iY - iDpadR, iDpadCentre.iX + iDpadR, iDpadCentre.iY + iDpadR);
-              aGc.DrawEllipse(pad);
+              aGc.DrawRect(pad);      // (DrawEllipse: gc opcode 60, not implemented in EKA2L1)
               TInt q = iDpadR / 3;
               TRect up(iDpadCentre.iX - q, iDpadCentre.iY - iDpadR, iDpadCentre.iX + q, iDpadCentre.iY - q);
               TRect dn(iDpadCentre.iX - q, iDpadCentre.iY + q, iDpadCentre.iX + q, iDpadCentre.iY + iDpadR);
@@ -1573,6 +1573,55 @@ jobs:
           s = rd(p)
           s = s.replace("#include <OpenGLES/ES2/gl.h>", "#include <GLES2/gl2.h>").replace("#include <OpenGLES/ES2/glext.h>", "#include <GLES2/gl2ext.h>")
           assert "OpenGLES/" not in s
+
+          # glCopyTexSubImage2D (dispatch 0x112C = 4396) is missing in some EKA2L1 builds ("Can't find dispatch
+          # function 4396") and some drivers; the VRAM snapshot sync (tex_a -> tex_b) is done with a second FBO and
+          # the existing copy shader instead: only glFramebufferTexture2D + glDrawArrays, which the port already uses.
+          if "fbo_b" not in s:
+              a = "static GLuint tex_a, tex_b, tex_dith, fbo_a;"
+              assert a in s, "gpu_gles2 fbo decl"
+              s = s.replace(a, "static GLuint tex_a, tex_b, tex_dith, fbo_a, fbo_b;", 1)
+
+              a = "    /* 4x4 ordered-dither table (+4 bias so it fits in unsigned bytes) */"
+              assert a in s, "gpu_gles2 dither anchor"
+              fbo_init = (
+                  "    glGenFramebuffers(1, &fbo_b);\n"
+                  "    glBindFramebuffer(GL_FRAMEBUFFER, fbo_b);\n"
+                  "    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex_b, 0);\n"
+                  "    fs = glCheckFramebufferStatus(GL_FRAMEBUFFER);\n"
+                  "    if (fs != GL_FRAMEBUFFER_COMPLETE) {\n"
+                  "        plat_log(\"[GPU] snapshot FBO incomplete: 0x%x\", (unsigned)fs);\n"
+                  "        plat_fatal(\"GLES2: snapshot framebuffer is incomplete (see crash.log, line \\\"[GPU] snapshot FBO incomplete\\\")\");\n"
+                  "    }\n"
+                  "    glBindFramebuffer(GL_FRAMEBUFFER, fbo_a);\n\n")
+              s = s.replace(a, fbo_init + a, 1)
+
+              old = ("    glBindFramebuffer(GL_FRAMEBUFFER, fbo_a);\n"
+                     "    glActiveTexture(GL_TEXTURE0);\n"
+                     "    glBindTexture(GL_TEXTURE_2D, tex_b);\n"
+                     "    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, x0, y0, x0, y0, x1 - x0, y1 - y0);\n")
+              assert old in s, "gpu_gles2 sync_snapshot body"
+              new = ("    static const GVert sq[6] = {\n"
+                     "        { 0, 0, 255, 255, 255, 255, 0, 0 }, { VRAM_W, 0, 255, 255, 255, 255, 0, 0 }, { 0, VRAM_H, 255, 255, 255, 255, 0, 0 },\n"
+                     "        { VRAM_W, 0, 255, 255, 255, 255, 0, 0 }, { VRAM_W, VRAM_H, 255, 255, 255, 255, 0, 0 }, { 0, VRAM_H, 255, 255, 255, 255, 0, 0 },\n"
+                     "    };\n"
+                     "    glBindFramebuffer(GL_FRAMEBUFFER, fbo_b);          /* render tex_a -> tex_b (dirty rect only) */\n"
+                     "    glViewport(0, 0, VRAM_W, VRAM_H);\n"
+                     "    glEnable(GL_SCISSOR_TEST);\n"
+                     "    glScissor(x0, y0, x1 - x0, y1 - y0);\n"
+                     "    glDisable(GL_BLEND);\n"
+                     "    glBindBuffer(GL_ARRAY_BUFFER, 0);\n"
+                     "    glUseProgram(pc.id);\n"
+                     "    glActiveTexture(GL_TEXTURE0);\n"
+                     "    glBindTexture(GL_TEXTURE_2D, tex_a);\n"
+                     "    glUniform1i(pc.vram, 0);\n"
+                     "    glUniform1f(pc.setmask, 0.0f);\n"
+                     "    glUniform1f(pc.chk, 0.0f);\n"
+                     "    glUniform2f(pc.off, 0.0f, 0.0f);\n"
+                     "    set_attribs(sq);\n"
+                     "    glDrawArrays(GL_TRIANGLES, 0, 6);\n")
+              s = s.replace(old, new, 1)
+              assert "glCopyTexSubImage2D(GL_TEXTURE_2D" not in s
           wr(p, s)
 
           # ---------------------------------------------------------------- mmp
