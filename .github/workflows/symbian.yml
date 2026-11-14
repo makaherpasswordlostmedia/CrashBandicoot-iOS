@@ -13,20 +13,24 @@ on:
   workflow_dispatch:
     inputs:
       cue_file_id:
-        description: "Drive file ID of your .cue (empty = secret DRIVE_CUE_ID)"
+        description: "Google Drive ID or link of your .cue (empty = secret DRIVE_CUE_ID)"
         required: false
         default: ""
         type: string
       bin_file_id:
-        description: "Drive file ID of your .bin (empty = secret DRIVE_BIN_ID)"
+        description: "Google Drive ID or link of your .bin (empty = secret DRIVE_BIN_ID)"
         required: false
         default: ""
         type: string
       opt:
-        description: "GCC optimisation flag for the whole app (-O2 fast, -Os smaller exe)"
-        required: false
+        description: "GCC optimisation (-O2 fast, -Os smaller exe)"
+        required: true
         default: "-O2"
-        type: string
+        type: choice
+        options:
+          - "-O2"
+          - "-Os"
+          - "-O3"
 
 permissions:
   contents: read
@@ -60,6 +64,8 @@ jobs:
             echo "::error::Disc IDs missing. Fill cue_file_id + bin_file_id, or set secrets DRIVE_CUE_ID / DRIVE_BIN_ID."
             exit 1
           fi
+          extract_id() { echo "$1" | tr -d ' \r\n' | sed -E 's#.*/d/([A-Za-z0-9_-]+).*#\1#; s#.*[?&]id=([A-Za-z0-9_-]+).*#\1#'; }
+          CUE_FILE_ID="$(extract_id "$CUE_FILE_ID")"; BIN_FILE_ID="$(extract_id "$BIN_FILE_ID")"
           mkdir -p "$RUNNER_TEMP/disc"
           python3 -m venv "$RUNNER_TEMP/venv"
           "$RUNNER_TEMP/venv/bin/pip" install -q gdown
@@ -77,6 +83,8 @@ jobs:
           ./scripts/prerecompile_native.sh "$RUNNER_TEMP/disc/game.cue" 2>&1 | tee build-recomp.log
 
       - name: Generate symbian/ tree and patch sources
+        env:
+          OPT: ${{ inputs.opt || '-O2' }}
         run: |
           set -e
           mkdir -p symbian/app/data
@@ -1584,7 +1592,7 @@ jobs:
           open("symbian/app/group/crashrecomp.mmp", "w").write(out)
           print("mmp: %d runtime + %d generated C files, opt=%s" % (len(src), len(gen), OPT))
           CR_EOF
-          python3 symbian/tools/patch_symbian.py "${{ inputs.opt || '-O2' }}"
+          python3 symbian/tools/patch_symbian.py "$OPT"
 
       - uses: actions/upload-artifact@v4
         with:
