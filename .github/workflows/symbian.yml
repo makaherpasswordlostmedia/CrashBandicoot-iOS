@@ -245,7 +245,7 @@ jobs:
               TBool iReady;
               TBool iSuspended;
               TUint8 iBuf[KSlots][KBytes];
-              TPtr8 iDes[KSlots];
+              TPtrC8 iDes[KSlots];
               };
 
           // Plain full-screen window that owns the EGL window surface (rendering happens on the emulation thread).
@@ -254,6 +254,7 @@ jobs:
           public:
               static CCrashGlView* NewL(const TRect& aRect);
               void Draw(const TRect& aRect) const;
+              RWindow& GlWindow() { return Window(); }     // Window() is protected in CCoeControl
               };
 
           // Transparent window above the GL view: loading/error text, touch pad, keys, overlay menu.
@@ -470,12 +471,12 @@ jobs:
               return self;
               }
 
-          CCrashAudio::CCrashAudio() : iDes(NULL, 0)
+          CCrashAudio::CCrashAudio()
               {
               for (TInt i = 0; i < KSlots; ++i)
                   {
                   Mem::FillZ(iBuf[i], KBytes);
-                  iDes[i].Set(iBuf[i], KBytes, KBytes);
+                  iDes[i].Set(iBuf[i], KBytes);
                   }
               }
 
@@ -500,7 +501,6 @@ jobs:
           void CCrashAudio::Fill(TInt aSlot)
               {
               PSym_MixAudio((short*)iBuf[aSlot], KFrames);
-              iDes[aSlot].SetLength(KBytes);
               TRAPD(err, iStream->WriteL(iDes[aSlot]));
               (void)err;
               }
@@ -696,7 +696,7 @@ jobs:
                   return;
                   }
               path.ZeroTerminate();
-              RWindow& glWin = iView->Window();
+              RWindow& glWin = iView->GlWindow();
               const char* glErr = PSym_GlInit(&glWin);
               if (glErr)
                   {
