@@ -255,9 +255,15 @@ jobs:
               static CCrashGlView* NewL(const TRect& aRect);
               void Draw(const TRect& aRect) const;
               RWindow& GlWindow() { return Window(); }     // Window() is protected in CCoeControl
+              // The pad/menu is a window-less child control drawn INTO this window (never a second window on top).
+              void SetChild(CCoeControl* aChild) { iChild = aChild; }
+              TInt CountComponentControls() const { return iChild ? 1 : 0; }
+              CCoeControl* ComponentControl(TInt /*aIndex*/) const { return iChild; }
+          private:
+              CCoeControl* iChild;
               };
 
-          // Transparent window above the GL view: loading/error text, touch pad, keys, overlay menu.
+          // Window-less control inside the GL view window: loading/error text, touch pad, keys, overlay menu.
           class CCrashContainer : public CCoeControl
               {
           public:
@@ -411,6 +417,7 @@ jobs:
 
               iView = CCrashGlView::NewL(ApplicationRect());
               iContainer = CCrashContainer::NewL(ApplicationRect(), iView);
+              iView->SetChild(iContainer);
               AddToStackL(iContainer);
               }
 
@@ -570,6 +577,7 @@ jobs:
           CCrashGlView* CCrashGlView::NewL(const TRect& aRect)
               {
               CCrashGlView* self = new (ELeave) CCrashGlView;
+              self->iChild = NULL;
               CleanupStack::PushL(self);
               self->CreateWindowL();
               self->SetExtentToWholeScreen();
@@ -613,9 +621,9 @@ jobs:
           void CCrashContainer::ConstructL(const TRect& aRect, CCrashGlView* aView)
               {
               iView = aView;
-              CreateWindowL();
-              SetExtentToWholeScreen();
-              Window().SetTransparencyAlphaChannel();      // pad floats over the GL window
+              // No window of its own: a second (alpha) window above the GL window is composited as opaque black by
+              // EKA2L1 and hides every GL frame. Draw inside the GL view's window instead.
+              SetContainerWindowL(*aView);
               EnableDragEvents();
           #ifdef Z3_MULTITOUCH
               Window().EnableAdvancedPointers();
@@ -870,7 +878,7 @@ jobs:
               }
 
           static const TRgb KLine(255, 255, 255, 150);
-          static const TRgb KFill(0, 0, 0, 70);
+          static const TRgb KFill(0, 0, 0, 0);   // (only used as 'no fill' marker)
           static const TRgb KHot(110, 110, 255, 150);
           static const TRgb KText(255, 255, 255, 220);
 
@@ -878,8 +886,8 @@ jobs:
               {
               aGc.SetPenStyle(CGraphicsContext::ESolidPen);
               aGc.SetPenColor(KLine);
-              aGc.SetBrushStyle(CGraphicsContext::ESolidBrush);
-              aGc.SetBrushColor(aDown ? KHot : KFill);
+              if (aDown) { aGc.SetBrushStyle(CGraphicsContext::ESolidBrush); aGc.SetBrushColor(KHot); }
+              else aGc.SetBrushStyle(CGraphicsContext::ENullBrush);
               aGc.DrawRect(aRect);
               aGc.SetBrushStyle(CGraphicsContext::ENullBrush);
               const CFont* font = iEikonEnv->NormalFont();
@@ -895,8 +903,7 @@ jobs:
               const TUint p = iKeyPad | iTouchPad;
               aGc.SetPenStyle(CGraphicsContext::ESolidPen);
               aGc.SetPenColor(KLine);
-              aGc.SetBrushStyle(CGraphicsContext::ESolidBrush);
-              aGc.SetBrushColor(KFill);
+              aGc.SetBrushStyle(CGraphicsContext::ENullBrush);
               TRect pad(iDpadCentre.iX - iDpadR, iDpadCentre.iY - iDpadR, iDpadCentre.iX + iDpadR, iDpadCentre.iY + iDpadR);
               aGc.DrawRect(pad);      // (DrawEllipse: gc opcode 60, not implemented in EKA2L1)
               TInt q = iDpadR / 3;
@@ -904,6 +911,7 @@ jobs:
               TRect dn(iDpadCentre.iX - q, iDpadCentre.iY + q, iDpadCentre.iX + q, iDpadCentre.iY + iDpadR);
               TRect lf(iDpadCentre.iX - iDpadR, iDpadCentre.iY - q, iDpadCentre.iX - q, iDpadCentre.iY + q);
               TRect rt(iDpadCentre.iX + q, iDpadCentre.iY - q, iDpadCentre.iX + iDpadR, iDpadCentre.iY + q);
+              aGc.SetBrushStyle(CGraphicsContext::ESolidBrush);
               aGc.SetBrushColor(KHot);
               if (p & PSYM_PAD_UP) aGc.DrawRect(up);
               if (p & PSYM_PAD_DOWN) aGc.DrawRect(dn);
@@ -974,11 +982,8 @@ jobs:
           void CCrashContainer::Draw(const TRect& /*aRect*/) const
               {
               CWindowGc& gc = SystemGc();
-              gc.SetDrawMode(CGraphicsContext::EDrawModeWriteAlpha);
               gc.SetPenStyle(CGraphicsContext::ESolidPen);
               gc.SetBrushStyle(CGraphicsContext::ESolidBrush);
-              gc.SetBrushColor(TRgb(0, 0, 0, 0));
-              gc.Clear(Rect());
 
               if (iMode == ELoading || iMode == EError)
                   {
