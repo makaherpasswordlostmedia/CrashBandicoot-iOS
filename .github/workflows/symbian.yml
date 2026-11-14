@@ -1,0 +1,1721 @@
+name: Build Crash Bandicoot for Symbian^3 (SIS, GLES2)
+
+# SELF-CONTAINED: this single file carries the whole Symbian port (symbian/ tree) and patches the
+# CrashBandicoot.Native sources at build time. Rendering: OpenGL ES 2.0 over EGL (PowerVR SGX: N8, C7, E7...). Put it at .github/workflows/symbian.yml of the repo.
+#
+# Run: Actions -> "Build Crash Bandicoot for Symbian^3 (SIS)" -> Run workflow.
+# Disc IDs (your own dump, Google Drive "anyone with the link"): fill the fields or save the secrets
+# DRIVE_CUE_ID / DRIVE_BIN_ID. The disc is only used to recompile the game executable; the .sisx
+# contains no disc data. Toolchain: https://github.com/fieldops-dev/symbian3-toolchain
+# (macOS runner; the first run builds GCC (~2 h) and caches it).
+
+on:
+  workflow_dispatch:
+    inputs:
+      cue_file_id:
+        description: "Drive file ID of your .cue (empty = secret DRIVE_CUE_ID)"
+        required: false
+        default: ""
+        type: string
+      bin_file_id:
+        description: "Drive file ID of your .bin (empty = secret DRIVE_BIN_ID)"
+        required: false
+        default: ""
+        type: string
+      opt:
+        description: "GCC optimisation flag for the whole app (-O2 fast, -Os smaller exe)"
+        required: false
+        default: "-O2"
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  TOOLCHAIN_REPO: fieldops-dev/symbian3-toolchain
+  TOOLCHAIN_REF: a96f917e6c8f02fe4f7c2186f8df760d3d9d832a
+  SYMBIAN_VOL: /Volumes/Symbian
+  GNUPOC_COMMIT: d3ddaf58c734ad3ab34dc60a012f9d4768a9ed3e
+  GCC4SYMBIAN_COMMIT: fe1b15a1c25716d5c515f12593080d58f14d4c3f
+
+jobs:
+  sources:
+    name: Recompile disc, write port sources, patch
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Fetch disc image (yours, from Google Drive)
+        env:
+          CUE_FILE_ID: ${{ inputs.cue_file_id || secrets.DRIVE_CUE_ID }}
+          BIN_FILE_ID: ${{ inputs.bin_file_id || secrets.DRIVE_BIN_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CUE_FILE_ID:-}" ] || [ -z "${BIN_FILE_ID:-}" ]; then
+            echo "::error::Disc IDs missing. Fill cue_file_id + bin_file_id, or set secrets DRIVE_CUE_ID / DRIVE_BIN_ID."
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/disc"
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install -q gdown
+          GDOWN="$RUNNER_TEMP/venv/bin/gdown"
+          "$GDOWN" "$CUE_FILE_ID" -O "$RUNNER_TEMP/disc/game.cue"
+          "$GDOWN" "$BIN_FILE_ID" -O "$RUNNER_TEMP/disc/game.bin"
+          sed -i -E 's/^FILE "[^"]+"/FILE "game.bin"/' "$RUNNER_TEMP/disc/game.cue"
+          grep -q TRACK "$RUNNER_TEMP/disc/game.cue" || { echo "::error::game.cue has no TRACK line (Drive sharing must be 'Anyone with the link')"; cat "$RUNNER_TEMP/disc/game.cue"; exit 1; }
+          ls -la "$RUNNER_TEMP/disc"
+
+      - name: Recompile (ELF -> C# -> C)
+        run: |
+          set -euo pipefail
+          chmod +x ./scripts/prerecompile_native.sh
+          ./scripts/prerecompile_native.sh "$RUNNER_TEMP/disc/game.cue" 2>&1 | tee build-recomp.log
+
+      - name: Generate symbian/ tree and patch sources
+        run: |
+          set -e
+          mkdir -p symbian/app/data
+          cat > symbian/app/data/crashrecomp.rss <<'CR_EOF'
+          NAME CRSH
+
+          #include <eikon.rh>
+          #include <avkon.rh>
+          #include <avkon.rsg>
+          #include <appinfo.rh>
+
+          RESOURCE RSS_SIGNATURE { }
+
+          RESOURCE TBUF r_default_document_name { buf = ""; }
+
+          RESOURCE EIK_APP_INFO
+              {
+              }
+
+          RESOURCE LOCALISABLE_APP_INFO r_localisable_app_info
+              {
+              short_caption = "Crash";
+              caption_and_icon = CAPTION_AND_ICON_INFO
+                  {
+                  caption = "Crash Bandicoot";
+                  number_of_icons = 0;
+                  };
+              }
+          CR_EOF
+          mkdir -p symbian/app/data
+          cat > symbian/app/data/crashrecomp_reg.rss <<'CR_EOF'
+          #include <appinfo.rh>
+          #include <crashrecomp.rsg>
+
+          UID2 KUidAppRegistrationResourceFile
+          UID3 0xE1C4A5B0
+
+          RESOURCE APP_REGISTRATION_INFO
+              {
+              app_file = "crashrecomp";
+              localisable_resource_file = "\\resource\\apps\\crashrecomp";
+              localisable_resource_id = R_LOCALISABLE_APP_INFO;
+              embeddability = KAppNotEmbeddable;
+              newfile = KAppDoesNotSupportNewFile;
+              }
+          CR_EOF
+          mkdir -p symbian/app/group
+          cat > symbian/app/group/bld.inf <<'CR_EOF'
+          PRJ_PLATFORMS
+          DEFAULT
+
+          PRJ_MMPFILES
+          crashrecomp.mmp
+          CR_EOF
+          mkdir -p symbian/app/group
+          cat > symbian/app/group/crashrecomp.mmp.in <<'CR_EOF'
+          // Crash Bandicoot (static recompilation, native C runtime, OpenGL ES 2.0) for Symbian^3.
+          // crashrecomp.mmp is generated from this file by symbian/tools/patch_symbian.py.
+          #include <platform_paths.hrh>
+
+          TARGET          crashrecomp.exe
+          TARGETTYPE      exe
+          UID             0x100039CE 0xE1C4A5B0
+          SECUREID        0xE1C4A5B0
+          VENDORID        0
+          CAPABILITY      NONE
+
+          EPOCSTACKSIZE   0x80000
+          EPOCHEAPSIZE    0x800000 0x8000000
+
+          MACRO           NDEBUG
+          MACRO           PSX_GLES2
+          MACRO           Z3_MULTITOUCH
+          MACRO           SYSTEM_VOLUME_MIXER_AVAILABLE=0
+
+          SOURCEPATH      ../src
+          SOURCE          crash_app.cpp
+          SOURCE          crash_appui.cpp
+          SOURCE          crash_container.cpp
+          SOURCE          crash_audio.cpp
+          SOURCE          crash_sleep.cpp
+          SOURCE          crash_gl.cpp
+
+          SOURCEPATH      ../../core
+          SOURCE          psx_sym.c
+
+          @CORE_SOURCES@
+          USERINCLUDE     ../inc
+          USERINCLUDE     ../../core
+          USERINCLUDE     ../../compat
+          USERINCLUDE     ../../../CrashBandicoot.Native/src
+          USERINCLUDE     ../../../CrashBandicoot.Native/gen
+          SYSTEMINCLUDE   /epoc32/include/stdapis
+          APP_LAYER_SYSTEMINCLUDE
+
+          SOURCEPATH      ../data
+          START RESOURCE  crashrecomp.rss
+          HEADER
+          TARGETPATH      /resource/apps
+          END
+
+          START RESOURCE  crashrecomp_reg.rss
+          TARGETPATH      /private/10003a3f/import/apps
+          END
+
+          LIBRARY         euser.lib apparc.lib cone.lib eikcore.lib avkon.lib eikcoctl.lib
+          LIBRARY         fbscli.lib bitgdi.lib gdi.lib ws32.lib efsrv.lib
+          LIBRARY         mediaclientaudiostream.lib bafl.lib
+          LIBRARY         libc.lib libm.lib libpthread.lib
+          LIBRARY         libEGL.lib libGLESv2.lib
+
+          // ARM11 must not do unaligned accesses; the recompiled code wraps on signed overflow.
+          OPTION          GCCE @OPT@ -fno-strict-aliasing -fwrapv -mno-unaligned-access -w
+          OPTION          GCCE -Wno-error=implicit-function-declaration -Wno-error=int-conversion
+          OPTION          GCCE -Wno-error=incompatible-pointer-types -Wno-error=implicit-int
+          OPTION          GCCE -idirafter @GCCINC@
+          CR_EOF
+          mkdir -p symbian/app/inc
+          cat > symbian/app/inc/crashrecomp.h <<'CR_EOF'
+          // crashrecomp.h - Symbian^3 front end for the native Crash Bandicoot recompilation.
+          #ifndef CRASHRECOMP_SYMBIAN_H
+          #define CRASHRECOMP_SYMBIAN_H
+
+          #include <aknapp.h>
+          #include <akndoc.h>
+          #include <aknappui.h>
+          #include <coecntrl.h>
+          #include <e32base.h>
+          #include <f32file.h>
+          #include <fbs.h>
+          #include <mdaaudiosampleplayer.h>
+          #include <mdaaudiooutputstream.h>
+
+          #include "psx_sym.h"
+
+          const TUid KUidCrash = { (TInt32)0xE1C4A5B0 };
+
+          // Pulls PCM from the SPU mixer and queues it on a CMdaAudioOutputStream (UI thread).
+          class CCrashAudio : public CBase, public MMdaAudioOutputStreamCallback
+              {
+          public:
+              static CCrashAudio* NewL();
+              ~CCrashAudio();
+              void Suspend();
+              void Resume();
+
+              void MaoscOpenComplete(TInt aError);
+              void MaoscBufferCopied(TInt aError, const TDesC8& aBuffer);
+              void MaoscPlayComplete(TInt aError);
+
+          private:
+              CCrashAudio();
+              void OpenStream();
+              void Fill(TInt aSlot);
+
+              enum { KSlots = 4, KFrames = PSYM_AUDIO_FRAMES, KBytes = PSYM_AUDIO_FRAMES * 4 };
+              CMdaAudioOutputStream* iStream;
+              TBool iReady;
+              TBool iSuspended;
+              TUint8 iBuf[KSlots][KBytes];
+              TPtr8 iDes[KSlots];
+              };
+
+          // Plain full-screen window that owns the EGL window surface (rendering happens on the emulation thread).
+          class CCrashGlView : public CCoeControl
+              {
+          public:
+              static CCrashGlView* NewL(const TRect& aRect);
+              void Draw(const TRect& aRect) const;
+              };
+
+          // Transparent window above the GL view: loading/error text, touch pad, keys, overlay menu.
+          class CCrashContainer : public CCoeControl
+              {
+          public:
+              static CCrashContainer* NewL(const TRect& aRect, CCrashGlView* aView);
+              ~CCrashContainer();
+              void SetForeground(TBool aForeground);
+
+              void Draw(const TRect& aRect) const;
+              void SizeChanged();
+              void HandlePointerEventL(const TPointerEvent& aEvent);
+              TKeyResponse OfferKeyEventL(const TKeyEvent& aKeyEvent, TEventCode aType);
+
+          private:
+              enum TMode { ELoading, EPlay, EMenu, EError };
+              enum { KMenuItems = 3, KMaxPtrs = 5 };
+
+              CCrashContainer();
+              void ConstructL(const TRect& aRect, CCrashGlView* aView);
+
+              static TInt TickCb(TAny* aPtr);
+              static TInt InitCb(TAny* aPtr);
+              void Tick();
+              void DoInit();
+              void StartTimer();
+              void StopTimer();
+              TBool FindDataDir(TDes8& aPath);
+              void SetError(const TDesC8& aText);
+              void OpenMenu();
+              void MenuActionL(TInt aIndex);
+              void ComputeLayout();
+              void UpdateTouchPad();
+              void PushPad();
+              TUint PadFromPoint(const TPoint& aPt) const;
+              void DrawButton(CWindowGc& aGc, const TRect& aRect, const TDesC& aLabel, TBool aDown) const;
+              void DrawPad(CWindowGc& aGc) const;
+              void DrawMenu(CWindowGc& aGc) const;
+              void DrawCentred(CWindowGc& aGc, const TDesC& aText, TInt aY) const;
+
+              CCrashGlView* iView;
+              CPeriodic* iTimer;
+              CIdle* iIdle;
+              CCrashAudio* iAudio;
+              RFs iFs;
+
+              TMode iMode;
+              TBool iForeground;
+              TBool iSound;
+              TUint iLastTick;
+
+              TBuf<160> iErrLine1;
+              TBuf<160> iErrLine2;
+
+              TUint iKeyPad;
+              TUint iTouchPad;
+              TBool iPtrDown[KMaxPtrs];
+              TPoint iPtrPos[KMaxPtrs];
+
+              TPoint iDpadCentre;
+              TInt iDpadR;
+              TRect iBtnCross, iBtnCircle, iBtnSquare, iBtnTri, iBtnL1, iBtnL2, iBtnR1, iBtnR2;
+              TRect iBtnSelect, iBtnStart, iBtnMenu;
+              TInt iMenuSel;
+              };
+
+          class CCrashAppUi : public CAknAppUi
+              {
+          public:
+              void ConstructL();
+              ~CCrashAppUi();
+              void HandleCommandL(TInt aCommand);
+              void HandleForegroundEventL(TBool aForeground);
+              void HandleResourceChangeL(TInt aType);
+          private:
+              CCrashGlView* iView;
+              CCrashContainer* iContainer;
+              };
+
+          class CCrashDocument : public CAknDocument
+              {
+          public:
+              CCrashDocument(CEikApplication& aApp) : CAknDocument(aApp) {}
+          private:
+              CEikAppUi* CreateAppUiL();
+              };
+
+          class CCrashApplication : public CAknApplication
+              {
+          private:
+              CApaDocument* CreateDocumentL();
+              TUid AppDllUid() const;
+              };
+
+          #endif
+          CR_EOF
+          mkdir -p symbian/app/sis
+          cat > symbian/app/sis/crashrecomp.pkg <<'CR_EOF'
+          ; Crash Bandicoot (native recompilation) for Symbian^3 - paths are expanded by package-sis.sh
+          &EN
+          #{"Crash Bandicoot"},(0xE1C4A5B0),1,0,0
+
+          %{"Crash Bandicoot recomp"}
+          :"Symbian port"
+
+          [0x20022E6D], 0, 0, 0, {"S60ProductID"}
+          [0x1028315F], 0, 0, 0, {"S60ProductID"}
+          [0x102752AE], 0, 0, 0, {"S60ProductID"}
+          [0x102032BE], 0, 0, 0, {"S60ProductID"}
+          [0x101F7961], 0, 0, 0, {"S60ProductID"}
+
+          "$(epocroot)epoc32/release/$(platform)/$(target)/crashrecomp.exe"-"!:\sys\bin\crashrecomp.exe"
+          "$(epocroot)epoc32/data/z/resource/apps/crashrecomp.rsc"-"!:\resource\apps\crashrecomp.rsc"
+          "$(epocroot)epoc32/data/z/private/10003a3f/import/apps/crashrecomp_reg.rsc"-"!:\private\10003a3f\import\apps\crashrecomp_reg.rsc"
+          "readme.txt"-"!:\crashbandicoot\readme.txt"
+          CR_EOF
+          mkdir -p symbian/app/sis
+          cat > symbian/app/sis/readme.txt <<'CR_EOF'
+          Put your own disc image here: one .cue plus its .bin (same folder, FILE line in the .cue must match the .bin name).
+          Saves (memory cards) go to the saves subfolder, crash.log is written next to the .cue.
+          CR_EOF
+          mkdir -p symbian/app/src
+          cat > symbian/app/src/crash_app.cpp <<'CR_EOF'
+          #include <eikstart.h>
+          #include "crashrecomp.h"
+
+          CApaDocument* CCrashApplication::CreateDocumentL() { return new (ELeave) CCrashDocument(*this); }
+          TUid CCrashApplication::AppDllUid() const { return KUidCrash; }
+          CEikAppUi* CCrashDocument::CreateAppUiL() { return new (ELeave) CCrashAppUi; }
+
+          LOCAL_C CApaApplication* NewApplication() { return new CCrashApplication; }
+
+          GLDEF_C TInt E32Main() { return EikStart::RunApplication(NewApplication); }
+          CR_EOF
+          mkdir -p symbian/app/src
+          cat > symbian/app/src/crash_appui.cpp <<'CR_EOF'
+          #include <avkon.hrh>
+          #include <eikon.hrh>
+          #include <eikenv.h>
+          #include <eikspane.h>
+          #include <eikbtgpc.h>
+          #include "crashrecomp.h"
+
+          void CCrashAppUi::ConstructL()
+              {
+              BaseConstructL(CAknAppUi::EAknEnableSkin);
+              SetOrientationL(CAknAppUiBase::EAppUiOrientationLandscape);
+
+              CEikStatusPane* sp = StatusPane();
+              if (sp) sp->MakeVisible(EFalse);
+              CEikButtonGroupContainer* cba = Cba();
+              if (cba) cba->MakeVisible(EFalse);
+
+              iView = CCrashGlView::NewL(ApplicationRect());
+              iContainer = CCrashContainer::NewL(ApplicationRect(), iView);
+              AddToStackL(iContainer);
+              }
+
+          CCrashAppUi::~CCrashAppUi()
+              {
+              if (iContainer)
+                  {
+                  RemoveFromStack(iContainer);
+                  delete iContainer;
+                  iContainer = NULL;
+                  }
+              delete iView;
+              iView = NULL;
+              }
+
+          void CCrashAppUi::HandleCommandL(TInt aCommand)
+              {
+              switch (aCommand)
+                  {
+                  case EEikCmdExit:
+                  case EAknSoftkeyExit:
+                  case EAknCmdExit:
+                      Exit();
+                      break;
+                  default:
+                      break;
+                  }
+              }
+
+          void CCrashAppUi::HandleForegroundEventL(TBool aForeground)
+              {
+              CAknAppUi::HandleForegroundEventL(aForeground);
+              if (iContainer) iContainer->SetForeground(aForeground);
+              }
+
+          void CCrashAppUi::HandleResourceChangeL(TInt aType)
+              {
+              CAknAppUi::HandleResourceChangeL(aType);
+              if (iContainer && aType == KEikDynamicLayoutVariantSwitch)
+                  {
+                  iView->SetRect(ApplicationRect());
+                  iContainer->SetRect(ApplicationRect());
+                  }
+              }
+          CR_EOF
+          mkdir -p symbian/app/src
+          cat > symbian/app/src/crash_audio.cpp <<'CR_EOF'
+          // Audio output through CMdaAudioOutputStream: 44.1 kHz stereo PCM16 pulled from the SPU mixer.
+          #include "crashrecomp.h"
+
+          static const TInt KRate44100 = 0x00000020;   // TMdaAudioDataSettings::ESampleRate44100Hz
+          static const TInt KStereo = 0x00000002;      // TMdaAudioDataSettings::EChannelsStereo
+
+          CCrashAudio* CCrashAudio::NewL()
+              {
+              CCrashAudio* self = new (ELeave) CCrashAudio;
+              self->OpenStream();
+              return self;
+              }
+
+          CCrashAudio::CCrashAudio() : iDes(NULL, 0)
+              {
+              for (TInt i = 0; i < KSlots; ++i)
+                  {
+                  Mem::FillZ(iBuf[i], KBytes);
+                  iDes[i].Set(iBuf[i], KBytes, KBytes);
+                  }
+              }
+
+          CCrashAudio::~CCrashAudio()
+              {
+              if (iStream)
+                  {
+                  iStream->Stop();
+                  delete iStream;
+                  }
+              }
+
+          void CCrashAudio::OpenStream()
+              {
+              iReady = EFalse;
+              delete iStream;
+              iStream = NULL;
+              TRAPD(err, iStream = CMdaAudioOutputStream::NewL(*this));
+              if (err == KErrNone && iStream) iStream->Open(NULL);
+              }
+
+          void CCrashAudio::Fill(TInt aSlot)
+              {
+              PSym_MixAudio((short*)iBuf[aSlot], KFrames);
+              iDes[aSlot].SetLength(KBytes);
+              TRAPD(err, iStream->WriteL(iDes[aSlot]));
+              (void)err;
+              }
+
+          void CCrashAudio::MaoscOpenComplete(TInt aError)
+              {
+              if (aError != KErrNone) return;
+              TRAPD(err, iStream->SetAudioPropertiesL(KRate44100, KStereo));
+              if (err != KErrNone) return;
+              iStream->SetVolume(iStream->MaxVolume() / 2);
+              iStream->SetPriority(EPriorityNormal, EMdaPriorityPreferenceTime);
+              iReady = ETrue;
+              for (TInt i = 0; i < KSlots; ++i) Fill(i);
+              }
+
+          void CCrashAudio::MaoscBufferCopied(TInt aError, const TDesC8& aBuffer)
+              {
+              if (aError != KErrNone || !iReady || iSuspended) return;
+              for (TInt i = 0; i < KSlots; ++i)
+                  {
+                  if (iBuf[i] == aBuffer.Ptr())
+                      {
+                      Fill(i);
+                      return;
+                      }
+                  }
+              }
+
+          void CCrashAudio::MaoscPlayComplete(TInt /*aError*/) {}
+
+          void CCrashAudio::Suspend()
+              {
+              iSuspended = ETrue;
+              if (iStream && iReady)
+                  {
+                  iStream->Stop();
+                  iReady = EFalse;
+                  }
+              }
+
+          void CCrashAudio::Resume()
+              {
+              if (iSuspended)
+                  {
+                  iSuspended = EFalse;
+                  OpenStream();
+                  }
+              }
+          CR_EOF
+          mkdir -p symbian/app/src
+          cat > symbian/app/src/crash_container.cpp <<'CR_EOF'
+          // Main control: loading/error screens, game view, multi-touch PlayStation pad, overlay menu.
+          #include <aknutils.h>
+          #include <avkon.hrh>
+          #include <eikon.hrh>
+          #include <eikenv.h>
+          #include <w32std.h>
+          #include "crashrecomp.h"
+
+          _LIT(KLoading1, "Starting Crash Bandicoot...");
+          _LIT(KLoading2, "(starting the GLES2 renderer)");
+          _LIT(KErrTitle, "Crash Bandicoot could not start");
+          _LIT(KErrHint, "Needed: <drive>:\\crashbandicoot\\ with your .cue + .bin");
+
+          static const TInt KTickMicros = 33000;
+
+          CCrashGlView* CCrashGlView::NewL(const TRect& aRect)
+              {
+              CCrashGlView* self = new (ELeave) CCrashGlView;
+              CleanupStack::PushL(self);
+              self->CreateWindowL();
+              self->SetExtentToWholeScreen();
+              self->SetRect(aRect);
+              self->ActivateL();
+              CleanupStack::Pop(self);
+              return self;
+              }
+
+          void CCrashGlView::Draw(const TRect& /*aRect*/) const
+              {
+              // Black until the first GL frame; afterwards EGL owns the window contents.
+              CWindowGc& gc = SystemGc();
+              gc.SetBrushStyle(CGraphicsContext::ESolidBrush);
+              gc.SetBrushColor(KRgbBlack);
+              gc.Clear(Rect());
+              }
+
+          CCrashContainer* CCrashContainer::NewL(const TRect& aRect, CCrashGlView* aView)
+              {
+              CCrashContainer* self = new (ELeave) CCrashContainer;
+              CleanupStack::PushL(self);
+              self->ConstructL(aRect, aView);
+              CleanupStack::Pop(self);
+              return self;
+              }
+
+          CCrashContainer::CCrashContainer() {}
+
+          CCrashContainer::~CCrashContainer()
+              {
+              StopTimer();
+              PSym_SetPad(0);
+              PSym_Flush();
+              delete iTimer;
+              delete iIdle;
+              delete iAudio;
+              iFs.Close();
+              }
+
+          void CCrashContainer::ConstructL(const TRect& aRect, CCrashGlView* aView)
+              {
+              iView = aView;
+              CreateWindowL();
+              SetExtentToWholeScreen();
+              Window().SetTransparencyAlphaChannel();      // pad floats over the GL window
+              EnableDragEvents();
+          #ifdef Z3_MULTITOUCH
+              Window().EnableAdvancedPointers();
+          #endif
+              SetFocusing(ETrue);
+              User::LeaveIfError(iFs.Connect());
+
+              iMode = ELoading;
+              iSound = ETrue;
+              iForeground = ETrue;
+              iMenuSel = 0;
+              for (TInt i = 0; i < KMaxPtrs; ++i) iPtrDown[i] = EFalse;
+
+              SetRect(aRect);
+              ActivateL();
+
+              iTimer = CPeriodic::NewL(CActive::EPriorityStandard);
+              iIdle = CIdle::NewL(CActive::EPriorityIdle);
+              iIdle->Start(TCallBack(InitCb, this));     // lets the loading screen appear first
+              }
+
+          TInt CCrashContainer::InitCb(TAny* aPtr)
+              {
+              static_cast<CCrashContainer*>(aPtr)->DoInit();
+              return 0;
+              }
+
+          void CCrashContainer::SetError(const TDesC8& aText)
+              {
+              iErrLine1.Zero();
+              iErrLine2.Zero();
+              TInt len = aText.Length();
+              TInt split = 58;
+              if (len <= split)
+                  {
+                  iErrLine1.Copy(aText);
+                  }
+              else
+                  {
+                  TInt cut = split;
+                  while (cut > 20 && aText[cut] != 32) --cut;
+                  iErrLine1.Copy(aText.Left(cut));
+                  iErrLine2.Copy(aText.Mid(cut).Left(iErrLine2.MaxLength()));
+                  }
+              iMode = EError;
+              }
+
+          // First drive whose \crashbandicoot\ folder holds a .cue file (E: mass memory and F: card first).
+          TBool CCrashContainer::FindDataDir(TDes8& aPath)
+              {
+              TDriveList list;
+              if (iFs.DriveList(list) != KErrNone) return EFalse;
+              const TInt order[8] = { 4, 5, 2, 6, 7, 3, 8, 9 };
+              for (TInt k = 0; k < 8; ++k)
+                  {
+                  TInt d = order[k];
+                  if (d >= KMaxDrives || !list[d]) continue;
+                  TBuf8<32> dir;
+                  dir.Append((TChar)('A' + d));
+                  dir.Append(_L8(":/crashbandicoot"));
+                  dir.ZeroTerminate();
+                  if (PSym_Probe((const char*)dir.Ptr()))
+                      {
+                      aPath.Copy(dir);
+                      return ETrue;
+                      }
+                  }
+              return EFalse;
+              }
+
+          void CCrashContainer::DoInit()
+              {
+              TBuf8<64> path;
+              if (!FindDataDir(path))
+                  {
+                  SetError(_L8("No .cue file found in <drive>:\\crashbandicoot\\"));
+                  DrawNow();
+                  return;
+                  }
+              path.ZeroTerminate();
+              RWindow& glWin = iView->Window();
+              const char* glErr = PSym_GlInit(&glWin);
+              if (glErr)
+                  {
+                  TPtrC8 msg((const TUint8*)glErr);
+                  SetError(msg);
+                  DrawNow();
+                  return;
+                  }
+              if (PSym_Start((const char*)path.Ptr()) != 0)
+                  {
+                  const char* e = PSym_Error();
+                  TPtrC8 msg((const TUint8*)(e ? e : "start failed"));
+                  SetError(msg);
+                  DrawNow();
+                  return;
+                  }
+              TRAPD(aerr, iAudio = CCrashAudio::NewL());
+              if (aerr != KErrNone) iAudio = NULL;
+
+              iMode = EPlay;
+              StartTimer();
+              DrawNow();
+              }
+
+          void CCrashContainer::StartTimer()
+              {
+              if (iTimer && !iTimer->IsActive())
+                  {
+                  iLastTick = User::NTickCount();
+                  iTimer->Start(KTickMicros, KTickMicros, TCallBack(TickCb, this));
+                  }
+              }
+
+          void CCrashContainer::StopTimer()
+              {
+              if (iTimer) iTimer->Cancel();
+              }
+
+          void CCrashContainer::SetForeground(TBool aForeground)
+              {
+              iForeground = aForeground;
+              if (!aForeground)
+                  {
+                  PSym_SetPaused(1);
+                  PSym_Flush();
+                  if (iAudio) iAudio->Suspend();
+                  StopTimer();
+                  }
+              else
+                  {
+                  if (iAudio) iAudio->Resume();
+                  if (iMode == EPlay)
+                      {
+                      PSym_SetPaused(0);
+                      StartTimer();
+                      }
+                  }
+              }
+
+          TInt CCrashContainer::TickCb(TAny* aPtr)
+              {
+              static_cast<CCrashContainer*>(aPtr)->Tick();
+              return 0;
+              }
+
+          // Poll: fatal error? new frame? (the emulation thread paces itself at 60 Hz)
+          void CCrashContainer::Tick()
+              {
+              if (iMode != EPlay || !iForeground) return;
+
+              const char* e = PSym_Error();
+              if (e)
+                  {
+                  TPtrC8 msg((const TUint8*)e);
+                  SetError(msg);
+                  StopTimer();
+                  DrawNow();
+                  return;
+                  }
+
+              TUint now = User::NTickCount();
+              TUint elapsed = now - iLastTick;
+              iLastTick = now;
+              if (!iAudio)
+                  {
+                  // no audio stream: keep the SPU/XA machinery running at real time
+                  TInt16 abuf[PSYM_AUDIO_FRAMES * 2];
+                  TInt frames = (TInt)(elapsed > 100 ? 100 : elapsed) * 44;
+                  while (frames > 0)
+                      {
+                      TInt n = frames > PSYM_AUDIO_FRAMES ? PSYM_AUDIO_FRAMES : frames;
+                      PSym_MixAudio(abuf, n);
+                      frames -= n;
+                      }
+                  }
+
+              }
+
+          void CCrashContainer::PushPad()
+              {
+              PSym_SetPad(iKeyPad | iTouchPad);
+              }
+
+          void CCrashContainer::OpenMenu()
+              {
+              iTouchPad = 0;
+              iKeyPad = 0;
+              for (TInt i = 0; i < KMaxPtrs; ++i) iPtrDown[i] = EFalse;
+              PushPad();
+              iMode = EMenu;
+              iMenuSel = 0;
+              PSym_SetPaused(1);
+              DrawNow();
+              }
+
+          void CCrashContainer::MenuActionL(TInt aIndex)
+              {
+              switch (aIndex)
+                  {
+                  case 0:
+                      break;
+                  case 1:
+                      iSound = !iSound;
+                      PSym_SetSound(iSound);
+                      DrawNow();
+                      return;
+                  default:
+                      PSym_Flush();
+                      iEikonEnv->EikAppUi()->HandleCommandL(EEikCmdExit);
+                      return;
+                  }
+              iMode = EPlay;
+              PSym_SetPaused(0);
+              DrawNow();
+              }
+
+          // ---------------------------------------------------------------------------
+          // Layout and drawing
+          // ---------------------------------------------------------------------------
+          void CCrashContainer::SizeChanged()
+              {
+              ComputeLayout();
+              }
+
+          void CCrashContainer::ComputeLayout()
+              {
+              TRect r = Rect();
+              TInt w = r.Width(), h = r.Height();
+              TInt R = Min(h / 4, w / 6);
+              if (R < 30) R = 30;
+              iDpadR = R;
+              iDpadCentre = TPoint(R + 8, h - R - 24);
+
+              // face buttons: triangle top, cross bottom, square left, circle right
+              TInt br = R * 3 / 10;
+              TPoint c(w - R - 8, h - R - 24);
+              TInt off = br * 12 / 10;
+              iBtnCircle = TRect(c.iX + off - br, c.iY - br, c.iX + off + br, c.iY + br);
+              iBtnSquare = TRect(c.iX - off - br, c.iY - br, c.iX - off + br, c.iY + br);
+              iBtnTri    = TRect(c.iX - br, c.iY - off - br, c.iX + br, c.iY - off + br);
+              iBtnCross  = TRect(c.iX - br, c.iY + off - br, c.iX + br, c.iY + off + br);
+
+              TInt sw = 84, sh = 36;
+              iBtnL1 = TRect(6, 6, 96, 44);
+              iBtnL2 = TRect(6, 50, 96, 88);
+              iBtnR1 = TRect(w - 96, 6, w - 6, 44);
+              iBtnR2 = TRect(w - 96, 50, w - 6, 88);
+              iBtnSelect = TRect(w / 2 - sw - 8, h - sh - 6, w / 2 - 8, h - 6);
+              iBtnStart = TRect(w / 2 + 8, h - sh - 6, w / 2 + sw + 8, h - 6);
+              iBtnMenu = TRect(w / 2 - 40, 4, w / 2 + 40, 40);
+              }
+
+          static const TRgb KLine(255, 255, 255, 150);
+          static const TRgb KFill(0, 0, 0, 70);
+          static const TRgb KHot(110, 110, 255, 150);
+          static const TRgb KText(255, 255, 255, 220);
+
+          void CCrashContainer::DrawButton(CWindowGc& aGc, const TRect& aRect, const TDesC& aLabel, TBool aDown) const
+              {
+              aGc.SetPenStyle(CGraphicsContext::ESolidPen);
+              aGc.SetPenColor(KLine);
+              aGc.SetBrushStyle(CGraphicsContext::ESolidBrush);
+              aGc.SetBrushColor(aDown ? KHot : KFill);
+              aGc.DrawRect(aRect);
+              aGc.SetBrushStyle(CGraphicsContext::ENullBrush);
+              const CFont* font = iEikonEnv->NormalFont();
+              aGc.UseFont(font);
+              aGc.SetPenColor(KText);
+              TInt base = (aRect.Height() + font->AscentInPixels() - font->DescentInPixels()) / 2;
+              aGc.DrawText(aLabel, aRect, base, CGraphicsContext::ECenter, 0);
+              aGc.DiscardFont();
+              }
+
+          void CCrashContainer::DrawPad(CWindowGc& aGc) const
+              {
+              const TUint p = iKeyPad | iTouchPad;
+              aGc.SetPenStyle(CGraphicsContext::ESolidPen);
+              aGc.SetPenColor(KLine);
+              aGc.SetBrushStyle(CGraphicsContext::ESolidBrush);
+              aGc.SetBrushColor(KFill);
+              TRect pad(iDpadCentre.iX - iDpadR, iDpadCentre.iY - iDpadR, iDpadCentre.iX + iDpadR, iDpadCentre.iY + iDpadR);
+              aGc.DrawEllipse(pad);
+              TInt q = iDpadR / 3;
+              TRect up(iDpadCentre.iX - q, iDpadCentre.iY - iDpadR, iDpadCentre.iX + q, iDpadCentre.iY - q);
+              TRect dn(iDpadCentre.iX - q, iDpadCentre.iY + q, iDpadCentre.iX + q, iDpadCentre.iY + iDpadR);
+              TRect lf(iDpadCentre.iX - iDpadR, iDpadCentre.iY - q, iDpadCentre.iX - q, iDpadCentre.iY + q);
+              TRect rt(iDpadCentre.iX + q, iDpadCentre.iY - q, iDpadCentre.iX + iDpadR, iDpadCentre.iY + q);
+              aGc.SetBrushColor(KHot);
+              if (p & PSYM_PAD_UP) aGc.DrawRect(up);
+              if (p & PSYM_PAD_DOWN) aGc.DrawRect(dn);
+              if (p & PSYM_PAD_LEFT) aGc.DrawRect(lf);
+              if (p & PSYM_PAD_RIGHT) aGc.DrawRect(rt);
+              aGc.SetBrushStyle(CGraphicsContext::ENullBrush);
+              aGc.DrawLine(TPoint(iDpadCentre.iX - iDpadR, iDpadCentre.iY), TPoint(iDpadCentre.iX + iDpadR, iDpadCentre.iY));
+              aGc.DrawLine(TPoint(iDpadCentre.iX, iDpadCentre.iY - iDpadR), TPoint(iDpadCentre.iX, iDpadCentre.iY + iDpadR));
+              DrawButton(aGc, iBtnCross, _L("X"), p & PSYM_PAD_CROSS);
+              DrawButton(aGc, iBtnCircle, _L("O"), p & PSYM_PAD_CIRCLE);
+              DrawButton(aGc, iBtnSquare, _L("S"), p & PSYM_PAD_SQUARE);
+              DrawButton(aGc, iBtnTri, _L("T"), p & PSYM_PAD_TRIANGLE);
+              DrawButton(aGc, iBtnL1, _L("L1"), p & PSYM_PAD_L1);
+              DrawButton(aGc, iBtnL2, _L("L2"), p & PSYM_PAD_L2);
+              DrawButton(aGc, iBtnR1, _L("R1"), p & PSYM_PAD_R1);
+              DrawButton(aGc, iBtnR2, _L("R2"), p & PSYM_PAD_R2);
+              DrawButton(aGc, iBtnSelect, _L("Select"), p & PSYM_PAD_SELECT);
+              DrawButton(aGc, iBtnStart, _L("Start"), p & PSYM_PAD_START);
+              DrawButton(aGc, iBtnMenu, _L("Menu"), EFalse);
+              }
+
+          void CCrashContainer::DrawCentred(CWindowGc& aGc, const TDesC& aText, TInt aY) const
+              {
+              const CFont* font = iEikonEnv->NormalFont();
+              aGc.UseFont(font);
+              TRect line(0, aY, Rect().Width(), aY + font->HeightInPixels() + 8);
+              aGc.DrawText(aText, line, font->AscentInPixels() + 4, CGraphicsContext::ECenter, 0);
+              aGc.DiscardFont();
+              }
+
+          void CCrashContainer::DrawMenu(CWindowGc& aGc) const
+              {
+              TRect r = Rect();
+              TInt w = 340, rh = 40, h = KMenuItems * rh;
+              TRect box((r.Width() - w) / 2, (r.Height() - h) / 2, (r.Width() + w) / 2, (r.Height() + h) / 2);
+              aGc.SetPenStyle(CGraphicsContext::ESolidPen);
+              aGc.SetPenColor(KLine);
+              aGc.SetBrushStyle(CGraphicsContext::ESolidBrush);
+              aGc.SetBrushColor(TRgb(20, 20, 40, 235));
+              aGc.DrawRect(box);
+              const CFont* font = iEikonEnv->NormalFont();
+              aGc.UseFont(font);
+              for (TInt i = 0; i < KMenuItems; ++i)
+                  {
+                  TRect row(box.iTl.iX + 2, box.iTl.iY + i * rh + 2, box.iBr.iX - 2, box.iTl.iY + (i + 1) * rh - 2);
+                  if (i == iMenuSel)
+                      {
+                      aGc.SetBrushColor(TRgb(70, 70, 140, 255));
+                      aGc.SetPenStyle(CGraphicsContext::ENullPen);
+                      aGc.DrawRect(row);
+                      aGc.SetPenStyle(CGraphicsContext::ESolidPen);
+                      }
+                  aGc.SetPenColor(TRgb(255, 255, 255, 255));
+                  TBuf<40> label;
+                  switch (i)
+                      {
+                      case 0: label = _L("Resume"); break;
+                      case 1: label = iSound ? _L("Sound: on") : _L("Sound: off"); break;
+                      default: label = _L("Exit"); break;
+                      }
+                  TInt base = (row.Height() + font->AscentInPixels() - font->DescentInPixels()) / 2;
+                  aGc.DrawText(label, row, base, CGraphicsContext::ECenter, 0);
+                  aGc.SetBrushColor(TRgb(20, 20, 40, 235));
+                  }
+              aGc.DiscardFont();
+              }
+
+          void CCrashContainer::Draw(const TRect& /*aRect*/) const
+              {
+              CWindowGc& gc = SystemGc();
+              gc.SetDrawMode(CGraphicsContext::EDrawModeWriteAlpha);
+              gc.SetPenStyle(CGraphicsContext::ESolidPen);
+              gc.SetBrushStyle(CGraphicsContext::ESolidBrush);
+              gc.SetBrushColor(TRgb(0, 0, 0, 0));
+              gc.Clear(Rect());
+
+              if (iMode == ELoading || iMode == EError)
+                  {
+                  gc.SetBrushColor(TRgb(0, 0, 0, 255));
+                  gc.Clear(Rect());
+                  gc.SetPenColor(TRgb(255, 255, 255, 255));
+                  TInt y = Rect().Height() / 2 - 50;
+                  if (iMode == ELoading)
+                      {
+                      DrawCentred(gc, KLoading1, y);
+                      DrawCentred(gc, KLoading2, y + 34);
+                      }
+                  else
+                      {
+                      DrawCentred(gc, KErrTitle, y);
+                      DrawCentred(gc, iErrLine1, y + 34);
+                      DrawCentred(gc, iErrLine2, y + 60);
+                      DrawCentred(gc, KErrHint, y + 100);
+                      }
+                  return;
+                  }
+
+              DrawPad(gc);
+              if (iMode == EMenu) DrawMenu(gc);
+              }
+
+          // ---------------------------------------------------------------------------
+          // Input
+          // ---------------------------------------------------------------------------
+          TUint CCrashContainer::PadFromPoint(const TPoint& aPt) const
+              {
+              TUint bits = 0;
+              if (iBtnCross.Contains(aPt)) bits |= PSYM_PAD_CROSS;
+              if (iBtnCircle.Contains(aPt)) bits |= PSYM_PAD_CIRCLE;
+              if (iBtnSquare.Contains(aPt)) bits |= PSYM_PAD_SQUARE;
+              if (iBtnTri.Contains(aPt)) bits |= PSYM_PAD_TRIANGLE;
+              if (iBtnL1.Contains(aPt)) bits |= PSYM_PAD_L1;
+              if (iBtnL2.Contains(aPt)) bits |= PSYM_PAD_L2;
+              if (iBtnR1.Contains(aPt)) bits |= PSYM_PAD_R1;
+              if (iBtnR2.Contains(aPt)) bits |= PSYM_PAD_R2;
+              if (iBtnSelect.Contains(aPt)) bits |= PSYM_PAD_SELECT;
+              if (iBtnStart.Contains(aPt)) bits |= PSYM_PAD_START;
+              TInt dx = aPt.iX - iDpadCentre.iX;
+              TInt dy = aPt.iY - iDpadCentre.iY;
+              TInt lim = iDpadR + iDpadR / 3;
+              if (dx > -lim && dx < lim && dy > -lim && dy < lim)
+                  {
+                  TInt dead = iDpadR / 4;
+                  if (dx < -dead) bits |= PSYM_PAD_LEFT;
+                  if (dx > dead) bits |= PSYM_PAD_RIGHT;
+                  if (dy < -dead) bits |= PSYM_PAD_UP;
+                  if (dy > dead) bits |= PSYM_PAD_DOWN;
+                  }
+              return bits;
+              }
+
+          void CCrashContainer::UpdateTouchPad()
+              {
+              TUint bits = 0;
+              for (TInt i = 0; i < KMaxPtrs; ++i)
+                  if (iPtrDown[i]) bits |= PadFromPoint(iPtrPos[i]);
+              iTouchPad = bits;
+              PushPad();
+              }
+
+          void CCrashContainer::HandlePointerEventL(const TPointerEvent& aEvent)
+              {
+              const TPoint pt = aEvent.iPosition;
+              TInt id = 0;
+          #ifdef Z3_MULTITOUCH
+              const TAdvancedPointerEvent* adv = aEvent.AdvancedPointerEvent();
+              if (adv) id = adv->PointerNumber();
+          #endif
+              if (id < 0 || id >= KMaxPtrs) return;
+
+              if (iMode == EPlay)
+                  {
+                  if (aEvent.iType == TPointerEvent::EButton1Down && iBtnMenu.Contains(pt))
+                      {
+                      OpenMenu();
+                      return;
+                      }
+                  if (aEvent.iType == TPointerEvent::EButton1Down || aEvent.iType == TPointerEvent::EDrag)
+                      {
+                      iPtrDown[id] = ETrue;
+                      iPtrPos[id] = pt;
+                      }
+                  else if (aEvent.iType == TPointerEvent::EButton1Up)
+                      {
+                      iPtrDown[id] = EFalse;
+                      }
+                  UpdateTouchPad();
+                  return;
+                  }
+
+              if (iMode == EMenu)
+                  {
+                  if (aEvent.iType == TPointerEvent::EButton1Up)
+                      {
+                      TRect r = Rect();
+                      TInt w = 340, rh = 40, h = KMenuItems * rh;
+                      TRect box((r.Width() - w) / 2, (r.Height() - h) / 2, (r.Width() + w) / 2, (r.Height() + h) / 2);
+                      if (box.Contains(pt)) MenuActionL((pt.iY - box.iTl.iY) / rh);
+                      else MenuActionL(0);
+                      }
+                  return;
+                  }
+
+              if (iMode == EError && aEvent.iType == TPointerEvent::EButton1Up)
+                  iEikonEnv->EikAppUi()->HandleCommandL(EEikCmdExit);
+              }
+
+          TKeyResponse CCrashContainer::OfferKeyEventL(const TKeyEvent& aKey, TEventCode aType)
+              {
+              const TInt sc = aKey.iScanCode;
+
+              if (iMode == EPlay)
+                  {
+                  TUint bit = 0;
+                  switch (sc)
+                      {
+                      case EStdKeyUpArrow:    bit = PSYM_PAD_UP; break;
+                      case EStdKeyDownArrow:  bit = PSYM_PAD_DOWN; break;
+                      case EStdKeyLeftArrow:  bit = PSYM_PAD_LEFT; break;
+                      case EStdKeyRightArrow: bit = PSYM_PAD_RIGHT; break;
+                      case 'X': case EStdKeySpace: bit = PSYM_PAD_CROSS; break;    // jump
+                      case 'Z':               bit = PSYM_PAD_SQUARE; break;        // spin
+                      case 'C':               bit = PSYM_PAD_CIRCLE; break;
+                      case 'S':               bit = PSYM_PAD_TRIANGLE; break;
+                      case 'Q':               bit = PSYM_PAD_L1; break;
+                      case 'W':               bit = PSYM_PAD_R1; break;
+                      case 'A':               bit = PSYM_PAD_L2; break;
+                      case 'D':               bit = PSYM_PAD_R2; break;
+                      case EStdKeyEnter: case EStdKeyDevice3: bit = PSYM_PAD_START; break;
+                      case EStdKeyBackspace:  bit = PSYM_PAD_SELECT; break;
+                      default: break;
+                      }
+                  if (aType == EEventKeyDown && sc == EStdKeyDevice0)      // left soft key
+                      {
+                      OpenMenu();
+                      return EKeyWasConsumed;
+                      }
+                  if (bit)
+                      {
+                      if (aType == EEventKeyDown) iKeyPad |= bit;
+                      else if (aType == EEventKeyUp) iKeyPad &= ~bit;
+                      PushPad();
+                      return EKeyWasConsumed;
+                      }
+                  return EKeyWasNotConsumed;
+                  }
+
+              if (aType != EEventKeyDown)
+                  {
+                  return (sc == EStdKeyUpArrow || sc == EStdKeyDownArrow || sc == EStdKeyEnter ||
+                          sc == EStdKeyDevice3 || sc == EStdKeyDevice0) ? EKeyWasConsumed : EKeyWasNotConsumed;
+                  }
+
+              if (iMode == EMenu)
+                  {
+                  if (sc == EStdKeyUpArrow && iMenuSel > 0) --iMenuSel;
+                  else if (sc == EStdKeyDownArrow && iMenuSel < KMenuItems - 1) ++iMenuSel;
+                  else if (sc == EStdKeyEnter || sc == EStdKeyDevice3) { MenuActionL(iMenuSel); return EKeyWasConsumed; }
+                  else if (sc == EStdKeyDevice0) { MenuActionL(0); return EKeyWasConsumed; }
+                  else return EKeyWasNotConsumed;
+                  DrawNow();
+                  return EKeyWasConsumed;
+                  }
+
+              if (iMode == EError && (sc == EStdKeyEnter || sc == EStdKeyDevice3 || sc == EStdKeyDevice0))
+                  {
+                  iEikonEnv->EikAppUi()->HandleCommandL(EEikCmdExit);
+                  return EKeyWasConsumed;
+                  }
+              return EKeyWasNotConsumed;
+              }
+          CR_EOF
+          mkdir -p symbian/app/src
+          cat > symbian/app/src/crash_gl.cpp <<'CR_EOF'
+          // EGL / OpenGL ES 2.0 host for the GLES2 GPU backend (replaces the EAGL part of ios_host.m).
+          // EGL display/config/surface/context are created on the UI thread (PSym_GlInit); the emulation thread
+          // binds the context (plat_gl_make_current) and swaps buffers (PSym_GlSwap).
+          #include <e32std.h>
+          #include <w32std.h>
+          #include <EGL/egl.h>
+          #include "psx_sym.h"
+
+          extern "C" {
+          void plat_log(const char *fmt, ...);
+          void plat_gl_make_current(void);
+          void plat_gl_screen(int *fbo, int *w, int *h);
+          }
+
+          static EGLDisplay gDpy = EGL_NO_DISPLAY;
+          static EGLSurface gSurf = EGL_NO_SURFACE;
+          static EGLContext gCtx = EGL_NO_CONTEXT;
+          static EGLConfig gCfg;
+          static volatile int gCurrent = 0;
+          static int gW = 640, gH = 360;
+
+          static EGLBoolean ChooseCfg(const EGLint* aAttr)
+              {
+              EGLint n = 0;
+              return eglChooseConfig(gDpy, aAttr, &gCfg, 1, &n) && n > 0;
+              }
+
+          extern "C" const char *PSym_GlInit(void *aWindow)
+              {
+              gDpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+              if (gDpy == EGL_NO_DISPLAY) return "EGL: no display";
+              EGLint maj = 0, min = 0;
+              if (!eglInitialize(gDpy, &maj, &min)) return "EGL: eglInitialize failed";
+              eglBindAPI(EGL_OPENGL_ES_API);
+
+              const EGLint a565[] = { EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+                                      EGL_RED_SIZE, 5, EGL_GREEN_SIZE, 6, EGL_BLUE_SIZE, 5, EGL_NONE };
+              const EGLint aAny[] = { EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT, EGL_NONE };
+              if (!ChooseCfg(a565) && !ChooseCfg(aAny)) return "EGL: no OpenGL ES 2.0 window config (device without GLES2?)";
+
+              gSurf = eglCreateWindowSurface(gDpy, gCfg, (EGLNativeWindowType)aWindow, NULL);
+              if (gSurf == EGL_NO_SURFACE) return "EGL: eglCreateWindowSurface failed";
+
+              const EGLint ctxAttr[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+              gCtx = eglCreateContext(gDpy, gCfg, EGL_NO_CONTEXT, ctxAttr);
+              if (gCtx == EGL_NO_CONTEXT) return "EGL: eglCreateContext (ES 2.0) failed";
+
+              eglQuerySurface(gDpy, gSurf, EGL_WIDTH, &gW);
+              eglQuerySurface(gDpy, gSurf, EGL_HEIGHT, &gH);
+              return NULL;
+              }
+
+          // Emulation thread: first call binds the context to this thread (cheap afterwards).
+          extern "C" void plat_gl_make_current(void)
+              {
+              if (gCurrent) return;
+              eglBindAPI(EGL_OPENGL_ES_API);
+              if (!eglMakeCurrent(gDpy, gSurf, gSurf, gCtx))
+                  plat_log("[EGL] eglMakeCurrent failed: 0x%x", (unsigned)eglGetError());
+              else
+                  gCurrent = 1;
+              }
+
+          extern "C" void plat_gl_screen(int *fbo, int *w, int *h)
+              {
+              *fbo = 0;
+              *w = gW;
+              *h = gH;
+              }
+
+          extern "C" int PSym_GlSwap(void)
+              {
+              if (!gCurrent) return 0;
+              if (!eglSwapBuffers(gDpy, gSurf))
+                  {
+                  static int logged;
+                  if (logged++ < 8) plat_log("[EGL] eglSwapBuffers failed: 0x%x", (unsigned)eglGetError());
+                  return 0;
+                  }
+              return 1;
+              }
+          CR_EOF
+          mkdir -p symbian/app/src
+          cat > symbian/app/src/crash_sleep.cpp <<'CR_EOF'
+          // Microsecond sleep for the emulation thread (User::After is limited to the 15 ms tick).
+          #include <e32std.h>
+          #include "psx_sym.h"
+
+          extern "C" void PSym_SleepUs(unsigned us)
+              {
+              RTimer t;
+              if (t.CreateLocal() != KErrNone)
+                  {
+                  User::After(us < 1000 ? 1000 : (TInt)us);
+                  return;
+                  }
+              TRequestStatus s;
+              t.HighRes(s, TTimeIntervalMicroSeconds32((TInt)us));
+              User::WaitForRequest(s);
+              t.Close();
+              }
+          CR_EOF
+          mkdir -p symbian/compat
+          cat > symbian/compat/z3compat.h <<'CR_EOF'
+          /* z3compat.h - Open C gaps and ARM alignment helpers. Included from psx.h by the patch script. */
+          #ifndef Z3COMPAT_H
+          #define Z3COMPAT_H
+          #include <string.h>
+          #include <ctype.h>
+          #include <stddef.h>
+          #include <stdint.h>
+
+          static inline int z3_strncasecmp(const char *a, const char *b, size_t n)
+          {
+              for (; n; n--, a++, b++) {
+                  int x = tolower((unsigned char)*a), y = tolower((unsigned char)*b);
+                  if (x != y) return x - y;
+                  if (!x) return 0;
+              }
+              return 0;
+          }
+          static inline int z3_strcasecmp(const char *a, const char *b)
+          {
+              for (;; a++, b++) {
+                  int x = tolower((unsigned char)*a), y = tolower((unsigned char)*b);
+                  if (x != y) return x - y;
+                  if (!x) return 0;
+              }
+          }
+          #define strcasecmp z3_strcasecmp
+          #define strncasecmp z3_strncasecmp
+
+          /* Emulated RAM is naturally aligned for compiled MIPS code: plain loads/stores on the fast path
+           * (memcpy turns into byte accesses with -mno-unaligned-access), memcpy otherwise. */
+          #define Z3_LD32(ptr, a) (__builtin_expect(!((a) & 3u), 1) ? *(const uint32_t *)(ptr) : ld32(ptr))
+          #define Z3_LD16(ptr, a) (__builtin_expect(!((a) & 1u), 1) ? (uint32_t)*(const uint16_t *)(ptr) : ld16(ptr))
+          #define Z3_ST32(ptr, a, v) do { if (__builtin_expect(!((a) & 3u), 1)) *(uint32_t *)(ptr) = (v); else st32((ptr), (v)); } while (0)
+          #define Z3_ST16(ptr, a, v) do { if (__builtin_expect(!((a) & 1u), 1)) *(uint16_t *)(ptr) = (uint16_t)(v); else st16((ptr), (v)); } while (0)
+
+          #endif
+          CR_EOF
+          mkdir -p symbian/core
+          cat > symbian/core/psx_sym.c <<'CR_EOF'
+          /* psx_sym.c - Symbian^3 platform layer (replaces ios_host.m; EGL part in crash_gl.cpp).
+           * The emulation runs on a pthread. The Avkon UI thread polls finished frames, mixes audio
+           * (spu_mix) and feeds the pad bits. Rendering is the GLES2 backend (PowerVR SGX on N8/C7/E7). */
+          #include <pthread.h>
+          #include <unistd.h>
+          #include <dirent.h>
+          #include <stdarg.h>
+          #include <sys/stat.h>
+          #include <sys/time.h>
+          #include "psx.h"
+          #include "psx_sym.h"
+
+          static char g_base[300], g_cue[420], g_saves[420], g_logpath[420];
+          static FILE *g_logf;
+          static pthread_mutex_t g_log_mx = PTHREAD_MUTEX_INITIALIZER;
+          static char g_err[220];
+          static volatile int g_has_err;
+          static volatile int g_sound = 1, g_started;
+
+          void plat_log(const char *fmt, ...)
+          {
+              pthread_mutex_lock(&g_log_mx);
+              if (!g_logf && g_logpath[0]) g_logf = fopen(g_logpath, "w");
+              if (g_logf) {
+                  va_list a; va_start(a, fmt);
+                  vfprintf(g_logf, fmt, a);
+                  va_end(a);
+                  fputc('\n', g_logf);
+                  fflush(g_logf);
+              }
+              pthread_mutex_unlock(&g_log_mx);
+          }
+
+          uint64_t plat_time_ns(void)
+          {
+              struct timeval tv;
+              gettimeofday(&tv, NULL);
+              return (uint64_t)tv.tv_sec * 1000000000ull + (uint64_t)tv.tv_usec * 1000ull;
+          }
+
+          void plat_sleep_us(unsigned us) { PSym_SleepUs(us); }
+          const char *plat_disc_path(void) { return g_cue; }
+          const char *plat_save_dir(void) { return g_saves; }
+          void plat_input_poll(void) {}
+          void plat_rumble(uint8_t large, uint8_t small_) { (void)large; (void)small_; }
+
+          void plat_fatal(const char *msg)
+          {
+              plat_log("[FATAL] %s", msg);
+              snprintf(g_err, sizeof g_err, "%s", msg);
+              g_has_err = 1;
+              g_paused = 1;
+              for (;;) PSym_SleepUs(500000);
+          }
+
+          /* The GLES2 backend keeps VRAM on the GPU: draw the display rectangle and swap. */
+          void gpu_present(int dx, int dy, int dw, int dh, bool rgb24, bool enabled);
+
+          void plat_present(const uint16_t *vram, int dx, int dy, int dw, int dh, bool rgb24, bool enabled)
+          {
+              (void)vram;
+              while (g_paused && !g_has_err) PSym_SleepUs(10000);
+              gpu_present(dx, dy, dw, dh, rgb24, enabled);
+              PSym_GlSwap();
+          }
+
+          void PSym_SetPad(unsigned mask) { g_pad_pressed = mask; }
+          void PSym_SetPaused(int paused) { g_paused = paused; }
+          void PSym_SetSound(int on) { g_sound = on; }
+          const char *PSym_Error(void) { return g_has_err ? g_err : NULL; }
+
+          void PSym_Flush(void)
+          {
+              if (g_card_a) card_flush(g_card_a);
+              if (g_card_b) card_flush(g_card_b);
+          }
+
+          void PSym_MixAudio(short *dst, int frames)
+          {
+              if (!g_started || g_has_err) { memset(dst, 0, (size_t)frames * 4); return; }
+              spu_mix((int16_t *)dst, frames);      /* always mixed: keeps voices and the XA ring moving */
+              if (!g_sound) memset(dst, 0, (size_t)frames * 4);
+          }
+
+          static int find_cue(const char *dir, char *out, size_t outsz)
+          {
+              DIR *d = opendir(dir);
+              if (!d) return 0;
+              struct dirent *e;
+              int ok = 0;
+              while ((e = readdir(d))) {
+                  size_t n = strlen(e->d_name);
+                  if (n > 4 && strcasecmp(e->d_name + n - 4, ".cue") == 0) {
+                      if (out) snprintf(out, outsz, "%s/%s", dir, e->d_name);
+                      ok = 1;
+                      break;
+                  }
+              }
+              closedir(d);
+              return ok;
+          }
+
+          int PSym_Probe(const char *dir) { return find_cue(dir, NULL, 0); }
+
+          static void *emu_main(void *arg)
+          {
+              (void)arg;
+              runtime_run_game();
+              plat_fatal("game returned");
+              return NULL;
+          }
+
+          static int fail(const char *msg)
+          {
+              snprintf(g_err, sizeof g_err, "%s", msg);
+              g_has_err = 1;
+              return -1;
+          }
+
+          int PSym_Start(const char *basedir)
+          {
+              if (g_started) return 0;
+              snprintf(g_base, sizeof g_base, "%s", basedir);
+              snprintf(g_saves, sizeof g_saves, "%s/saves", g_base);
+              snprintf(g_logpath, sizeof g_logpath, "%s/crash.log", g_base);
+              mkdir(g_saves, 0755);
+
+              if (!find_cue(g_base, g_cue, sizeof g_cue)) return fail("No .cue file in the crashbandicoot folder.");
+
+              plat_log("---- launch, cue=%s", g_cue);
+              pthread_attr_t at;
+              pthread_attr_init(&at);
+              pthread_attr_setstacksize(&at, 1024 * 1024);
+              pthread_t th;
+              if (pthread_create(&th, &at, emu_main, NULL) != 0) return fail("Cannot start the emulation thread.");
+              pthread_detach(th);
+              g_started = 1;
+              return 0;
+          }
+          CR_EOF
+          mkdir -p symbian/core
+          cat > symbian/core/psx_sym.h <<'CR_EOF'
+          /* psx_sym.h - C interface between the native RecompOne runtime and the Symbian front end. */
+          #ifndef PSX_SYM_H
+          #define PSX_SYM_H
+
+          #ifdef __cplusplus
+          extern "C" {
+          #endif
+
+          /* Pad bits (active-high), identical to PAD_* in psx.h. */
+          enum {
+            PSYM_PAD_SELECT = 1 << 0, PSYM_PAD_START = 1 << 3,
+            PSYM_PAD_UP = 1 << 4, PSYM_PAD_RIGHT = 1 << 5, PSYM_PAD_DOWN = 1 << 6, PSYM_PAD_LEFT = 1 << 7,
+            PSYM_PAD_L2 = 1 << 8, PSYM_PAD_R2 = 1 << 9, PSYM_PAD_L1 = 1 << 10, PSYM_PAD_R1 = 1 << 11,
+            PSYM_PAD_TRIANGLE = 1 << 12, PSYM_PAD_CIRCLE = 1 << 13, PSYM_PAD_CROSS = 1 << 14, PSYM_PAD_SQUARE = 1 << 15
+          };
+
+          enum { PSYM_AUDIO_RATE = 44100, PSYM_AUDIO_FRAMES = 1024 };
+
+          /* 1 if dir (e.g. "E:/crashbandicoot") exists and holds a .cue file. */
+          int  PSym_Probe(const char *dir);
+          /* Boots the game on its own thread. 0 = started, otherwise PSym_Error() says why. */
+          int  PSym_Start(const char *basedir);
+          /* NULL while everything is fine, else the last fatal message. */
+          const char *PSym_Error(void);
+
+          void PSym_SetPad(unsigned mask);
+          void PSym_SetPaused(int paused);
+          void PSym_SetSound(int on);
+          void PSym_Flush(void);                      /* write memory cards */
+
+          /* EGL/GLES2 host (C++, crash_gl.cpp). PSym_GlInit runs on the UI thread with the RWindow* of the GL view
+           * and returns NULL on success or an error text. The context is made current on the emulation thread. */
+          const char *PSym_GlInit(void *rwindow);
+          int  PSym_GlSwap(void);
+
+          /* 44.1 kHz stereo PCM16: frames * 2 samples. */
+          void PSym_MixAudio(short *dst, int frames);
+
+          /* Implemented in C++ (RTimer): microsecond sleep. */
+          void PSym_SleepUs(unsigned us);
+
+          #ifdef __cplusplus
+          }
+          #endif
+          #endif
+          CR_EOF
+          mkdir -p symbian/tools
+          cat > symbian/tools/host_check.c <<'CR_EOF'
+          /* Link/start check on a desktop: the runtime (GLES2 backend) must link without Symbian and
+           * fail cleanly without a disc. The EGL host (crash_gl.cpp) is Symbian only, so it is stubbed here. */
+          #include "psx_sym.h"
+          #include <stdio.h>
+          #include <unistd.h>
+
+          void PSym_SleepUs(unsigned us) { usleep(us); }
+          void plat_gl_make_current(void) {}
+          void plat_gl_screen(int *fbo, int *w, int *h) { *fbo = 0; *w = 640; *h = 360; }
+          int PSym_GlSwap(void) { return 1; }
+          const char *PSym_GlInit(void *w) { (void)w; return 0; }
+
+          int main(int argc, char **argv)
+          {
+              int r = PSym_Start(argc > 1 ? argv[1] : ".");
+              const char *e = PSym_Error();
+              printf("start=%d err=%s\n", r, e ? e : "none");
+              return 0;
+          }
+          CR_EOF
+          mkdir -p symbian/tools
+          cat > symbian/tools/patch_symbian.py <<'CR_EOF'
+          #!/usr/bin/env python3
+          """Prepares the CrashBandicoot.Native sources for the Symbian^3 build (run from the repo root).
+
+          * psx.h: pulls in compat/z3compat.h, aligned fast paths for RAM/scratch accessors (ARM, no unaligned access)
+          * disc.c: no libgen.h, pread() -> locked lseek()+read()
+          * libsdk.c: __sync_synchronize() -> compiler barrier (single core ARM11)
+          * gpu_gles2.inc: Symbian GLES2 headers instead of the iOS ones
+          * writes symbian/app/group/crashrecomp.mmp from crashrecomp.mmp.in + the source lists
+          """
+          import glob, os, re, shutil, sys
+
+          N = "CrashBandicoot.Native"
+          OPT = sys.argv[1] if len(sys.argv) > 1 else "-O2"
+
+          def rd(p): return open(p, newline="").read()
+          def wr(p, s): open(p, "w", newline="").write(s)
+
+          # ---------------------------------------------------------------- psx.h
+          p = N + "/src/psx.h"
+          s = rd(p)
+          if "z3compat.h" not in s:
+              a = "#include <stdlib.h>\n"
+              assert a in s, "psx.h anchor"
+              s = s.replace(a, a + '#include "z3compat.h"\n', 1)
+              s, n1 = re.subn(r"\bld32\((g_ram|g_scratch) \+ (\(p & \(PS_\w+ - 1\)\))\)", r"Z3_LD32(\1 + \2, p)", s)
+              s, n2 = re.subn(r"\bld16\((g_ram|g_scratch) \+ (\(p & \(PS_\w+ - 1\)\))\)", r"Z3_LD16(\1 + \2, p)", s)
+              s, n3 = re.subn(r"\bst32\((g_ram|g_scratch) \+ (\(p & \(PS_\w+ - 1\)\)), v\)", r"Z3_ST32(\1 + \2, p, v)", s)
+              s, n4 = re.subn(r"\bst16\((g_ram|g_scratch) \+ (\(p & \(PS_\w+ - 1\)\)), v\)", r"Z3_ST16(\1 + \2, p, v)", s)
+              assert (n1, n2, n3, n4) == (2, 2, 2, 2), (n1, n2, n3, n4)
+              wr(p, s)
+
+          # ---------------------------------------------------------------- disc.c
+          p = N + "/src/disc.c"
+          s = rd(p)
+          if "z3_pread" not in s:
+              s = s.replace("#include <libgen.h>\n", "#include <pthread.h>\n")
+              old = "    ssize_t n = pread(t->fd, out, (size_t)want, (off_t)pos);"
+              assert old in s, "disc.c pread"
+              s = s.replace(old, "    ssize_t n = z3_pread(t->fd, out, (size_t)want, (off_t)pos);")
+              anchor = "void disc_read_sector_data("
+              helper = ("static pthread_mutex_t g_disc_mx = PTHREAD_MUTEX_INITIALIZER;\n"
+                        "static ssize_t z3_pread(int fd, void *buf, size_t n, off_t pos)\n{\n"
+                        "    ssize_t r = -1;\n    pthread_mutex_lock(&g_disc_mx);\n"
+                        "    if (lseek(fd, pos, SEEK_SET) == pos) r = read(fd, buf, n);\n"
+                        "    pthread_mutex_unlock(&g_disc_mx);\n    return r;\n}\n\n")
+              assert anchor in s
+              s = s.replace(anchor, helper + anchor, 1)
+              wr(p, s)
+
+          # ---------------------------------------------------------------- libsdk.c
+          p = N + "/src/libsdk.c"
+          s = rd(p)
+          s = s.replace("__sync_synchronize();", '__asm__ volatile("" ::: "memory");')
+          wr(p, s)
+
+          # ---------------------------------------------------------------- GLES2 headers
+          p = N + "/src/gpu_gles2.inc"
+          s = rd(p)
+          s = s.replace("#include <OpenGLES/ES2/gl.h>", "#include <GLES2/gl2.h>").replace("#include <OpenGLES/ES2/glext.h>", "#include <GLES2/gl2ext.h>")
+          assert "OpenGLES/" not in s
+          wr(p, s)
+
+          # ---------------------------------------------------------------- mmp
+          EXCLUDE = {"host_stub.c"}
+          def lst(d):
+              return sorted(os.path.basename(f) for f in glob.glob(N + "/" + d + "/*.c"))
+          src, gen = lst("src"), lst("gen")
+          assert gen, "no generated C files in %s/gen (recompile step failed?)" % N
+          names = src + gen + ["psx_sym.c"]
+          dup = sorted(set(x for x in names if names.count(x) > 1))
+          assert not dup, "duplicate object names: %s" % dup
+
+          lines = ["SOURCEPATH      ../../../%s/src" % N] + ["SOURCE          " + f for f in src] + [""]
+          lines += ["SOURCEPATH      ../../../%s/gen" % N] + ["SOURCE          " + f for f in gen] + [""]
+          tmpl = open("symbian/app/group/crashrecomp.mmp.in").read()
+          out = tmpl.replace("@CORE_SOURCES@", "\n".join(lines)).replace("@OPT@", OPT)
+          open("symbian/app/group/crashrecomp.mmp", "w").write(out)
+          print("mmp: %d runtime + %d generated C files, opt=%s" % (len(src), len(gen), OPT))
+          CR_EOF
+          python3 symbian/tools/patch_symbian.py "${{ inputs.opt || '-O2' }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: port-src
+          retention-days: 1
+          path: |
+            CrashBandicoot.Native/src
+            CrashBandicoot.Native/gen
+            symbian
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-logs-recomp
+          path: build-recomp.log
+          if-no-files-found: ignore
+
+  host-check:
+    name: Core build check (host)
+    needs: sources
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: port-src
+          path: .
+      - name: Install GLES2 headers and libs
+        run: sudo apt-get update && sudo apt-get install -y libgles-dev
+      - name: Compile and link the runtime without Symbian
+        run: |
+          set -e
+          mkdir obj
+          FL="-std=gnu11 -O0 -fno-strict-aliasing -fwrapv -w -DNDEBUG -DPSX_GLES2 -Isymbian/core -Isymbian/compat -ICrashBandicoot.Native/src -ICrashBandicoot.Native/gen"
+          ls CrashBandicoot.Native/src/*.c CrashBandicoot.Native/gen/*.c symbian/core/psx_sym.c symbian/tools/host_check.c \
+            | xargs -P 4 -I{} sh -c 'gcc '"$FL"' -c {} -o obj/$(basename {} .c).o'
+          gcc obj/*.o -o host_check -lm -lpthread -lGLESv2
+          mkdir empty && ./host_check "$PWD/empty"
+
+  build-sis:
+    name: Build crashrecomp.sisx
+    needs: sources
+    runs-on: ${{ vars.MACOS_RUNNER || 'macos-latest' }}
+    timeout-minutes: 360
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: port-src
+          path: .
+      - name: Check out symbian3-toolchain
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TOOLCHAIN_REPO }}
+          ref: ${{ env.TOOLCHAIN_REF }}
+          path: toolchain
+      - name: Create case-sensitive APFS volume
+        run: |
+          hdiutil create -size 24g -fs "Case-sensitive APFS" -volname Symbian -type SPARSE "$RUNNER_TEMP/symbian"
+          hdiutil attach "$RUNNER_TEMP/symbian.sparseimage" -mountpoint "$SYMBIAN_VOL"
+          sudo chown "$(id -u):$(id -g)" "$SYMBIAN_VOL"
+      - name: Install Homebrew dependencies and Rosetta
+        run: |
+          brew install perl openssl@3 unshield make gmp mpfr libmpc isl gnu-sed
+          brew unlink perl
+          sudo softwareupdate --install-rosetta --agree-to-license || true
+      - name: Restore toolchain cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            /Volumes/Symbian/toolchain
+            /Volumes/Symbian/sdks
+            /Volumes/Symbian/gnupoc
+          key: symbian3-toolchain-${{ env.TOOLCHAIN_REF }}-${{ env.GNUPOC_COMMIT }}-${{ env.GCC4SYMBIAN_COMMIT }}
+      - name: Build toolchain and install SDK (cache miss)
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          JOBS: 4
+        run: |
+          set -eo pipefail
+          cd toolchain
+          source Scripts/env.sh
+          mkdir -p "$N8_SRC"
+          git clone https://github.com/mstorsjo/gnupoc-package "$N8_SRC/gnupoc-package"
+          git -C "$N8_SRC/gnupoc-package" checkout "$GNUPOC_COMMIT"
+          git clone https://github.com/fedor4ever/GCC4Symbian "$N8_SRC/GCC4Symbian"
+          git -C "$N8_SRC/GCC4Symbian" checkout "$GCC4SYMBIAN_COMMIT"
+          Scripts/fetch-sdk.sh
+          Scripts/build-host-tools.sh
+          Scripts/build-gcc.sh
+          Scripts/install-sdk.sh
+      - name: Save toolchain cache
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            /Volumes/Symbian/toolchain
+            /Volumes/Symbian/sdks
+            /Volumes/Symbian/gnupoc
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+      - name: Check Open C (libc, pthread) in the SDK
+        run: |
+          source toolchain/Scripts/env.sh
+          ls "${EPOCROOT}epoc32/include/stdapis/stdio.h" "${EPOCROOT}epoc32/include/stdapis/pthread.h" "${EPOCROOT}epoc32/include/GLES2/gl2.h" "${EPOCROOT}epoc32/include/EGL/egl.h" || true
+          ls "${EPOCROOT}epoc32/release/armv5/lib/" | grep -i -E "^lib(c|m|pthread|EGL|GLESv2)\." || true
+          arm-none-symbianelf-gcc -print-file-name=include
+      - name: Build crashrecomp
+        run: |
+          set -eo pipefail
+          source toolchain/Scripts/env.sh
+          GCCINC="$(arm-none-symbianelf-gcc -print-file-name=include)"
+          cd symbian/app/group
+          sed -i.bak "s|@GCCINC@|$GCCINC|" crashrecomp.mmp
+          bldmake bldfiles
+          if ! abld build -keepgoing gcce urel; then
+            echo "::warning::build failed, retrying without multi-touch (Z3_MULTITOUCH)"
+            sed -i.bak2 "/Z3_MULTITOUCH/d" crashrecomp.mmp
+            abld reallyclean gcce urel || true
+            bldmake bldfiles
+            abld build gcce urel
+          fi
+          test -f "${EPOCROOT}epoc32/release/gcce/urel/crashrecomp.exe"
+          ls -l "${EPOCROOT}epoc32/release/gcce/urel/crashrecomp.exe"
+      - name: Package signed SIS
+        run: |
+          set -eo pipefail
+          source toolchain/Scripts/env.sh
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          "$N8_REPO/Scripts/package-sis.sh" symbian/app/sis/crashrecomp.pkg "$GITHUB_WORKSPACE/dist"
+          ls -l "$GITHUB_WORKSPACE/dist"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crashrecomp-symbian3
+          path: dist/crashrecomp.sisx
+          if-no-files-found: error
