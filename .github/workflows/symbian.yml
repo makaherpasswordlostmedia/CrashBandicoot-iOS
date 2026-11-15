@@ -1689,6 +1689,7 @@ jobs:
               b = s.index("static void make_tex(")
               new_cs = r'''static GLuint compile_shader(GLenum type, const char *src, const char *name)
           {
+              plat_log("[GPU] compiling %s %s ...", name, type == GL_VERTEX_SHADER ? "VS" : "FS");
               GLuint s = glCreateShader(type);
               const char *one[1] = { src };
               glShaderSource(s, 1, one, NULL);
@@ -1743,7 +1744,8 @@ jobs:
               # gl_init: drop the dither texture, build the shaders from the assembled strings
               a = s.index("    /* 4x4 ordered-dither table (+4 bias so it fits in unsigned bytes) */")
               b = s.index("    gl_invalidate();\n\n    glClearColor(0, 0, 0, 0);")
-              new_init = r'''    build_fs_sources();
+              new_init = r'''    plat_log("[GPU] init: building shaders");
+              build_fs_sources();
               build_prog(&pf, VS_MAIN, FS_FLAT_SRC, "flat");
               build_prog(&pt, VS_MAIN, FS_TEX_SRC, "textured");
               build_prog(&pd, VS_DISP, FS_DISP, "display");
@@ -1765,7 +1767,7 @@ jobs:
                   "static void gl_invalidate(void);     /* defined with the GL state shadow, below */\n"
                   "static void gl_selftest(void);       /* GLES2-COMPAT: defined after the primitive code */", "fwd decl")
               rep("    plat_gl_make_current();          /* creates the EAGL context on the emulation thread */\n    gl_init();\n}",
-                  "    plat_gl_make_current();          /* creates the EAGL context on the emulation thread */\n    gl_init();\n    gl_selftest();\n}",
+                  "    plat_gl_make_current();          /* creates the EAGL context on the emulation thread */\n    gl_init();\n    if (dg_flag()) gl_selftest();\n}",
                   "gpu_init")
 
               selftest = r'''
@@ -1775,6 +1777,7 @@ jobs:
           /* ------------------------------------------------------------------ */
           static int st_check(const char *name, const uint16_t *want, int w, int h)
           {
+              plat_log("[GPU] selftest %s: flushing + glReadPixels ...", name);
               read_rect_rgba(0, 0, w, h, scr_b);
               int bad = 0, fx = -1, fy = -1; unsigned fg = 0, fw = 0;
               for (int y = 0; y < h; y++)
@@ -1817,9 +1820,11 @@ jobs:
               bind_vram_target();
               glScissor(0, 0, VRAM_W, VRAM_H);
               glClearColor(0, 0, 0, 0);
+              plat_log("[GPU] selftest: glClear ...");
               glClear(GL_COLOR_BUFFER_BIT);
               gl_invalidate();
               (void)glGetError();
+              plat_log("[GPU] selftest: VRAM cleared, drawing flat quad ...");
 
               /* flat */
               tp_x = tp_y = tp_depth = blend_mode = 0; dither_on = false; draw_left = draw_top = 0; draw_right = VRAM_W - 1; draw_bottom = VRAM_H - 1;
@@ -1928,11 +1933,24 @@ jobs:
           static unsigned dg_err, dg_td_logged, dg_up_logged;
           static float dg_last_tpw = -1.0f, dg_last_clw;
           static uint8_t *dg_buf;
+          /* heavy diagnostics (selftest, GL queries, VRAM probes) only when a file gpudiag.txt exists next to the .cue */
+          static int dg_flag(void)
+          {
+              static int v = -1;
+              if (v < 0) {
+                  static const char *const paths[] = { "E:/crashbandicoot/gpudiag.txt", "E:/CrashBandicoot/gpudiag.txt", "C:/crashbandicoot/gpudiag.txt", "gpudiag.txt" };
+                  v = 0;
+                  for (unsigned i = 0; i < sizeof paths / sizeof *paths && !v; i++) { FILE *f = fopen(paths[i], "rb"); if (f) { fclose(f); v = 1; } }
+                  plat_log("[GPU] heavy diagnostics %s (create gpudiag.txt next to the .cue file to enable selftest / texprobe / GL queries)", v ? "ENABLED" : "off");
+              }
+              return v;
+          }
           ''', "dg statics")
 
               rep("    plat_log(\"[GPU] GL_VERSION=%s\", (const char *)glGetString(GL_VERSION));\n}",
                   r'''    plat_log("[GPU] GL_VERSION=%s", (const char *)glGetString(GL_VERSION));
-              {
+              if (dg_flag()) {
+                  plat_log("[GPU] querying GL limits ...");
                   const char *sl = (const char *)glGetString(0x8B8C);            /* GL_SHADING_LANGUAGE_VERSION */
                   GLint mt = 0, mva = 0, mvv = 0, mtu = 0, pr[2] = { 0, 0 }, pp = 0;
                   glGetIntegerv(0x0D33, &mt);                                    /* GL_MAX_TEXTURE_SIZE */
@@ -2039,7 +2057,7 @@ jobs:
                            (dg_tt[0] - dg_tt_last[0]) * per, (dg_tt[1] - dg_tt_last[1]) * per, (dg_tt[2] - dg_tt_last[2]) * per, dg_err);
                   dg_fd_last = dg_fd; dg_ft_last = dg_ft;
                   memcpy(dg_td_last, dg_td, sizeof dg_td); memcpy(dg_tt_last, dg_tt, sizeof dg_tt);
-                  dg_texprobe();
+                  if (dg_flag()) dg_texprobe();
                   memcpy(st_fr_last, st_fr, sizeof st_fr);
           ''', "frame log extras")
 
