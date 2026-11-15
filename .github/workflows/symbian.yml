@@ -1535,6 +1535,523 @@ jobs:
           def rd(p): return open(p, newline="").read()
           def wr(p, s): open(p, "w", newline="").write(s)
 
+          # ---------------------------------------------------------------- GLES2 compat + diagnostics (EKA2L1 / Symbian)
+          def apply_gles2_compat(s):
+              if "GLES2-COMPAT" in s:
+                  return s
+
+              def rep(old, new, what):
+                  nonlocal s
+                  assert s.count(old) == 1, "gles2 compat anchor (%s): count=%d" % (what, s.count(old))
+                  s = s.replace(old, new, 1)
+
+              # ---- 1. vertex layout: float attributes only (no GL_SHORT). Texpage / CLUT / dither state is packed into two
+              #         floats (a_pk) instead of two int16 vec4 -> 28 bytes per vertex ----------------------------------------
+              rep("typedef struct { float x, y; uint8_t r, g, b, a; float u, v; int16_t tp[4]; int16_t cl[4]; } GVert;   /* 36 bytes */",
+                  "typedef struct { float x, y; uint8_t r, g, b, a; float u, v; float tpw, clw; } GVert;   /* 28 bytes, GLES2-COMPAT: float attribs only */",
+                  "GVert")
+              rep("    glVertexAttribPointer(3, 4, GL_SHORT, GL_FALSE, sizeof(GVert), p->tp);\n"
+                  "    glVertexAttribPointer(4, 4, GL_SHORT, GL_FALSE, sizeof(GVert), p->cl);\n",
+                  "    glVertexAttribPointer(3, 2, GL_FLOAT, GL_FALSE, sizeof(GVert), &p->tpw);\n",
+                  "attrib ptrs")
+              rep("    glEnableVertexAttribArray(3); glEnableVertexAttribArray(4);\n}",
+                  "    glEnableVertexAttribArray(3);\n}", "enable attribs")
+              rep("        glDisableVertexAttribArray(3); glDisableVertexAttribArray(4);\n",
+                  "        glDisableVertexAttribArray(3);\n", "present attribs")
+              rep("    for (int i = 0; i < n; i++) {\n"
+                  "        tv[i].tp[0] = (int16_t)(tex ? tp_x : 0); tv[i].tp[1] = (int16_t)(tex ? tp_y : 0);\n"
+                  "        tv[i].tp[2] = (int16_t)depth;            tv[i].tp[3] = (int16_t)(raw ? 1 : 0);\n"
+                  "        tv[i].cl[0] = (int16_t)clutx;            tv[i].cl[1] = (int16_t)cluty;\n"
+                  "        tv[i].cl[2] = (int16_t)(dither ? 1 : 0); tv[i].cl[3] = 0;\n"
+                  "    }\n",
+                  "    /* texpage word: x/64 | y/256<<4 | depth<<5 | raw<<7 ; CLUT word: x/16 | y<<6 | dither<<15 (exact in a float) */\n"
+                  "    const float tpw = (float)((tex ? ((tp_x >> 6) | ((tp_y >> 8) << 4)) : 0) | (depth << 5) | ((raw ? 1 : 0) << 7));\n"
+                  "    const float clw = (float)(((clutx >> 4) & 63) | (cluty << 6) | ((dither ? 1 : 0) << 15));\n"
+                  "    for (int i = 0; i < n; i++) { tv[i].tpw = tpw; tv[i].clw = clw; }\n",
+                  "submit tp/cl")
+              rep('static const char VS_MAIN[] =\n'
+                  '    "attribute vec2 a_pos; attribute vec4 a_col; attribute vec2 a_uv;\\n"\n'
+                  '    "attribute vec4 a_tp; attribute vec4 a_cl;\\n"\n'
+                  '    "varying vec4 v_col; varying vec2 v_uv; varying vec4 v_tp; varying vec4 v_cl;\\n"\n'
+                  '    "void main(){ v_col = a_col; v_uv = a_uv; v_tp = a_tp; v_cl = a_cl;\\n"',
+                  'static const char VS_MAIN[] =\n'
+                  '    "attribute vec2 a_pos; attribute vec4 a_col; attribute vec2 a_uv; attribute vec2 a_pk;\\n"\n'
+                  '    "varying vec4 v_col; varying vec2 v_uv; varying vec2 v_pk;\\n"\n'
+                  '    "void main(){ v_col = a_col; v_uv = a_uv; v_pk = a_pk;\\n"',
+                  "VS_MAIN")
+
+              # ---- 2. shaders: no #define/#ifdef, no multi-string glShaderSource, no loops, no dither texture -----------
+              a = s.index("/* Main fragment shader. With TEXTURED defined")
+              b = s.index("static const char FS_DISP[] =")
+              new_fs = r'''/* Main fragment shader, assembled at start-up as ONE plain string per program (flat / textured): no
+           * #define/#ifdef and no multi-string glShaderSource (emulated GLES2 layers can mangle both), no loops,
+           * no dither texture (the 4x4 ordered-dither table is computed in the shader). GLES2-COMPAT.
+           * Bit-exact tricks: every division is a multiplication by a power of two. */
+          static const char FS_HEAD[] =
+              "precision highp float;\n"
+              "varying vec4 v_col; varying vec2 v_uv; varying vec2 v_pk;\n"
+              "uniform sampler2D u_vram;\n"
+              "uniform float u_setmask; uniform float u_chk;\n";
+
+          static const char FS_TEX_DECL[] =
+              "uniform float u_pass;\n"
+              "uniform float u_twin; uniform vec2 u_twand; uniform vec2 u_twor;\n"
+              "vec4 fetch(vec2 p){ p = mod(p, vec2(1024.0, 512.0));\n"
+              "  return texture2D(u_vram, (p + 0.5) * vec2(0.0009765625, 0.001953125)); }\n"
+              "vec4 bits(vec4 t){ return vec4(floor((t.rgb * 255.0 + 0.5) * 0.125), step(0.5, t.a)); }\n"
+              "float word(vec4 b){ return b.r + b.g * 32.0 + b.b * 1024.0 + b.a * 32768.0; }\n"
+              "float bit1(float a, float b, float p){ return mod(floor(a / p), 2.0) * mod(floor(b / p), 2.0) * p; }\n"
+              "float band(float a, float b){\n"
+              "  return bit1(a, b, 1.0) + bit1(a, b, 2.0) + bit1(a, b, 4.0) + bit1(a, b, 8.0)\n"
+              "       + bit1(a, b, 16.0) + bit1(a, b, 32.0) + bit1(a, b, 64.0) + bit1(a, b, 128.0); }\n"
+              "float twin(float x, float a, float o){ float t = band(x, a); return t + o - band(t, o); }\n";
+
+          static const char FS_MAIN_A[] =
+              "void main(){\n"
+              "  float clw = floor(v_pk.y + 0.5);\n"
+              "  float c1 = floor(clw * 0.015625);\n"
+              "  float u_dither = mod(floor(c1 * 0.001953125), 2.0);\n";
+
+          static const char FS_TEX_VARS[] =
+              "  float tpw = floor(v_pk.x + 0.5);\n"
+              "  float t1 = floor(tpw * 0.0625); float t2 = floor(t1 * 0.5);\n"
+              "  vec2 u_tp = vec2(mod(tpw, 16.0) * 64.0, mod(t1, 2.0) * 256.0);\n"
+              "  float u_depth = mod(t2, 4.0); float u_raw = floor(t2 * 0.25);\n"
+              "  vec2 u_clut = vec2(mod(clw, 64.0) * 16.0, mod(c1, 512.0));\n";
+
+          static const char FS_MAIN_B[] =
+              "  float d = 0.0;\n"
+              "  if (u_dither > 0.5) {\n"
+              "    vec2 q = mod(floor(gl_FragCoord.xy), 4.0);\n"
+              "    vec4 row = q.y < 0.5 ? vec4(0.0, 4.0, 1.0, 5.0) : (q.y < 1.5 ? vec4(6.0, 2.0, 7.0, 3.0)\n"
+              "             : (q.y < 2.5 ? vec4(1.0, 5.0, 0.0, 4.0) : vec4(7.0, 3.0, 6.0, 2.0)));\n"
+              "    d = (q.x < 0.5 ? row.x : (q.x < 1.5 ? row.y : (q.x < 2.5 ? row.z : row.w))) - 4.0;\n"
+              "  }\n"
+              "  if (u_chk > 0.5) {\n"
+              "    if (texture2D(u_vram, gl_FragCoord.xy * vec2(0.0009765625, 0.001953125)).a > 0.5) discard;\n"
+              "  }\n"
+              "  vec3 c8 = floor(v_col.rgb * 255.0 + 0.5);\n"
+              "  float alpha = u_setmask;\n"
+              "  vec3 o;\n";
+
+          static const char FS_TEX_BODY[] =
+              "  vec2 uv = floor(v_uv + 0.004);\n"
+              "  float u = mod(uv.x, 256.0); float v = mod(uv.y, 256.0);\n"
+              "  if (u_twin > 0.5) { u = twin(u, u_twand.x, u_twor.x); v = twin(v, u_twand.y, u_twor.y); }\n"
+              "  vec4 tk;\n"
+              "  if (u_depth < 0.5) {\n"
+              "    float wd = word(bits(fetch(vec2(u_tp.x + floor(u * 0.25), u_tp.y + v))));\n"
+              "    float s = mod(u, 4.0);\n"
+              "    float inv = s < 0.5 ? 1.0 : (s < 1.5 ? 0.0625 : (s < 2.5 ? 0.00390625 : 0.000244140625));\n"
+              "    float idx = mod(floor(wd * inv), 16.0);\n"
+              "    tk = bits(fetch(vec2(u_clut.x + idx, u_clut.y)));\n"
+              "  } else if (u_depth < 1.5) {\n"
+              "    float wd = word(bits(fetch(vec2(u_tp.x + floor(u * 0.5), u_tp.y + v))));\n"
+              "    float inv = mod(u, 2.0) < 0.5 ? 1.0 : 0.00390625;\n"
+              "    float idx = mod(floor(wd * inv), 256.0);\n"
+              "    tk = bits(fetch(vec2(u_clut.x + idx, u_clut.y)));\n"
+              "  } else {\n"
+              "    tk = bits(fetch(vec2(u_tp.x + u, u_tp.y + v)));\n"
+              "  }\n"
+              "  if (tk.r + tk.g + tk.b + tk.a < 0.5) discard;\n"
+              "  if (u_pass > 0.5 && u_pass < 1.5 && tk.a > 0.5) discard;\n"
+              "  if (u_pass > 1.5 && tk.a < 0.5) discard;\n"
+              "  alpha = max(alpha, tk.a);\n"
+              "  vec3 m = tk.rgb * 8.0;\n"
+              "  if (u_raw < 0.5) m = floor(m * c8 * 0.0078125);\n"
+              "  o = min(floor(clamp(m + d, 0.0, 255.0) * 0.125), 31.0);\n";
+
+          static const char FS_FLAT_BODY[] =
+              "  o = min(floor(clamp(c8 + d, 0.0, 255.0) * 0.125), 31.0);\n";
+
+          static const char FS_MAIN_END[] =
+              "  gl_FragColor = vec4(o * (8.0 / 255.0), alpha);\n"
+              "}\n";
+
+          static char FS_FLAT_SRC[3072], FS_TEX_SRC[6144];
+
+          static void build_fs_sources(void)
+          {
+              int a = snprintf(FS_FLAT_SRC, sizeof FS_FLAT_SRC, "%s%s%s%s%s",
+                               FS_HEAD, FS_MAIN_A, FS_MAIN_B, FS_FLAT_BODY, FS_MAIN_END);
+              int b = snprintf(FS_TEX_SRC, sizeof FS_TEX_SRC, "%s%s%s%s%s%s%s",
+                               FS_HEAD, FS_TEX_DECL, FS_MAIN_A, FS_TEX_VARS, FS_MAIN_B, FS_TEX_BODY, FS_MAIN_END);
+              if (a < 0 || a >= (int)sizeof FS_FLAT_SRC || b < 0 || b >= (int)sizeof FS_TEX_SRC)
+                  plat_fatal("GLES2: fragment shader source buffer too small");
+              plat_log("[GPU] fragment shader sources: flat %d bytes, textured %d bytes", a, b);
+          }
+
+          '''
+              s = s[:a] + new_fs + s[b:]
+
+              # compile_shader: single string, always log the info log (warnings included)
+              a = s.index("static GLuint compile_shader(")
+              b = s.index("static void make_tex(")
+              new_cs = r'''static GLuint compile_shader(GLenum type, const char *src, const char *name)
+          {
+              GLuint s = glCreateShader(type);
+              const char *one[1] = { src };
+              glShaderSource(s, 1, one, NULL);
+              glCompileShader(s);
+              GLint ok = 0; glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+              char log[1024]; log[0] = 0;
+              glGetShaderInfoLog(s, sizeof log, NULL, log);
+              if (!ok) {
+                  plat_log("[GPU] shader error: %s %s: %s", name, type == GL_VERTEX_SHADER ? "VS" : "FS", log);
+                  plat_fatal("GLES2 shader compile failed (see crash.log, line \"[GPU] shader error\")");
+              }
+              if (log[0]) plat_log("[GPU] shader note: %s %s: %s", name, type == GL_VERTEX_SHADER ? "VS" : "FS", log);
+              return s;
+          }
+
+          static void build_prog(Prog *P, const char *vs, const char *fs, const char *name)
+          {
+              GLuint v = compile_shader(GL_VERTEX_SHADER, vs, name);
+              GLuint f = compile_shader(GL_FRAGMENT_SHADER, fs, name);
+              P->id = glCreateProgram();
+              glAttachShader(P->id, v); glAttachShader(P->id, f);
+              glBindAttribLocation(P->id, 0, "a_pos");
+              glBindAttribLocation(P->id, 1, "a_col");
+              glBindAttribLocation(P->id, 2, "a_uv");
+              glBindAttribLocation(P->id, 3, "a_pk");
+              glLinkProgram(P->id);
+              GLint ok = 0; glGetProgramiv(P->id, GL_LINK_STATUS, &ok);
+              if (!ok) {
+                  char log[1024]; log[0] = 0;
+                  glGetProgramInfoLog(P->id, sizeof log, NULL, log);
+                  plat_log("[GPU] shader error: link %s: %s", name, log);
+                  plat_fatal("GLES2 shader link failed (see crash.log, line \"[GPU] shader error\")");
+              }
+          #define U(n, s) P->n = glGetUniformLocation(P->id, s)
+              U(vram, "u_vram"); U(setmask, "u_setmask"); U(chk, "u_chk"); U(pass, "u_pass");
+              U(twin, "u_twin"); U(twand, "u_twand"); U(twor, "u_twor");
+              U(rect, "u_rect"); U(rgb24, "u_rgb24"); U(off, "u_off");
+          #undef U
+              plat_log("[GPU] program %s: vram=%d setmask=%d chk=%d pass=%d twin=%d twand=%d twor=%d rect=%d rgb24=%d off=%d",
+                       name, (int)P->vram, (int)P->setmask, (int)P->chk, (int)P->pass, (int)P->twin, (int)P->twand, (int)P->twor,
+                       (int)P->rect, (int)P->rgb24, (int)P->off);
+          }
+
+          '''
+              s = s[:a] + new_cs + s[b:]
+
+              # Prog: the dither sampler is gone
+              rep("    GLint vram, dith, setmask, chk, pass, twin, twand, twor, rect, rgb24, off;",
+                  "    GLint vram, setmask, chk, pass, twin, twand, twor, rect, rgb24, off;", "Prog fields")
+              rep("static GLuint tex_a, tex_b, tex_dith, fbo_a", "static GLuint tex_a, tex_b, fbo_a", "tex decl")
+
+              # gl_init: drop the dither texture, build the shaders from the assembled strings
+              a = s.index("    /* 4x4 ordered-dither table (+4 bias so it fits in unsigned bytes) */")
+              b = s.index("    gl_invalidate();\n\n    glClearColor(0, 0, 0, 0);")
+              new_init = r'''    build_fs_sources();
+              build_prog(&pf, VS_MAIN, FS_FLAT_SRC, "flat");
+              build_prog(&pt, VS_MAIN, FS_TEX_SRC, "textured");
+              build_prog(&pd, VS_DISP, FS_DISP, "display");
+              build_prog(&pc, VS_MAIN, FS_COPY, "copy");
+              glUseProgram(pf.id); glUniform1i(pf.vram, 0);      /* never change */
+              glUseProgram(pt.id); glUniform1i(pt.vram, 0);
+          '''
+              s = s[:a] + new_init + s[b:]
+
+              # draw_buf: only texture unit 0 is used now
+              rep("        glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, tex_dith);\n"
+                  "        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex_b);\n",
+                  "        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex_b);\n", "draw_buf units")
+
+              assert "tex_dith" not in s and 'sampler2D u_dith' not in s and '"#ifdef' not in s and '"#define' not in s
+
+              # ---- 3. start-up self test: logs what the GL layer really does (crash.log) --------------------------------
+              rep("static void gl_invalidate(void);     /* defined with the GL state shadow, below */",
+                  "static void gl_invalidate(void);     /* defined with the GL state shadow, below */\n"
+                  "static void gl_selftest(void);       /* GLES2-COMPAT: defined after the primitive code */", "fwd decl")
+              rep("    plat_gl_make_current();          /* creates the EAGL context on the emulation thread */\n    gl_init();\n}",
+                  "    plat_gl_make_current();          /* creates the EAGL context on the emulation thread */\n    gl_init();\n    gl_selftest();\n}",
+                  "gpu_init")
+
+              selftest = r'''
+          /* ------------------------------------------------------------------ */
+          /* Start-up self test (GLES2-COMPAT). Renders known data through the real draw path and compares the read-back  */
+          /* with a CPU model. Results go to crash.log ("[GPU] selftest ..."); VRAM is cleared afterwards.                  */
+          /* ------------------------------------------------------------------ */
+          static int st_check(const char *name, const uint16_t *want, int w, int h)
+          {
+              read_rect_rgba(0, 0, w, h, scr_b);
+              int bad = 0, fx = -1, fy = -1; unsigned fg = 0, fw = 0;
+              for (int y = 0; y < h; y++)
+                  for (int x = 0; x < w; x++) {
+                      const uint8_t *q = scr_b + ((size_t)y * w + x) * 4;
+                      unsigned got = (unsigned)((q[0] >> 3) | ((q[1] >> 3) << 5) | ((q[2] >> 3) << 10));
+                      unsigned exp = want[y * w + x] & 0x7FFF;
+                      if (got != exp) { if (!bad) { fx = x; fy = y; fg = got; fw = exp; } bad++; }
+                  }
+              GLenum e = glGetError();
+              if (bad) plat_log("[GPU] selftest %-8s FAIL: %d of %d texels wrong, first (%d,%d) got=%04x want=%04x glError=0x%x", name, bad, w * h, fx, fy, fg, fw, (unsigned)e);
+              else plat_log("[GPU] selftest %-8s ok (glError=0x%x)", name, (unsigned)e);
+              return bad;
+          }
+
+          static void st_quad(int x, int y, int w, int h, int cr, int cg, int cb, bool tex, bool raw, int clut)
+          {
+              Vert a = { x,     y,     cr, cg, cb, 0,     0 };
+              Vert b = { x + w, y,     cr, cg, cb, w,     0 };
+              Vert c = { x,     y + h, cr, cg, cb, 0,     h };
+              Vert d = { x + w, y + h, cr, cg, cb, w,     h };
+              poly_tri(&a, &b, &c, tex, false, false, raw, clut);
+              poly_tri(&b, &c, &d, tex, false, false, raw, clut);
+          }
+
+          static void st_clear(void)
+          {
+              bool d = dither_on; dither_on = false;
+              st_quad(0, 0, 8, 8, 0, 0, 0, false, false, 0);
+              dither_on = d;
+          }
+
+          static void gl_selftest(void)
+          {
+              uint16_t exp[16 * 16], t16[8 * 8], t4[2 * 8], t8[4 * 8], clut16[16], clut256[256];
+              int fails = 0;
+              plat_log("[GPU] vertex = %d bytes, attributes: a_pos f2, a_col ubyte4n, a_uv f2, a_pk f2", (int)sizeof(GVert));
+
+              glDisable(GL_SCISSOR_TEST);
+              bind_vram_target();
+              glScissor(0, 0, VRAM_W, VRAM_H);
+              glClearColor(0, 0, 0, 0);
+              glClear(GL_COLOR_BUFFER_BIT);
+              gl_invalidate();
+              (void)glGetError();
+
+              /* flat */
+              tp_x = tp_y = tp_depth = blend_mode = 0; dither_on = false; draw_left = draw_top = 0; draw_right = VRAM_W - 1; draw_bottom = VRAM_H - 1;
+              draw_ofs_x = draw_ofs_y = 0; set_mask = check_mask = false; tw_mask_x = tw_mask_y = tw_off_x = tw_off_y = 0;
+              st_quad(0, 0, 8, 8, 248, 0, 0, false, false, 0);
+              for (int i = 0; i < 64; i++) exp[i] = 31;
+              flush_batch();
+              fails += st_check("flat", exp, 8, 8);
+
+              /* 16bpp raw texture at (576,256) = texpage 9, y 256 */
+              for (int i = 0; i < 64; i++) t16[i] = (uint16_t)(0x0421u * (unsigned)((i % 31) + 1) | 0x8000u);
+              upload_words(576, 256, 8, 8, t16);
+              tp_x = tp_y = tp_depth = 0; st_clear();
+              tp_x = 576; tp_y = 256; tp_depth = 2;
+              st_quad(0, 0, 8, 8, 128, 128, 128, true, true, 0);
+              flush_batch();
+              for (int i = 0; i < 64; i++) exp[i] = t16[i];
+              fails += st_check("tex16", exp, 8, 8);
+
+              /* 4bpp CLUT texture: texels 0..15 repeating, CLUT at (0,480) */
+              for (int i = 0; i < 16; i++) clut16[i] = (uint16_t)(i == 0 ? 0x0000 : (0x0842u * (unsigned)i) | 0x8000u);
+              upload_words(0, 480, 16, 1, clut16);
+              for (int y = 0; y < 8; y++) { t4[y * 2] = (uint16_t)(0x3210 + y * 0x1111 * 0); t4[y * 2 + 1] = (uint16_t)0x7654; }
+              upload_words(640, 256, 2, 8, t4);
+              tp_x = tp_y = tp_depth = 0; st_clear();
+              tp_x = 640; tp_y = 256; tp_depth = 0;
+              st_quad(0, 0, 8, 8, 128, 128, 128, true, true, (0 >> 4) | (480 << 6));
+              flush_batch();
+              for (int y = 0; y < 8; y++) for (int x = 0; x < 8; x++) {
+                  unsigned wd = t4[y * 2 + (x >> 2)], idx = (wd >> ((x & 3) * 4)) & 15;
+                  exp[y * 8 + x] = clut16[idx];
+              }
+              fails += st_check("tex4", exp, 8, 8);
+
+              /* 8bpp CLUT texture, CLUT at (0,481) */
+              for (int i = 0; i < 256; i++) clut256[i] = (uint16_t)(i == 0 ? 0 : (((unsigned)i * 0x0101u) & 0x7FFF) | 0x8000u);
+              upload_words(0, 481, 256, 1, clut256);
+              for (int y = 0; y < 8; y++) for (int i = 0; i < 4; i++) t8[y * 4 + i] = (uint16_t)(((y * 8 + i * 2 + 1) & 0xFF) | (((y * 8 + i * 2 + 2) & 0xFF) << 8));
+              upload_words(704, 256, 4, 8, t8);
+              tp_x = tp_y = tp_depth = 0; st_clear();
+              tp_x = 704; tp_y = 256; tp_depth = 1;
+              st_quad(0, 0, 8, 8, 128, 128, 128, true, true, (0 >> 4) | (481 << 6));
+              flush_batch();
+              for (int y = 0; y < 8; y++) for (int x = 0; x < 8; x++) {
+                  unsigned wd = t8[y * 4 + (x >> 1)], idx = (wd >> ((x & 1) * 8)) & 255;
+                  exp[y * 8 + x] = clut256[idx];
+              }
+              fails += st_check("tex8", exp, 8, 8);
+
+              /* snapshot sync: draw a flat quad INTO the texture page, then sample it (dirty rect -> tex_b copy) */
+              tp_x = tp_y = tp_depth = 0;
+              {
+                  int sx = 576, sy = 256;
+                  Vert a = { sx, sy, 0, 248, 0, 0, 0 }, b = { sx + 8, sy, 0, 248, 0, 0, 0 }, c = { sx, sy + 8, 0, 248, 0, 0, 0 }, d = { sx + 8, sy + 8, 0, 248, 0, 0, 0 };
+                  poly_tri(&a, &b, &c, false, false, false, false, 0);
+                  poly_tri(&b, &c, &d, false, false, false, false, 0);
+              }
+              tp_x = tp_y = tp_depth = 0; st_clear();
+              tp_x = 576; tp_y = 256; tp_depth = 2;
+              st_quad(0, 0, 8, 8, 128, 128, 128, true, true, 0);
+              flush_batch();
+              for (int i = 0; i < 64; i++) exp[i] = 31 << 5;
+              fails += st_check("sync", exp, 8, 8);
+
+              /* modulated + gouraud-free colour: tex16 texel 0x7FFF * (128/128) must stay 0x7FFF */
+              for (int i = 0; i < 64; i++) t16[i] = 0xFFFF;
+              upload_words(576, 264, 8, 8, t16);
+              tp_x = tp_y = tp_depth = 0; st_clear();
+              tp_x = 576; tp_y = 256; tp_depth = 2;
+              {
+                  Vert a = { 0, 0, 128, 128, 128, 0, 8 }, b = { 8, 0, 128, 128, 128, 8, 8 }, c = { 0, 8, 128, 128, 128, 0, 16 }, d = { 8, 8, 128, 128, 128, 8, 16 };
+                  poly_tri(&a, &b, &c, true, false, false, false, 0);
+                  poly_tri(&b, &c, &d, true, false, false, false, 0);
+              }
+              flush_batch();
+              for (int i = 0; i < 64; i++) exp[i] = 0x7FFF;
+              fails += st_check("modulate", exp, 8, 8);
+
+              plat_log("[GPU] selftest %s (%d failing checks)", fails ? "FAILED" : "PASSED", fails);
+
+              /* wipe VRAM (both textures) and the statistics so the game starts from a clean slate */
+              memset(scr_a, 0, (size_t)VRAM_W * VRAM_H * 4);
+              glActiveTexture(GL_TEXTURE0);
+              glBindTexture(GL_TEXTURE_2D, tex_a);
+              glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, VRAM_W, VRAM_H, GL_RGBA, GL_UNSIGNED_BYTE, scr_a);
+              glBindTexture(GL_TEXTURE_2D, tex_b);
+              glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, VRAM_W, VRAM_H, GL_RGBA, GL_UNSIGNED_BYTE, scr_a);
+              gl_invalidate();
+              dirty.valid = false; nbk = 0;
+              tp_x = tp_y = tp_depth = blend_mode = 0;
+              st_draws = st_tris = st_syncs = st_uploads = st_reads = st_fills = st_copies = 0;
+              st_last_draws = st_last_tris = 0;
+              memset(st_fr, 0, sizeof st_fr); memset(st_fr_last, 0, sizeof st_fr_last);
+              first_draw_logged = false;
+          }
+
+          '''
+              rep("/* ------------------------------------------------------------------ */\n/* GP0 / GP1                                                            */",
+                  selftest + "/* ------------------------------------------------------------------ */\n/* GP0 / GP1                                                            */", "selftest insert")
+              # ---- 4. graphics diagnostics -> crash.log -----------------------------------------------------------------
+              rep("static bool first_draw_logged;\n",
+                  "static bool first_draw_logged;\n"
+                  r'''/* diagnostics (GLES2-COMPAT) */
+          static unsigned dg_td[4], dg_tt[4], dg_td_last[4], dg_tt_last[4];     /* textured draws / tris per depth (0=4bpp 1=8bpp 2=16bpp) */
+          static unsigned dg_fd, dg_ft, dg_fd_last, dg_ft_last;                  /* flat draws / tris */
+          static unsigned dg_err, dg_td_logged, dg_up_logged;
+          static float dg_last_tpw = -1.0f, dg_last_clw;
+          static uint8_t *dg_buf;
+          ''', "dg statics")
+
+              rep("    plat_log(\"[GPU] GL_VERSION=%s\", (const char *)glGetString(GL_VERSION));\n}",
+                  r'''    plat_log("[GPU] GL_VERSION=%s", (const char *)glGetString(GL_VERSION));
+              {
+                  const char *sl = (const char *)glGetString(0x8B8C);            /* GL_SHADING_LANGUAGE_VERSION */
+                  GLint mt = 0, mva = 0, mvv = 0, mtu = 0, pr[2] = { 0, 0 }, pp = 0;
+                  glGetIntegerv(0x0D33, &mt);                                    /* GL_MAX_TEXTURE_SIZE */
+                  glGetIntegerv(0x8869, &mva);                                   /* GL_MAX_VERTEX_ATTRIBS */
+                  glGetIntegerv(0x8DFC, &mvv);                                   /* GL_MAX_VARYING_VECTORS */
+                  glGetIntegerv(0x8872, &mtu);                                   /* GL_MAX_TEXTURE_IMAGE_UNITS */
+                  glGetShaderPrecisionFormat(GL_FRAGMENT_SHADER, 0x8DF2, pr, &pp); /* GL_HIGH_FLOAT: range[2], precision */
+                  plat_log("[GPU] GLSL=%s maxTex=%d maxVertexAttribs=%d maxVaryingVecs=%d maxTexUnits=%d fragment highp: range=2^%d..2^%d precision=%d bits%s",
+                           sl ? sl : "?", (int)mt, (int)mva, (int)mvv, (int)mtu, (int)pr[0], (int)pr[1], (int)pp,
+                           pp == 0 ? "  <-- NO highp in fragment shaders (texture decode will be wrong!)" : "");
+                  const char *ex = (const char *)glGetString(0x1F03);            /* GL_EXTENSIONS */
+                  if (ex) {
+                      size_t n = strlen(ex);
+                      for (size_t o = 0; o < n; o += 180) plat_log("[GPU] extensions[%u]: %.180s", (unsigned)(o / 180), ex + o);
+                  }
+                  (void)glGetError();
+              }
+          }''', "gl_init info")
+
+              rep("    if (timed) st_flush_ns += (plat_time_ns() - t0) * 16u;\n}",
+                  r'''    {
+                  const unsigned tris = (unsigned)(cnt / 3);
+                  if (k->tex) {
+                      const int tw = (int)buf[0].tpw, cw = (int)buf[0].clw;
+                      const unsigned dp = (unsigned)(tw >> 5) & 3u;
+                      dg_td[dp]++; dg_tt[dp] += tris;
+                      dg_last_tpw = buf[0].tpw; dg_last_clw = buf[0].clw;
+                      if (dg_td_logged < 24) {
+                          dg_td_logged++;
+                          plat_log("[GPU] textured draw #%u: verts=%d page=(%d,%d) depth=%u raw=%d clut=(%d,%d) pass=%d texwin=%d blend=%d uv0=(%.1f,%.1f) uv1=(%.1f,%.1f)",
+                                   dg_td_logged, cnt, (tw & 15) * 64, ((tw >> 4) & 1) * 256, dp, (tw >> 7) & 1,
+                                   (cw & 63) * 16, (cw >> 6) & 511, (int)k->pass, (int)k->twin, k->blend_on ? (int)(k->blend & 3) : -1,
+                                   (double)buf[0].u, (double)buf[0].v, (double)buf[1].u, (double)buf[1].v);
+                      }
+                  } else { dg_fd++; dg_ft += tris; }
+                  if (st_draws <= 200 || (st_draws & 1023u) == 0) {
+                      GLenum e = glGetError();
+                      if (e != 0 && dg_err++ < 40) plat_log("[GPU] glGetError=0x%x after draw #%u (tex=%d cnt=%d)", (unsigned)e, st_draws, k->tex ? 1 : 0, cnt);
+                  }
+              }
+              if (timed) st_flush_ns += (plat_time_ns() - t0) * 16u;
+          }''', "draw_buf diag")
+
+              rep("static void read_rect_rgba(int x, int y, int w, int h, uint8_t *out)\n{",
+                  r'''/* Compare the texture page / CLUT of the last textured draw in the render target (tex_a) and the sampled snapshot
+           * (tex_b). All-zero tex_b = textures never arrived (everything textured is discarded); a != b = stale snapshot. */
+          static void dg_texprobe(void)
+          {
+              if (dg_last_tpw < 0.0f) { plat_log("[GPU] texprobe: no textured draw yet"); return; }
+              const int tw = (int)dg_last_tpw, cw = (int)dg_last_clw;
+              const int px = (tw & 15) * 64, py = ((tw >> 4) & 1) * 256, dp = (tw >> 5) & 3;
+              const int cx = (cw & 63) * 16, cy = (cw >> 6) & 511;
+              int w = dp == 0 ? 64 : (dp == 1 ? 128 : 256);
+              if (px + w > VRAM_W) w = VRAM_W - px;
+              int cn = dp == 0 ? 16 : 256;
+              if (cx + cn > VRAM_W) cn = VRAM_W - cx;
+              const int h = 256;
+              if (!dg_buf) dg_buf = (uint8_t *)malloc(2 * 256 * 256 * 4 + 2 * 256 * 4);
+              if (!dg_buf) return;
+              uint8_t *pg[2] = { dg_buf, dg_buf + 256 * 256 * 4 };
+              uint8_t *cl[2] = { dg_buf + 2 * 256 * 256 * 4, dg_buf + 2 * 256 * 256 * 4 + 256 * 4 };
+              const GLuint fb[2] = { fbo_a, fbo_b };
+              unsigned pnz[2] = { 0, 0 }, cnz[2] = { 0, 0 }, pdiff = 0, cdiff = 0;
+              flush_batch();
+              glPixelStorei(GL_PACK_ALIGNMENT, 4);
+              for (int t = 0; t < 2; t++) {
+                  glBindFramebuffer(GL_FRAMEBUFFER, fb[t]);
+                  glReadPixels(px, py, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pg[t]);
+                  glReadPixels(cx, cy, cn, 1, GL_RGBA, GL_UNSIGNED_BYTE, cl[t]);
+                  for (int i = 0; i < w * h; i++) if (pg[t][i * 4] | pg[t][i * 4 + 1] | pg[t][i * 4 + 2] | pg[t][i * 4 + 3]) pnz[t]++;
+                  for (int i = 0; i < cn; i++) if (cl[t][i * 4] | cl[t][i * 4 + 1] | cl[t][i * 4 + 2] | cl[t][i * 4 + 3]) cnz[t]++;
+              }
+              for (int i = 0; i < w * h; i++) if (memcmp(pg[0] + i * 4, pg[1] + i * 4, 4) != 0) pdiff++;
+              for (int i = 0; i < cn; i++) if (memcmp(cl[0] + i * 4, cl[1] + i * 4, 4) != 0) cdiff++;
+              unsigned fa[4], fb4[4];
+              for (int i = 0; i < 4; i++) {
+                  const uint8_t *a = pg[0] + i * 4, *b = pg[1] + i * 4;
+                  fa[i] = (unsigned)((a[0] >> 3) | ((a[1] >> 3) << 5) | ((a[2] >> 3) << 10) | (a[3] ? 0x8000 : 0));
+                  fb4[i] = (unsigned)((b[0] >> 3) | ((b[1] >> 3) << 5) | ((b[2] >> 3) << 10) | (b[3] ? 0x8000 : 0));
+              }
+              plat_log("[GPU] texprobe page=(%d,%d) depth=%d %dx%d px: nonzero tex_a=%u tex_b=%u, differ=%u | clut=(%d,%d) %d entries: nonzero tex_a=%u tex_b=%u, differ=%u%s",
+                       px, py, dp, w, h, pnz[0], pnz[1], pdiff, cx, cy, cn, cnz[0], cnz[1], cdiff,
+                       (pnz[1] == 0 ? "  <-- SAMPLED TEXTURE PAGE IS EMPTY" : (pdiff ? "  <-- snapshot differs from render target" : "")));
+              plat_log("[GPU] texprobe first texels: tex_a=%04x %04x %04x %04x tex_b=%04x %04x %04x %04x", fa[0], fa[1], fa[2], fa[3], fb4[0], fb4[1], fb4[2], fb4[3]);
+              gl_invalidate();
+          }
+
+          static void read_rect_rgba(int x, int y, int w, int h, uint8_t *out)
+          {''', "texprobe")
+
+              rep("    st_uploads++;\n}",
+                  "    st_uploads++;\n"
+                  r'''    if (dg_up_logged < 40 && (st_uploads <= 12 || (size_t)w * h >= 2048)) {
+                  dg_up_logged++;
+                  plat_log("[GPU] upload #%u: (%d,%d) %dx%d halfwords%s", st_uploads, x, y, w, h, check_mask ? " (mask-check)" : "");
+              }
+          }''', "upload log")
+
+              rep("        memcpy(st_fr_last, st_fr, sizeof st_fr);\n",
+                  r'''        plat_log("[GPU]   mix /f: flat draws=%.1f tris=%.0f | textured draws=%.1f tris=%.0f (4bpp %.0f, 8bpp %.0f, 16bpp %.0f tris) | glErrors=%u",
+                           (dg_fd - dg_fd_last) * per, (dg_ft - dg_ft_last) * per,
+                           (dg_td[0] + dg_td[1] + dg_td[2] - dg_td_last[0] - dg_td_last[1] - dg_td_last[2]) * per,
+                           (dg_tt[0] + dg_tt[1] + dg_tt[2] - dg_tt_last[0] - dg_tt_last[1] - dg_tt_last[2]) * per,
+                           (dg_tt[0] - dg_tt_last[0]) * per, (dg_tt[1] - dg_tt_last[1]) * per, (dg_tt[2] - dg_tt_last[2]) * per, dg_err);
+                  dg_fd_last = dg_fd; dg_ft_last = dg_ft;
+                  memcpy(dg_td_last, dg_td, sizeof dg_td); memcpy(dg_tt_last, dg_tt, sizeof dg_tt);
+                  dg_texprobe();
+                  memcpy(st_fr_last, st_fr, sizeof st_fr);
+          ''', "frame log extras")
+
+              # self-test must not leave diagnostics counters dirty
+              rep("    first_draw_logged = false;\n}",
+                  "    first_draw_logged = false;\n"
+                  "    memset(dg_td, 0, sizeof dg_td); memset(dg_tt, 0, sizeof dg_tt); dg_fd = dg_ft = 0; dg_err = 0; dg_td_logged = 0; dg_up_logged = 0;\n"
+                  "    dg_last_tpw = -1.0f;\n}", "selftest reset")
+
+              s += "\n/* GLES2-COMPAT applied */\n"
+              return s
+
           # ---------------------------------------------------------------- psx.h
           p = N + "/src/psx.h"
           s = rd(p)
@@ -1627,6 +2144,7 @@ jobs:
                      "    glDrawArrays(GL_TRIANGLES, 0, 6);\n")
               s = s.replace(old, new, 1)
               assert "glCopyTexSubImage2D(GL_TEXTURE_2D" not in s
+          s = apply_gles2_compat(s)
           wr(p, s)
 
           # ---------------------------------------------------------------- mmp
