@@ -1767,7 +1767,7 @@ jobs:
                   "static void gl_invalidate(void);     /* defined with the GL state shadow, below */\n"
                   "static void gl_selftest(void);       /* GLES2-COMPAT: defined after the primitive code */", "fwd decl")
               rep("    plat_gl_make_current();          /* creates the EAGL context on the emulation thread */\n    gl_init();\n}",
-                  "    plat_gl_make_current();          /* creates the EAGL context on the emulation thread */\n    gl_init();\n    if (dg_flag()) gl_selftest();\n}",
+                  "    plat_gl_make_current();          /* creates the EAGL context on the emulation thread */\n    gl_init();\n}",
                   "gpu_init")
 
               selftest = r'''
@@ -1813,12 +1813,20 @@ jobs:
           static void gl_selftest(void)
           {
               uint16_t exp[16 * 16], t16[8 * 8], t4[2 * 8], t8[4 * 8], clut16[16], clut256[256];
+              __typeof__(tp_x) s_tpx = tp_x; __typeof__(tp_y) s_tpy = tp_y; __typeof__(tp_depth) s_tpd = tp_depth;
+              __typeof__(blend_mode) s_bm = blend_mode; __typeof__(dither_on) s_dth = dither_on;
+              __typeof__(draw_left) s_dl = draw_left; __typeof__(draw_top) s_dt = draw_top;
+              __typeof__(draw_right) s_dr = draw_right; __typeof__(draw_bottom) s_db = draw_bottom;
+              __typeof__(draw_ofs_x) s_ox = draw_ofs_x; __typeof__(draw_ofs_y) s_oy = draw_ofs_y;
+              __typeof__(set_mask) s_sm = set_mask; __typeof__(check_mask) s_cm = check_mask;
+              __typeof__(tw_mask_x) s_twmx = tw_mask_x; __typeof__(tw_mask_y) s_twmy = tw_mask_y;
+              __typeof__(tw_off_x) s_twox = tw_off_x; __typeof__(tw_off_y) s_twoy = tw_off_y;
               int fails = 0;
               plat_log("[GPU] vertex = %d bytes, attributes: a_pos f2, a_col ubyte4n, a_uv f2, a_pk f2", (int)sizeof(GVert));
 
               glDisable(GL_SCISSOR_TEST);
               bind_vram_target();
-              glScissor(0, 0, VRAM_W, VRAM_H);
+              glScissor(0, 0, 8, 8);
               glClearColor(0, 0, 0, 0);
               plat_log("[GPU] selftest: glClear ...");
               glClear(GL_COLOR_BUFFER_BIT);
@@ -1905,19 +1913,11 @@ jobs:
 
               plat_log("[GPU] selftest %s (%d failing checks)", fails ? "FAILED" : "PASSED", fails);
 
-              /* wipe VRAM (both textures) and the statistics so the game starts from a clean slate */
-              memset(scr_a, 0, (size_t)VRAM_W * VRAM_H * 4);
-              glActiveTexture(GL_TEXTURE0);
-              glBindTexture(GL_TEXTURE_2D, tex_a);
-              glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, VRAM_W, VRAM_H, GL_RGBA, GL_UNSIGNED_BYTE, scr_a);
-              glBindTexture(GL_TEXTURE_2D, tex_b);
-              glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, VRAM_W, VRAM_H, GL_RGBA, GL_UNSIGNED_BYTE, scr_a);
+              /* restore the game's GPU state (the test runs on the 2nd present, when the game is already running) */
+              tp_x = s_tpx; tp_y = s_tpy; tp_depth = s_tpd; blend_mode = s_bm; dither_on = s_dth;
+              draw_left = s_dl; draw_top = s_dt; draw_right = s_dr; draw_bottom = s_db; draw_ofs_x = s_ox; draw_ofs_y = s_oy;
+              set_mask = s_sm; check_mask = s_cm; tw_mask_x = s_twmx; tw_mask_y = s_twmy; tw_off_x = s_twox; tw_off_y = s_twoy;
               gl_invalidate();
-              dirty.valid = false; nbk = 0;
-              tp_x = tp_y = tp_depth = blend_mode = 0;
-              st_draws = st_tris = st_syncs = st_uploads = st_reads = st_fills = st_copies = 0;
-              st_last_draws = st_last_tris = 0;
-              memset(st_fr, 0, sizeof st_fr); memset(st_fr_last, 0, sizeof st_fr_last);
               first_draw_logged = false;
           }
 
@@ -2017,6 +2017,7 @@ jobs:
               flush_batch();
               glPixelStorei(GL_PACK_ALIGNMENT, 4);
               for (int t = 0; t < 2; t++) {
+                  plat_log("[GPU] texprobe: glReadPixels from %s ...", t ? "tex_b" : "tex_a");
                   glBindFramebuffer(GL_FRAMEBUFFER, fb[t]);
                   glReadPixels(px, py, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pg[t]);
                   glReadPixels(cx, cy, cn, 1, GL_RGBA, GL_UNSIGNED_BYTE, cl[t]);
@@ -2067,6 +2068,7 @@ jobs:
                   "    memset(dg_td, 0, sizeof dg_td); memset(dg_tt, 0, sizeof dg_tt); dg_fd = dg_ft = 0; dg_err = 0; dg_td_logged = 0; dg_up_logged = 0;\n"
                   "    dg_last_tpw = -1.0f;\n}", "selftest reset")
 
+              rep("    st_frames++;\n", "    st_frames++;\n    if (st_frames == 2 && dg_flag()) gl_selftest();     /* GLES2-COMPAT: after the first swap, never before */\n", "selftest hook")
               s += "\n/* GLES2-COMPAT applied */\n"
               return s
 
