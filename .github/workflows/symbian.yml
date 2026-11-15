@@ -1264,6 +1264,21 @@ jobs:
               User::WaitForRequest(s);
               t.Close();
               }
+
+          extern "C" void plat_log(const char *fmt, ...);
+
+          // Last-chance logger for CPU exceptions (data abort, undefined instruction, FPU, ...) on the emulation thread.
+          static void CrashExcHandler(TExcType aType)
+              {
+              plat_log("[EXC] exception type=%d cp=%s last_call=0x%08x", (int)aType, plat_get_cp(), plat_last_call());
+              User::Panic(_L("CrashExc"), (TInt)aType);
+              }
+
+          extern "C" void PSym_InstallExcHandler(void)
+              {
+              TInt r = User::SetExceptionHandler(CrashExcHandler, KExceptionFault | KExceptionInteger | KExceptionFpe);
+              plat_log("[SYS] exception handler installed, r=%d", (int)r);
+              }
           CR_EOF
           mkdir -p symbian/compat
           cat > symbian/compat/z3compat.h <<'CR_EOF'
@@ -1346,7 +1361,44 @@ jobs:
               return (uint64_t)tv.tv_sec * 1000000000ull + (uint64_t)tv.tv_usec * 1000ull;
           }
 
-          void plat_sleep_us(unsigned us) { PSym_SleepUs(us); }
+          /* ---- crash breadcrumbs + watchdog -------------------------------------------------------------------------
+           * plat_cp() records the last stage the emulation thread entered. A watchdog thread logs every 2 s whether the
+           * game is still moving (frames / last called function); when it is not, the log says "STALL" and where. */
+          static const char *volatile g_cp = "boot";
+          void plat_cp(const char *s) { g_cp = s; }
+          const char *plat_get_cp(void) { return g_cp; }
+          unsigned plat_last_call(void) { return (unsigned)g_last_call_addr; }
+
+          static void *wd_main(void *arg)
+          {
+              (void)arg;
+              int64_t last_frames = -1; unsigned last_call = 0xFFFFFFFFu, tick = 0, still = 0;
+              const uint64_t t0 = plat_time_ns();
+              for (;;) {
+                  PSym_SleepUs(2000000);
+                  tick++;
+                  const int64_t fr = g_present_calls;
+                  const unsigned lc = (unsigned)g_last_call_addr, secs = (unsigned)((plat_time_ns() - t0) / 1000000000ull);
+                  still = (fr != last_frames || lc != last_call) ? 0 : still + 1;
+                  last_frames = fr; last_call = lc;
+                  if (still >= 1) {
+                      if (still <= 5 || (still % 15) == 0)
+                          plat_log("[WD] t=%us STALL x%u: frames=%d last_call=0x%08X cp=%s paused=%d err=%d", secs, still, (int)fr, lc, g_cp, (int)g_paused, (int)g_has_err);
+                  } else if (tick <= 15 || (tick % 30) == 0) {
+                      plat_log("[WD] t=%us ok: frames=%d last_call=0x%08X cp=%s", secs, (int)fr, lc, g_cp);
+                  }
+              }
+              return NULL;
+          }
+
+          void plat_sleep_us(unsigned us)
+          {
+              static int n;
+              if (n < 2) plat_log("[SLEEP] first plat_sleep_us(%u) ...", us);
+              PSym_SleepUs(us);
+              if (n < 2) plat_log("[SLEEP] returned");
+              n++;
+          }
           const char *plat_disc_path(void) { return g_cue; }
           const char *plat_save_dir(void) { return g_saves; }
           void plat_input_poll(void) {}
@@ -1366,10 +1418,14 @@ jobs:
 
           void plat_present(const uint16_t *vram, int dx, int dy, int dw, int dh, bool rgb24, bool enabled)
           {
+              static int n;
               (void)vram;
               while (g_paused && !g_has_err) PSym_SleepUs(10000);
               gpu_present(dx, dy, dw, dh, rgb24, enabled);
-              PSym_GlSwap();
+              if (n < 3) plat_log("[EGL] swap #%d ...", n + 1);
+              int ok = PSym_GlSwap();
+              if (n < 3) plat_log("[EGL] swap #%d returned %d", n + 1, ok);
+              n++;
           }
 
           void PSym_SetPad(unsigned mask) { g_pad_pressed = mask; }
@@ -1413,7 +1469,11 @@ jobs:
           static void *emu_main(void *arg)
           {
               (void)arg;
+              plat_log("[THREAD] emulation thread started");
+              PSym_InstallExcHandler();
+              plat_cp("runtime_run_game");
               runtime_run_game();
+              plat_log("[THREAD] runtime_run_game returned (cp=%s)", g_cp);
               plat_fatal("game returned");
               return NULL;
           }
@@ -1442,6 +1502,15 @@ jobs:
               pthread_t th;
               if (pthread_create(&th, &at, emu_main, NULL) != 0) return fail("Cannot start the emulation thread.");
               pthread_detach(th);
+              plat_log("[THREAD] emulation thread created (stack 1 MB)");
+              {
+                  pthread_attr_t wa; pthread_t wt;
+                  pthread_attr_init(&wa);
+                  pthread_attr_setstacksize(&wa, 64 * 1024);
+                  int wr = pthread_create(&wt, &wa, wd_main, NULL);
+                  if (wr == 0) pthread_detach(wt);
+                  plat_log("[THREAD] watchdog rc=%d", wr);
+              }
               g_started = 1;
               return 0;
           }
@@ -1489,6 +1558,12 @@ jobs:
           /* Implemented in C++ (RTimer): microsecond sleep. */
           void PSym_SleepUs(unsigned us);
 
+          /* Crash diagnostics: exception handler for the calling thread (C++), breadcrumbs (psx_sym.c). */
+          void PSym_InstallExcHandler(void);
+          void plat_cp(const char *stage);
+          const char *plat_get_cp(void);
+          unsigned plat_last_call(void);
+
           #ifdef __cplusplus
           }
           #endif
@@ -1503,6 +1578,7 @@ jobs:
           #include <unistd.h>
 
           void PSym_SleepUs(unsigned us) { usleep(us); }
+          void PSym_InstallExcHandler(void) {}
           void plat_gl_make_current(void) {}
           void plat_gl_screen(int *fbo, int *w, int *h) { *fbo = 0; *w = 640; *h = 360; }
           int PSym_GlSwap(void) { return 1; }
@@ -1762,313 +1838,18 @@ jobs:
 
               assert "tex_dith" not in s and 'sampler2D u_dith' not in s and '"#ifdef' not in s and '"#define' not in s
 
-              # ---- 3. start-up self test: logs what the GL layer really does (crash.log) --------------------------------
-              rep("static void gl_invalidate(void);     /* defined with the GL state shadow, below */",
-                  "static void gl_invalidate(void);     /* defined with the GL state shadow, below */\n"
-                  "static void gl_selftest(void);       /* GLES2-COMPAT: defined after the primitive code */", "fwd decl")
-              rep("    plat_gl_make_current();          /* creates the EAGL context on the emulation thread */\n    gl_init();\n}",
-                  "    plat_gl_make_current();          /* creates the EAGL context on the emulation thread */\n    gl_init();\n}",
-                  "gpu_init")
-
-              selftest = r'''
-          /* ------------------------------------------------------------------ */
-          /* Start-up self test (GLES2-COMPAT). Renders known data through the real draw path and compares the read-back  */
-          /* with a CPU model. Results go to crash.log ("[GPU] selftest ..."); VRAM is cleared afterwards.                  */
-          /* ------------------------------------------------------------------ */
-          static int st_check(const char *name, const uint16_t *want, int w, int h)
-          {
-              plat_log("[GPU] selftest %s: flushing + glReadPixels ...", name);
-              read_rect_rgba(0, 0, w, h, scr_b);
-              int bad = 0, fx = -1, fy = -1; unsigned fg = 0, fw = 0;
-              for (int y = 0; y < h; y++)
-                  for (int x = 0; x < w; x++) {
-                      const uint8_t *q = scr_b + ((size_t)y * w + x) * 4;
-                      unsigned got = (unsigned)((q[0] >> 3) | ((q[1] >> 3) << 5) | ((q[2] >> 3) << 10));
-                      unsigned exp = want[y * w + x] & 0x7FFF;
-                      if (got != exp) { if (!bad) { fx = x; fy = y; fg = got; fw = exp; } bad++; }
-                  }
-              GLenum e = glGetError();
-              if (bad) plat_log("[GPU] selftest %-8s FAIL: %d of %d texels wrong, first (%d,%d) got=%04x want=%04x glError=0x%x", name, bad, w * h, fx, fy, fg, fw, (unsigned)e);
-              else plat_log("[GPU] selftest %-8s ok (glError=0x%x)", name, (unsigned)e);
-              return bad;
-          }
-
-          static void st_quad(int x, int y, int w, int h, int cr, int cg, int cb, bool tex, bool raw, int clut)
-          {
-              Vert a = { x,     y,     cr, cg, cb, 0,     0 };
-              Vert b = { x + w, y,     cr, cg, cb, w,     0 };
-              Vert c = { x,     y + h, cr, cg, cb, 0,     h };
-              Vert d = { x + w, y + h, cr, cg, cb, w,     h };
-              poly_tri(&a, &b, &c, tex, false, false, raw, clut);
-              poly_tri(&b, &c, &d, tex, false, false, raw, clut);
-          }
-
-          static void st_clear(void)
-          {
-              bool d = dither_on; dither_on = false;
-              st_quad(0, 0, 8, 8, 0, 0, 0, false, false, 0);
-              dither_on = d;
-          }
-
-          static void gl_selftest(void)
-          {
-              uint16_t exp[16 * 16], t16[8 * 8], t4[2 * 8], t8[4 * 8], clut16[16], clut256[256];
-              __typeof__(tp_x) s_tpx = tp_x; __typeof__(tp_y) s_tpy = tp_y; __typeof__(tp_depth) s_tpd = tp_depth;
-              __typeof__(blend_mode) s_bm = blend_mode; __typeof__(dither_on) s_dth = dither_on;
-              __typeof__(draw_left) s_dl = draw_left; __typeof__(draw_top) s_dt = draw_top;
-              __typeof__(draw_right) s_dr = draw_right; __typeof__(draw_bottom) s_db = draw_bottom;
-              __typeof__(draw_ofs_x) s_ox = draw_ofs_x; __typeof__(draw_ofs_y) s_oy = draw_ofs_y;
-              __typeof__(set_mask) s_sm = set_mask; __typeof__(check_mask) s_cm = check_mask;
-              __typeof__(tw_mask_x) s_twmx = tw_mask_x; __typeof__(tw_mask_y) s_twmy = tw_mask_y;
-              __typeof__(tw_off_x) s_twox = tw_off_x; __typeof__(tw_off_y) s_twoy = tw_off_y;
-              int fails = 0;
-              plat_log("[GPU] vertex = %d bytes, attributes: a_pos f2, a_col ubyte4n, a_uv f2, a_pk f2", (int)sizeof(GVert));
-
-              glDisable(GL_SCISSOR_TEST);
-              bind_vram_target();
-              glScissor(0, 0, 8, 8);
-              glClearColor(0, 0, 0, 0);
-              plat_log("[GPU] selftest: glClear ...");
-              glClear(GL_COLOR_BUFFER_BIT);
-              gl_invalidate();
-              (void)glGetError();
-              plat_log("[GPU] selftest: VRAM cleared, drawing flat quad ...");
-
-              /* flat */
-              tp_x = tp_y = tp_depth = blend_mode = 0; dither_on = false; draw_left = draw_top = 0; draw_right = VRAM_W - 1; draw_bottom = VRAM_H - 1;
-              draw_ofs_x = draw_ofs_y = 0; set_mask = check_mask = false; tw_mask_x = tw_mask_y = tw_off_x = tw_off_y = 0;
-              st_quad(0, 0, 8, 8, 248, 0, 0, false, false, 0);
-              for (int i = 0; i < 64; i++) exp[i] = 31;
-              flush_batch();
-              fails += st_check("flat", exp, 8, 8);
-
-              /* 16bpp raw texture at (576,256) = texpage 9, y 256 */
-              for (int i = 0; i < 64; i++) t16[i] = (uint16_t)(0x0421u * (unsigned)((i % 31) + 1) | 0x8000u);
-              upload_words(576, 256, 8, 8, t16);
-              tp_x = tp_y = tp_depth = 0; st_clear();
-              tp_x = 576; tp_y = 256; tp_depth = 2;
-              st_quad(0, 0, 8, 8, 128, 128, 128, true, true, 0);
-              flush_batch();
-              for (int i = 0; i < 64; i++) exp[i] = t16[i];
-              fails += st_check("tex16", exp, 8, 8);
-
-              /* 4bpp CLUT texture: texels 0..15 repeating, CLUT at (0,480) */
-              for (int i = 0; i < 16; i++) clut16[i] = (uint16_t)(i == 0 ? 0x0000 : (0x0842u * (unsigned)i) | 0x8000u);
-              upload_words(0, 480, 16, 1, clut16);
-              for (int y = 0; y < 8; y++) { t4[y * 2] = (uint16_t)(0x3210 + y * 0x1111 * 0); t4[y * 2 + 1] = (uint16_t)0x7654; }
-              upload_words(640, 256, 2, 8, t4);
-              tp_x = tp_y = tp_depth = 0; st_clear();
-              tp_x = 640; tp_y = 256; tp_depth = 0;
-              st_quad(0, 0, 8, 8, 128, 128, 128, true, true, (0 >> 4) | (480 << 6));
-              flush_batch();
-              for (int y = 0; y < 8; y++) for (int x = 0; x < 8; x++) {
-                  unsigned wd = t4[y * 2 + (x >> 2)], idx = (wd >> ((x & 3) * 4)) & 15;
-                  exp[y * 8 + x] = clut16[idx];
-              }
-              fails += st_check("tex4", exp, 8, 8);
-
-              /* 8bpp CLUT texture, CLUT at (0,481) */
-              for (int i = 0; i < 256; i++) clut256[i] = (uint16_t)(i == 0 ? 0 : (((unsigned)i * 0x0101u) & 0x7FFF) | 0x8000u);
-              upload_words(0, 481, 256, 1, clut256);
-              for (int y = 0; y < 8; y++) for (int i = 0; i < 4; i++) t8[y * 4 + i] = (uint16_t)(((y * 8 + i * 2 + 1) & 0xFF) | (((y * 8 + i * 2 + 2) & 0xFF) << 8));
-              upload_words(704, 256, 4, 8, t8);
-              tp_x = tp_y = tp_depth = 0; st_clear();
-              tp_x = 704; tp_y = 256; tp_depth = 1;
-              st_quad(0, 0, 8, 8, 128, 128, 128, true, true, (0 >> 4) | (481 << 6));
-              flush_batch();
-              for (int y = 0; y < 8; y++) for (int x = 0; x < 8; x++) {
-                  unsigned wd = t8[y * 4 + (x >> 1)], idx = (wd >> ((x & 1) * 8)) & 255;
-                  exp[y * 8 + x] = clut256[idx];
-              }
-              fails += st_check("tex8", exp, 8, 8);
-
-              /* snapshot sync: draw a flat quad INTO the texture page, then sample it (dirty rect -> tex_b copy) */
-              tp_x = tp_y = tp_depth = 0;
-              {
-                  int sx = 576, sy = 256;
-                  Vert a = { sx, sy, 0, 248, 0, 0, 0 }, b = { sx + 8, sy, 0, 248, 0, 0, 0 }, c = { sx, sy + 8, 0, 248, 0, 0, 0 }, d = { sx + 8, sy + 8, 0, 248, 0, 0, 0 };
-                  poly_tri(&a, &b, &c, false, false, false, false, 0);
-                  poly_tri(&b, &c, &d, false, false, false, false, 0);
-              }
-              tp_x = tp_y = tp_depth = 0; st_clear();
-              tp_x = 576; tp_y = 256; tp_depth = 2;
-              st_quad(0, 0, 8, 8, 128, 128, 128, true, true, 0);
-              flush_batch();
-              for (int i = 0; i < 64; i++) exp[i] = 31 << 5;
-              fails += st_check("sync", exp, 8, 8);
-
-              /* modulated + gouraud-free colour: tex16 texel 0x7FFF * (128/128) must stay 0x7FFF */
-              for (int i = 0; i < 64; i++) t16[i] = 0xFFFF;
-              upload_words(576, 264, 8, 8, t16);
-              tp_x = tp_y = tp_depth = 0; st_clear();
-              tp_x = 576; tp_y = 256; tp_depth = 2;
-              {
-                  Vert a = { 0, 0, 128, 128, 128, 0, 8 }, b = { 8, 0, 128, 128, 128, 8, 8 }, c = { 0, 8, 128, 128, 128, 0, 16 }, d = { 8, 8, 128, 128, 128, 8, 16 };
-                  poly_tri(&a, &b, &c, true, false, false, false, 0);
-                  poly_tri(&b, &c, &d, true, false, false, false, 0);
-              }
-              flush_batch();
-              for (int i = 0; i < 64; i++) exp[i] = 0x7FFF;
-              fails += st_check("modulate", exp, 8, 8);
-
-              plat_log("[GPU] selftest %s (%d failing checks)", fails ? "FAILED" : "PASSED", fails);
-
-              /* restore the game's GPU state (the test runs on the 2nd present, when the game is already running) */
-              tp_x = s_tpx; tp_y = s_tpy; tp_depth = s_tpd; blend_mode = s_bm; dither_on = s_dth;
-              draw_left = s_dl; draw_top = s_dt; draw_right = s_dr; draw_bottom = s_db; draw_ofs_x = s_ox; draw_ofs_y = s_oy;
-              set_mask = s_sm; check_mask = s_cm; tw_mask_x = s_twmx; tw_mask_y = s_twmy; tw_off_x = s_twox; tw_off_y = s_twoy;
-              gl_invalidate();
-              first_draw_logged = false;
-          }
-
-          '''
-              rep("/* ------------------------------------------------------------------ */\n/* GP0 / GP1                                                            */",
-                  selftest + "/* ------------------------------------------------------------------ */\n/* GP0 / GP1                                                            */", "selftest insert")
-              # ---- 4. graphics diagnostics -> crash.log -----------------------------------------------------------------
-              rep("static bool first_draw_logged;\n",
-                  "static bool first_draw_logged;\n"
-                  r'''/* diagnostics (GLES2-COMPAT) */
-          static unsigned dg_td[4], dg_tt[4], dg_td_last[4], dg_tt_last[4];     /* textured draws / tris per depth (0=4bpp 1=8bpp 2=16bpp) */
-          static unsigned dg_fd, dg_ft, dg_fd_last, dg_ft_last;                  /* flat draws / tris */
-          static unsigned dg_err, dg_td_logged, dg_up_logged;
-          static float dg_last_tpw = -1.0f, dg_last_clw;
-          static uint8_t *dg_buf;
-          /* heavy diagnostics (selftest, GL queries, VRAM probes) only when a file gpudiag.txt exists next to the .cue */
-          static int dg_flag(void)
-          {
-              static int v = -1;
-              if (v < 0) {
-                  static const char *const paths[] = { "E:/crashbandicoot/gpudiag.txt", "E:/CrashBandicoot/gpudiag.txt", "C:/crashbandicoot/gpudiag.txt", "gpudiag.txt" };
-                  v = 0;
-                  for (unsigned i = 0; i < sizeof paths / sizeof *paths && !v; i++) { FILE *f = fopen(paths[i], "rb"); if (f) { fclose(f); v = 1; } }
-                  plat_log("[GPU] heavy diagnostics %s (create gpudiag.txt next to the .cue file to enable selftest / texprobe / GL queries)", v ? "ENABLED" : "off");
-              }
-              return v;
-          }
-          ''', "dg statics")
-
+              # ---- 3. minimal logging only (no self test, no GL probes): first draw breadcrumbs + highp info -------------
+              rep("    glDrawArrays(k->prim ? GL_LINES : GL_TRIANGLES, 0, cnt);\n",
+                  "    if (!first_draw_logged) plat_log(\"[GPU] first glDrawArrays: cnt=%d tex=%d prim=%d prog=%u\", cnt, k->tex ? 1 : 0, (int)k->prim, (unsigned)P->id);\n"
+                  "    glDrawArrays(k->prim ? GL_LINES : GL_TRIANGLES, 0, cnt);\n"
+                  "    if (!first_draw_logged) plat_log(\"[GPU] first glDrawArrays returned\");\n", "draw breadcrumbs")
               rep("    plat_log(\"[GPU] GL_VERSION=%s\", (const char *)glGetString(GL_VERSION));\n}",
-                  r'''    plat_log("[GPU] GL_VERSION=%s", (const char *)glGetString(GL_VERSION));
-              if (dg_flag()) {
-                  plat_log("[GPU] querying GL limits ...");
-                  const char *sl = (const char *)glGetString(0x8B8C);            /* GL_SHADING_LANGUAGE_VERSION */
-                  GLint mt = 0, mva = 0, mvv = 0, mtu = 0, pr[2] = { 0, 0 }, pp = 0;
-                  glGetIntegerv(0x0D33, &mt);                                    /* GL_MAX_TEXTURE_SIZE */
-                  glGetIntegerv(0x8869, &mva);                                   /* GL_MAX_VERTEX_ATTRIBS */
-                  glGetIntegerv(0x8DFC, &mvv);                                   /* GL_MAX_VARYING_VECTORS */
-                  glGetIntegerv(0x8872, &mtu);                                   /* GL_MAX_TEXTURE_IMAGE_UNITS */
-                  glGetShaderPrecisionFormat(GL_FRAGMENT_SHADER, 0x8DF2, pr, &pp); /* GL_HIGH_FLOAT: range[2], precision */
-                  plat_log("[GPU] GLSL=%s maxTex=%d maxVertexAttribs=%d maxVaryingVecs=%d maxTexUnits=%d fragment highp: range=2^%d..2^%d precision=%d bits%s",
-                           sl ? sl : "?", (int)mt, (int)mva, (int)mvv, (int)mtu, (int)pr[0], (int)pr[1], (int)pp,
-                           pp == 0 ? "  <-- NO highp in fragment shaders (texture decode will be wrong!)" : "");
-                  const char *ex = (const char *)glGetString(0x1F03);            /* GL_EXTENSIONS */
-                  if (ex) {
-                      size_t n = strlen(ex);
-                      for (size_t o = 0; o < n; o += 180) plat_log("[GPU] extensions[%u]: %.180s", (unsigned)(o / 180), ex + o);
-                  }
-                  (void)glGetError();
-              }
-          }''', "gl_init info")
-
-              rep("    if (timed) st_flush_ns += (plat_time_ns() - t0) * 16u;\n}",
-                  r'''    {
-                  const unsigned tris = (unsigned)(cnt / 3);
-                  if (k->tex) {
-                      const int tw = (int)buf[0].tpw, cw = (int)buf[0].clw;
-                      const unsigned dp = (unsigned)(tw >> 5) & 3u;
-                      dg_td[dp]++; dg_tt[dp] += tris;
-                      dg_last_tpw = buf[0].tpw; dg_last_clw = buf[0].clw;
-                      if (dg_td_logged < 24) {
-                          dg_td_logged++;
-                          plat_log("[GPU] textured draw #%u: verts=%d page=(%d,%d) depth=%u raw=%d clut=(%d,%d) pass=%d texwin=%d blend=%d uv0=(%.1f,%.1f) uv1=(%.1f,%.1f)",
-                                   dg_td_logged, cnt, (tw & 15) * 64, ((tw >> 4) & 1) * 256, dp, (tw >> 7) & 1,
-                                   (cw & 63) * 16, (cw >> 6) & 511, (int)k->pass, (int)k->twin, k->blend_on ? (int)(k->blend & 3) : -1,
-                                   (double)buf[0].u, (double)buf[0].v, (double)buf[1].u, (double)buf[1].v);
-                      }
-                  } else { dg_fd++; dg_ft += tris; }
-                  if (st_draws <= 200 || (st_draws & 1023u) == 0) {
-                      GLenum e = glGetError();
-                      if (e != 0 && dg_err++ < 40) plat_log("[GPU] glGetError=0x%x after draw #%u (tex=%d cnt=%d)", (unsigned)e, st_draws, k->tex ? 1 : 0, cnt);
-                  }
-              }
-              if (timed) st_flush_ns += (plat_time_ns() - t0) * 16u;
-          }''', "draw_buf diag")
-
-              rep("static void read_rect_rgba(int x, int y, int w, int h, uint8_t *out)\n{",
-                  r'''/* Compare the texture page / CLUT of the last textured draw in the render target (tex_a) and the sampled snapshot
-           * (tex_b). All-zero tex_b = textures never arrived (everything textured is discarded); a != b = stale snapshot. */
-          static void dg_texprobe(void)
-          {
-              if (dg_last_tpw < 0.0f) { plat_log("[GPU] texprobe: no textured draw yet"); return; }
-              const int tw = (int)dg_last_tpw, cw = (int)dg_last_clw;
-              const int px = (tw & 15) * 64, py = ((tw >> 4) & 1) * 256, dp = (tw >> 5) & 3;
-              const int cx = (cw & 63) * 16, cy = (cw >> 6) & 511;
-              int w = dp == 0 ? 64 : (dp == 1 ? 128 : 256);
-              if (px + w > VRAM_W) w = VRAM_W - px;
-              int cn = dp == 0 ? 16 : 256;
-              if (cx + cn > VRAM_W) cn = VRAM_W - cx;
-              const int h = 256;
-              if (!dg_buf) dg_buf = (uint8_t *)malloc(2 * 256 * 256 * 4 + 2 * 256 * 4);
-              if (!dg_buf) return;
-              uint8_t *pg[2] = { dg_buf, dg_buf + 256 * 256 * 4 };
-              uint8_t *cl[2] = { dg_buf + 2 * 256 * 256 * 4, dg_buf + 2 * 256 * 256 * 4 + 256 * 4 };
-              const GLuint fb[2] = { fbo_a, fbo_b };
-              unsigned pnz[2] = { 0, 0 }, cnz[2] = { 0, 0 }, pdiff = 0, cdiff = 0;
-              flush_batch();
-              glPixelStorei(GL_PACK_ALIGNMENT, 4);
-              for (int t = 0; t < 2; t++) {
-                  plat_log("[GPU] texprobe: glReadPixels from %s ...", t ? "tex_b" : "tex_a");
-                  glBindFramebuffer(GL_FRAMEBUFFER, fb[t]);
-                  glReadPixels(px, py, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pg[t]);
-                  glReadPixels(cx, cy, cn, 1, GL_RGBA, GL_UNSIGNED_BYTE, cl[t]);
-                  for (int i = 0; i < w * h; i++) if (pg[t][i * 4] | pg[t][i * 4 + 1] | pg[t][i * 4 + 2] | pg[t][i * 4 + 3]) pnz[t]++;
-                  for (int i = 0; i < cn; i++) if (cl[t][i * 4] | cl[t][i * 4 + 1] | cl[t][i * 4 + 2] | cl[t][i * 4 + 3]) cnz[t]++;
-              }
-              for (int i = 0; i < w * h; i++) if (memcmp(pg[0] + i * 4, pg[1] + i * 4, 4) != 0) pdiff++;
-              for (int i = 0; i < cn; i++) if (memcmp(cl[0] + i * 4, cl[1] + i * 4, 4) != 0) cdiff++;
-              unsigned fa[4], fb4[4];
-              for (int i = 0; i < 4; i++) {
-                  const uint8_t *a = pg[0] + i * 4, *b = pg[1] + i * 4;
-                  fa[i] = (unsigned)((a[0] >> 3) | ((a[1] >> 3) << 5) | ((a[2] >> 3) << 10) | (a[3] ? 0x8000 : 0));
-                  fb4[i] = (unsigned)((b[0] >> 3) | ((b[1] >> 3) << 5) | ((b[2] >> 3) << 10) | (b[3] ? 0x8000 : 0));
-              }
-              plat_log("[GPU] texprobe page=(%d,%d) depth=%d %dx%d px: nonzero tex_a=%u tex_b=%u, differ=%u | clut=(%d,%d) %d entries: nonzero tex_a=%u tex_b=%u, differ=%u%s",
-                       px, py, dp, w, h, pnz[0], pnz[1], pdiff, cx, cy, cn, cnz[0], cnz[1], cdiff,
-                       (pnz[1] == 0 ? "  <-- SAMPLED TEXTURE PAGE IS EMPTY" : (pdiff ? "  <-- snapshot differs from render target" : "")));
-              plat_log("[GPU] texprobe first texels: tex_a=%04x %04x %04x %04x tex_b=%04x %04x %04x %04x", fa[0], fa[1], fa[2], fa[3], fb4[0], fb4[1], fb4[2], fb4[3]);
-              gl_invalidate();
-          }
-
-          static void read_rect_rgba(int x, int y, int w, int h, uint8_t *out)
-          {''', "texprobe")
-
-              rep("    st_uploads++;\n}",
-                  "    st_uploads++;\n"
-                  r'''    if (dg_up_logged < 40 && (st_uploads <= 12 || (size_t)w * h >= 2048)) {
-                  dg_up_logged++;
-                  plat_log("[GPU] upload #%u: (%d,%d) %dx%d halfwords%s", st_uploads, x, y, w, h, check_mask ? " (mask-check)" : "");
-              }
-          }''', "upload log")
-
-              rep("        memcpy(st_fr_last, st_fr, sizeof st_fr);\n",
-                  r'''        plat_log("[GPU]   mix /f: flat draws=%.1f tris=%.0f | textured draws=%.1f tris=%.0f (4bpp %.0f, 8bpp %.0f, 16bpp %.0f tris) | glErrors=%u",
-                           (dg_fd - dg_fd_last) * per, (dg_ft - dg_ft_last) * per,
-                           (dg_td[0] + dg_td[1] + dg_td[2] - dg_td_last[0] - dg_td_last[1] - dg_td_last[2]) * per,
-                           (dg_tt[0] + dg_tt[1] + dg_tt[2] - dg_tt_last[0] - dg_tt_last[1] - dg_tt_last[2]) * per,
-                           (dg_tt[0] - dg_tt_last[0]) * per, (dg_tt[1] - dg_tt_last[1]) * per, (dg_tt[2] - dg_tt_last[2]) * per, dg_err);
-                  dg_fd_last = dg_fd; dg_ft_last = dg_ft;
-                  memcpy(dg_td_last, dg_td, sizeof dg_td); memcpy(dg_tt_last, dg_tt, sizeof dg_tt);
-                  if (dg_flag()) dg_texprobe();
-                  memcpy(st_fr_last, st_fr, sizeof st_fr);
-          ''', "frame log extras")
-
-              # self-test must not leave diagnostics counters dirty
-              rep("    first_draw_logged = false;\n}",
-                  "    first_draw_logged = false;\n"
-                  "    memset(dg_td, 0, sizeof dg_td); memset(dg_tt, 0, sizeof dg_tt); dg_fd = dg_ft = 0; dg_err = 0; dg_td_logged = 0; dg_up_logged = 0;\n"
-                  "    dg_last_tpw = -1.0f;\n}", "selftest reset")
-
-              rep("    st_frames++;\n", "    st_frames++;\n    if (st_frames == 2 && dg_flag()) gl_selftest();     /* GLES2-COMPAT: after the first swap, never before */\n", "selftest hook")
+                  "    plat_log(\"[GPU] GL_VERSION=%s\", (const char *)glGetString(GL_VERSION));\n"
+                  "    {\n"
+                  "        GLint pr[2] = { 0, 0 }, pp = 0;\n"
+                  "        glGetShaderPrecisionFormat(GL_FRAGMENT_SHADER, GL_HIGH_FLOAT, pr, &pp);\n"
+                  "        plat_log(\"[GPU] fragment highp: range=2^%d precision=%d bits%s\", (int)pr[1], (int)pp, pp == 0 ? \"  <-- NO highp (texture decode will be wrong)\" : \"\");\n"
+                  "    }\n}", "gl_init info")
               s += "\n/* GLES2-COMPAT applied */\n"
               return s
 
@@ -2166,6 +1947,61 @@ jobs:
               assert "glCopyTexSubImage2D(GL_TEXTURE_2D" not in s
           s = apply_gles2_compat(s)
           wr(p, s)
+
+          # ---------------------------------------------------------------- dispatch.c: stage breadcrumbs + first-frame log
+          p = N + "/src/dispatch.c"
+          s = rd(p)
+          if "plat_cp" not in s:
+              a = "#include <pthread.h>\n"
+              assert a in s, "dispatch.c include anchor"
+              s = s.replace(a, a + "extern void plat_cp(const char *stage);   /* Symbian crash breadcrumbs (psx_sym.c) */\n", 1)
+              old = ("    plat_present(g_vram, x, y, w, h, rgb24, en);\n    frameclock_throttle();\n    libcd_tick();\n"
+                     "    cd_advance_streaming();\n    bios_refresh_pad();\n    libpad_refresh();\n    irq_deliver(0, &g_cpu);\n}")
+              assert s.count(old) == 1, "dispatch.c present anchor"
+              new = ("    const bool dbg = g_present_calls <= 3;\n"
+                     "    plat_cp(\"present: gpu_present\");\n"
+                     "    plat_present(g_vram, x, y, w, h, rgb24, en);\n"
+                     "    if (dbg) LOG(\"[FRAME] #%d presented\", (int)g_present_calls);\n"
+                     "    plat_cp(\"present: frameclock_throttle\");\n"
+                     "    frameclock_throttle();\n"
+                     "    if (dbg) LOG(\"[FRAME] #%d throttle done\", (int)g_present_calls);\n"
+                     "    plat_cp(\"present: libcd_tick\");\n"
+                     "    libcd_tick();\n"
+                     "    plat_cp(\"present: cd_advance_streaming\");\n"
+                     "    cd_advance_streaming();\n"
+                     "    plat_cp(\"present: pad\");\n"
+                     "    bios_refresh_pad();\n    libpad_refresh();\n"
+                     "    plat_cp(\"present: irq_deliver\");\n"
+                     "    irq_deliver(0, &g_cpu);\n"
+                     "    plat_cp(\"game code\");\n"
+                     "    if (dbg) LOG(\"[FRAME] #%d irq delivered, back in game code\", (int)g_present_calls);\n}")
+              s = s.replace(old, new, 1)
+              old = "    cpu_restore(cpu, &snap);\n    if (irq >= 0 && irq < 8) g_irq_delivered[irq]++;"
+              assert s.count(old) == 1, "dispatch.c irq anchor"
+              s = s.replace(old, "    cpu_restore(cpu, &snap);\n    if (irq >= 0 && irq < 8 && g_irq_delivered[irq] == 0) LOG(\"[IRQ] first handler return irq=%d\", irq);\n    if (irq >= 0 && irq < 8) g_irq_delivered[irq]++;", 1)
+              wr(p, s)
+
+          # ---------------------------------------------------------------- libsdk.c: helper threads need a real stack
+          p = N + "/src/libsdk.c"
+          s = rd(p)
+          if "z3_spawn" not in s:
+              for a, b in (("pthread_create(&g_xa_thread, NULL, xa_loop, NULL);", "z3_spawn(&g_xa_thread, xa_loop, \"xa\");"),
+                           ("pthread_create(&g_st_thread, NULL, st_loop, NULL);", "z3_spawn(&g_st_thread, st_loop, \"stream\");")):
+                  assert s.count(a) == 1, "libsdk thread anchor " + a
+                  s = s.replace(a, b, 1)
+              for loop in ("xa", "st"):
+                  a = "    (void)arg;\n    uint8_t sec[2352];\n    while (g_%s_run) {" % loop
+                  assert s.count(a) == 1, "libsdk sec anchor " + loop
+                  s = s.replace(a, "    (void)arg;\n    static uint8_t sec[2352];   /* off the (small) helper-thread stack */\n    while (g_%s_run) {" % loop, 1)
+              a = "static void *xa_loop(void *arg)\n"
+              assert s.count(a) == 1, "libsdk xa_loop anchor"
+              helper = ("/* Symbian's default pthread stack is tiny; sector decode needs more. */\n"
+                        "static void z3_spawn(pthread_t *t, void *(*fn)(void *), const char *name)\n{\n"
+                        "    pthread_attr_t at;\n    pthread_attr_init(&at);\n    pthread_attr_setstacksize(&at, 256 * 1024);\n"
+                        "    int r = pthread_create(t, &at, fn, NULL);\n"
+                        "    plat_log(\"[THREAD] %s thread rc=%d (stack 256 KB)\", name, r);\n}\n\n")
+              s = s.replace(a, helper + a, 1)
+              wr(p, s)
 
           # ---------------------------------------------------------------- mmp
           EXCLUDE = {"host_stub.c"}
