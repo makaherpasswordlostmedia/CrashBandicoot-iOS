@@ -1164,8 +1164,8 @@ jobs:
           mkdir -p symbian/app/src
           cat > symbian/app/src/crash_gl.cpp <<'CR_EOF'
           // EGL / OpenGL ES 2.0 host for the GLES2 GPU backend (replaces the EAGL part of ios_host.m).
-          // EGL display/config/surface/context are created on the UI thread (PSym_GlInit); the emulation thread
-          // binds the context (plat_gl_make_current) and swaps buffers (PSym_GlSwap).
+          // EGL display/config/surface/context are all created on the emulation thread (plat_gl_make_current); the UI thread
+          // only hands over the RWindow (PSym_GlInit). The same thread swaps buffers (PSym_GlSwap).
           #include <e32std.h>
           #include <w32std.h>
           #include <EGL/egl.h>
@@ -1190,40 +1190,69 @@ jobs:
               return eglChooseConfig(gDpy, aAttr, &gCfg, 1, &n) && n > 0;
               }
 
+          extern "C" void plat_fatal(const char *msg);
+          static void *gWin = NULL;
+
+          // UI thread: only remembers the RWindow. A window surface must be created, made current and swapped on ONE thread
+          // (swapping a surface that another thread created hangs eglSwapBuffers on Symbian^3), so the emulation thread builds
+          // every EGL object itself in plat_gl_make_current().
           extern "C" const char *PSym_GlInit(void *aWindow)
               {
+              gWin = aWindow;
+              return NULL;
+              }
+
+          // Emulation thread: creates display, config, window surface and context, makes them current (cheap afterwards).
+          extern "C" void plat_gl_make_current(void)
+              {
+              if (gCurrent) return;
+              plat_log("[EGL] creating display/surface/context on the emulation thread");
               gDpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
-              if (gDpy == EGL_NO_DISPLAY) return "EGL: no display";
+              if (gDpy == EGL_NO_DISPLAY) plat_fatal("EGL: no display");
               EGLint maj = 0, min = 0;
-              if (!eglInitialize(gDpy, &maj, &min)) return "EGL: eglInitialize failed";
+              if (!eglInitialize(gDpy, &maj, &min)) plat_fatal("EGL: eglInitialize failed");
+              {
+                  const char *ev = eglQueryString(gDpy, EGL_VENDOR), *evr = eglQueryString(gDpy, EGL_VERSION), *ec = eglQueryString(gDpy, EGL_CLIENT_APIS);
+                  plat_log("[EGL] initialised %d.%d vendor=%s version=%s apis=%s", (int)maj, (int)min, ev ? ev : "?", evr ? evr : "?", ec ? ec : "?");
+              }
               eglBindAPI(EGL_OPENGL_ES_API);
 
               const EGLint a565[] = { EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
                                       EGL_RED_SIZE, 5, EGL_GREEN_SIZE, 6, EGL_BLUE_SIZE, 5, EGL_NONE };
               const EGLint aAny[] = { EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT, EGL_NONE };
-              if (!ChooseCfg(a565) && !ChooseCfg(aAny)) return "EGL: no OpenGL ES 2.0 window config (device without GLES2?)";
-
-              gSurf = eglCreateWindowSurface(gDpy, gCfg, (EGLNativeWindowType)aWindow, NULL);
-              if (gSurf == EGL_NO_SURFACE) return "EGL: eglCreateWindowSurface failed";
-
-              const EGLint ctxAttr[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
-              gCtx = eglCreateContext(gDpy, gCfg, EGL_NO_CONTEXT, ctxAttr);
-              if (gCtx == EGL_NO_CONTEXT) return "EGL: eglCreateContext (ES 2.0) failed";
-
-              eglQuerySurface(gDpy, gSurf, EGL_WIDTH, &gW);
-              eglQuerySurface(gDpy, gSurf, EGL_HEIGHT, &gH);
-              return NULL;
+              if (!ChooseCfg(a565) && !ChooseCfg(aAny)) plat_fatal("EGL: no OpenGL ES 2.0 window config (device without GLES2?)");
+              {
+                  EGLint id = 0, r = 0, g = 0, b = 0, a = 0, d = 0, st = 0;
+                  eglGetConfigAttrib(gDpy, gCfg, EGL_CONFIG_ID, &id);
+                  eglGetConfigAttrib(gDpy, gCfg, EGL_RED_SIZE, &r); eglGetConfigAttrib(gDpy, gCfg, EGL_GREEN_SIZE, &g);
+                  eglGetConfigAttrib(gDpy, gCfg, EGL_BLUE_SIZE, &b); eglGetConfigAttrib(gDpy, gCfg, EGL_ALPHA_SIZE, &a);
+                  eglGetConfigAttrib(gDpy, gCfg, EGL_DEPTH_SIZE, &d); eglGetConfigAttrib(gDpy, gCfg, EGL_STENCIL_SIZE, &st);
+                  plat_log("[EGL] config id=%d rgba=%d/%d/%d/%d depth=%d stencil=%d", (int)id, (int)r, (int)g, (int)b, (int)a, (int)d, (int)st);
               }
 
-          // Emulation thread: first call binds the context to this thread (cheap afterwards).
-          extern "C" void plat_gl_make_current(void)
-              {
-              if (gCurrent) return;
-              eglBindAPI(EGL_OPENGL_ES_API);
+              gSurf = eglCreateWindowSurface(gDpy, gCfg, (EGLNativeWindowType)gWin, NULL);
+              if (gSurf == EGL_NO_SURFACE)
+                  {
+                  plat_log("[EGL] eglCreateWindowSurface failed: 0x%x", (unsigned)eglGetError());
+                  plat_fatal("EGL: eglCreateWindowSurface failed (see crash.log)");
+                  }
+
+              plat_log("[EGL] window surface created");
+              const EGLint ctxAttr[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+              gCtx = eglCreateContext(gDpy, gCfg, EGL_NO_CONTEXT, ctxAttr);
+              if (gCtx == EGL_NO_CONTEXT) plat_fatal("EGL: eglCreateContext (ES 2.0) failed");
+
+              plat_log("[EGL] context created, making current ...");
               if (!eglMakeCurrent(gDpy, gSurf, gSurf, gCtx))
+                  {
                   plat_log("[EGL] eglMakeCurrent failed: 0x%x", (unsigned)eglGetError());
-              else
-                  gCurrent = 1;
+                  plat_fatal("EGL: eglMakeCurrent failed (see crash.log)");
+                  }
+              eglQuerySurface(gDpy, gSurf, EGL_WIDTH, &gW);
+              eglQuerySurface(gDpy, gSurf, EGL_HEIGHT, &gH);
+              EGLBoolean si = eglSwapInterval(gDpy, 0);       // never block on the compositor's vsync (frameclock throttles)
+              plat_log("[EGL] ready: EGL %d.%d, surface %dx%d, swapInterval(0)=%d", (int)maj, (int)min, (int)gW, (int)gH, (int)si);
+              gCurrent = 1;
               }
 
           extern "C" void plat_gl_screen(int *fbo, int *w, int *h)
@@ -1272,6 +1301,14 @@ jobs:
               {
               plat_log("[EXC] exception type=%d cp=%s last_call=0x%08x", (int)aType, plat_get_cp(), plat_last_call());
               User::Panic(_L("CrashExc"), (TInt)aType);
+              }
+
+          extern "C" void PSym_LogHeap(const char *aTag)
+              {
+              RHeap& h = User::Heap();
+              TInt biggest = 0;
+              TInt avail = h.Available(biggest);
+              plat_log("[HEAP] %s: size=%d max=%d free=%d biggest_free=%d", aTag, (int)h.Size(), (int)h.MaxLength(), (int)avail, (int)biggest);
               }
 
           extern "C" void PSym_InstallExcHandler(void)
@@ -1335,6 +1372,7 @@ jobs:
 
           static char g_base[300], g_cue[420], g_saves[420], g_logpath[420];
           static FILE *g_logf;
+          static uint64_t g_log_t0;
           static pthread_mutex_t g_log_mx = PTHREAD_MUTEX_INITIALIZER;
           static char g_err[220];
           static volatile int g_has_err;
@@ -1343,8 +1381,9 @@ jobs:
           void plat_log(const char *fmt, ...)
           {
               pthread_mutex_lock(&g_log_mx);
-              if (!g_logf && g_logpath[0]) g_logf = fopen(g_logpath, "w");
+              if (!g_logf && g_logpath[0]) { g_logf = fopen(g_logpath, "w"); g_log_t0 = plat_time_ns(); }
               if (g_logf) {
+                  fprintf(g_logf, "[%6u] ", (unsigned)((plat_time_ns() - g_log_t0) / 1000000ull));   /* ms since launch */
                   va_list a; va_start(a, fmt);
                   vfprintf(g_logf, fmt, a);
                   va_end(a);
@@ -1387,6 +1426,7 @@ jobs:
                   } else if (tick <= 15 || (tick % 30) == 0) {
                       plat_log("[WD] t=%us ok: frames=%d last_call=0x%08X cp=%s", secs, (int)fr, lc, g_cp);
                   }
+                  if (tick == 1 || tick == 5 || (tick % 30) == 0) PSym_LogHeap("watchdog");
               }
               return NULL;
           }
@@ -1470,6 +1510,7 @@ jobs:
           {
               (void)arg;
               plat_log("[THREAD] emulation thread started");
+              PSym_LogHeap("emulation thread");
               PSym_InstallExcHandler();
               plat_cp("runtime_run_game");
               runtime_run_game();
@@ -1491,11 +1532,18 @@ jobs:
               snprintf(g_base, sizeof g_base, "%s", basedir);
               snprintf(g_saves, sizeof g_saves, "%s/saves", g_base);
               snprintf(g_logpath, sizeof g_logpath, "%s/crash.log", g_base);
+              {   /* keep the previous run (the one that crashed) as crash_prev.log */
+                  char prev[420];
+                  snprintf(prev, sizeof prev, "%s/crash_prev.log", g_base);
+                  remove(prev);
+                  rename(g_logpath, prev);
+              }
               mkdir(g_saves, 0755);
 
               if (!find_cue(g_base, g_cue, sizeof g_cue)) return fail("No .cue file in the crashbandicoot folder.");
 
               plat_log("---- launch, cue=%s", g_cue);
+              PSym_LogHeap("ui thread at launch");
               pthread_attr_t at;
               pthread_attr_init(&at);
               pthread_attr_setstacksize(&at, 1024 * 1024);
@@ -1560,6 +1608,7 @@ jobs:
 
           /* Crash diagnostics: exception handler for the calling thread (C++), breadcrumbs (psx_sym.c). */
           void PSym_InstallExcHandler(void);
+          void PSym_LogHeap(const char *tag);            /* [HEAP] size / max / free / biggest free block of the calling thread's heap */
           void plat_cp(const char *stage);
           const char *plat_get_cp(void);
           unsigned plat_last_call(void);
@@ -1579,6 +1628,7 @@ jobs:
 
           void PSym_SleepUs(unsigned us) { usleep(us); }
           void PSym_InstallExcHandler(void) {}
+          void PSym_LogHeap(const char *t) { (void)t; }
           void plat_gl_make_current(void) {}
           void plat_gl_screen(int *fbo, int *w, int *h) { *fbo = 0; *w = 640; *h = 360; }
           int PSym_GlSwap(void) { return 1; }
