@@ -785,6 +785,8 @@ jobs:
                   return;
                   }
 
+              PSym_UiPresent();                       // the UI thread owns the EGL window surface: draw the newest frame + swap
+
               TUint now = User::NTickCount();
               TUint elapsed = now - iLastTick;
               iLastTick = now;
@@ -1163,9 +1165,11 @@ jobs:
           CR_EOF
           mkdir -p symbian/app/src
           cat > symbian/app/src/crash_gl.cpp <<'CR_EOF'
-          // EGL / OpenGL ES 2.0 host for the GLES2 GPU backend (replaces the EAGL part of ios_host.m).
-          // EGL display/config/surface/context are all created on the emulation thread (plat_gl_make_current); the UI thread
-          // only hands over the RWindow (PSym_GlInit). The same thread swaps buffers (PSym_GlSwap).
+          // EGL / OpenGL ES 2.0 host for the GLES2 GPU backend.
+          // Threading model (Symbian^3 / Broadcom VideoCore III): the EGL *window surface* is created, made current and swapped
+          // ONLY on the UI thread (creating or swapping it from another thread hangs forever on this hardware). The emulation
+          // thread gets its own context that SHARES objects with the UI context, bound to a 1x1 pbuffer: it renders VRAM into a
+          // texture and never touches the window. The UI thread draws that texture to the window and swaps (PSym_UiPresent).
           #include <e32std.h>
           #include <w32std.h>
           #include <EGL/egl.h>
@@ -1173,86 +1177,117 @@ jobs:
 
           extern "C" {
           void plat_log(const char *fmt, ...);
+          void plat_fatal(const char *msg);
           void plat_gl_make_current(void);
           void plat_gl_screen(int *fbo, int *w, int *h);
           }
 
           static EGLDisplay gDpy = EGL_NO_DISPLAY;
-          static EGLSurface gSurf = EGL_NO_SURFACE;
-          static EGLContext gCtx = EGL_NO_CONTEXT;
-          static EGLConfig gCfg;
-          static volatile int gCurrent = 0;
+          static EGLSurface gSurf = EGL_NO_SURFACE, gPb = EGL_NO_SURFACE;
+          static EGLContext gCtxUi = EGL_NO_CONTEXT, gCtxEmu = EGL_NO_CONTEXT;
+          static EGLConfig gCfg, gCfgPb;
+          static volatile int gEmuCurrent = 0, gUiReady = 0;
           static int gW = 640, gH = 360;
 
-          static EGLBoolean ChooseCfg(const EGLint* aAttr)
+          static EGLBoolean Choose(const EGLint* aAttr, EGLConfig* aOut)
               {
               EGLint n = 0;
-              return eglChooseConfig(gDpy, aAttr, &gCfg, 1, &n) && n > 0;
+              return eglChooseConfig(gDpy, aAttr, aOut, 1, &n) && n > 0;
               }
 
-          extern "C" void plat_fatal(const char *msg);
-          static void *gWin = NULL;
+          static void LogCfg(const char* aTag, EGLConfig aCfg)
+              {
+              EGLint id = 0, r = 0, g = 0, b = 0, a = 0, d = 0, st = 0, ty = 0;
+              eglGetConfigAttrib(gDpy, aCfg, EGL_CONFIG_ID, &id);
+              eglGetConfigAttrib(gDpy, aCfg, EGL_RED_SIZE, &r);   eglGetConfigAttrib(gDpy, aCfg, EGL_GREEN_SIZE, &g);
+              eglGetConfigAttrib(gDpy, aCfg, EGL_BLUE_SIZE, &b);  eglGetConfigAttrib(gDpy, aCfg, EGL_ALPHA_SIZE, &a);
+              eglGetConfigAttrib(gDpy, aCfg, EGL_DEPTH_SIZE, &d); eglGetConfigAttrib(gDpy, aCfg, EGL_STENCIL_SIZE, &st);
+              eglGetConfigAttrib(gDpy, aCfg, EGL_SURFACE_TYPE, &ty);
+              plat_log("[EGL] %s config id=%d rgba=%d/%d/%d/%d depth=%d stencil=%d surfaceType=0x%x", aTag, (int)id, (int)r, (int)g, (int)b, (int)a, (int)d, (int)st, (unsigned)ty);
+              }
 
-          // UI thread: only remembers the RWindow. A window surface must be created, made current and swapped on ONE thread
-          // (swapping a surface that another thread created hangs eglSwapBuffers on Symbian^3), so the emulation thread builds
-          // every EGL object itself in plat_gl_make_current().
+          // UI thread, before the emulation thread exists.
           extern "C" const char *PSym_GlInit(void *aWindow)
               {
-              gWin = aWindow;
-              return NULL;
-              }
-
-          // Emulation thread: creates display, config, window surface and context, makes them current (cheap afterwards).
-          extern "C" void plat_gl_make_current(void)
-              {
-              if (gCurrent) return;
-              plat_log("[EGL] creating display/surface/context on the emulation thread");
+              plat_log("[EGL] init on the UI thread");
               gDpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
-              if (gDpy == EGL_NO_DISPLAY) plat_fatal("EGL: no display");
+              if (gDpy == EGL_NO_DISPLAY) return "EGL: no display";
               EGLint maj = 0, min = 0;
-              if (!eglInitialize(gDpy, &maj, &min)) plat_fatal("EGL: eglInitialize failed");
+              if (!eglInitialize(gDpy, &maj, &min)) return "EGL: eglInitialize failed";
               {
                   const char *ev = eglQueryString(gDpy, EGL_VENDOR), *evr = eglQueryString(gDpy, EGL_VERSION), *ec = eglQueryString(gDpy, EGL_CLIENT_APIS);
                   plat_log("[EGL] initialised %d.%d vendor=%s version=%s apis=%s", (int)maj, (int)min, ev ? ev : "?", evr ? evr : "?", ec ? ec : "?");
               }
               eglBindAPI(EGL_OPENGL_ES_API);
 
-              const EGLint a565[] = { EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
-                                      EGL_RED_SIZE, 5, EGL_GREEN_SIZE, 6, EGL_BLUE_SIZE, 5, EGL_NONE };
-              const EGLint aAny[] = { EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT, EGL_NONE };
-              if (!ChooseCfg(a565) && !ChooseCfg(aAny)) plat_fatal("EGL: no OpenGL ES 2.0 window config (device without GLES2?)");
-              {
-                  EGLint id = 0, r = 0, g = 0, b = 0, a = 0, d = 0, st = 0;
-                  eglGetConfigAttrib(gDpy, gCfg, EGL_CONFIG_ID, &id);
-                  eglGetConfigAttrib(gDpy, gCfg, EGL_RED_SIZE, &r); eglGetConfigAttrib(gDpy, gCfg, EGL_GREEN_SIZE, &g);
-                  eglGetConfigAttrib(gDpy, gCfg, EGL_BLUE_SIZE, &b); eglGetConfigAttrib(gDpy, gCfg, EGL_ALPHA_SIZE, &a);
-                  eglGetConfigAttrib(gDpy, gCfg, EGL_DEPTH_SIZE, &d); eglGetConfigAttrib(gDpy, gCfg, EGL_STENCIL_SIZE, &st);
-                  plat_log("[EGL] config id=%d rgba=%d/%d/%d/%d depth=%d stencil=%d", (int)id, (int)r, (int)g, (int)b, (int)a, (int)d, (int)st);
-              }
+              const EGLint wp565[] = { EGL_SURFACE_TYPE, EGL_WINDOW_BIT | EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+                                       EGL_RED_SIZE, 5, EGL_GREEN_SIZE, 6, EGL_BLUE_SIZE, 5, EGL_NONE };
+              const EGLint wpAny[] = { EGL_SURFACE_TYPE, EGL_WINDOW_BIT | EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT, EGL_NONE };
+              const EGLint w565[]  = { EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+                                       EGL_RED_SIZE, 5, EGL_GREEN_SIZE, 6, EGL_BLUE_SIZE, 5, EGL_NONE };
+              const EGLint wAny[]  = { EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT, EGL_NONE };
+              const EGLint pAny[]  = { EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT, EGL_NONE };
+              bool one = false;
+              if (Choose(wp565, &gCfg) || Choose(wpAny, &gCfg)) { gCfgPb = gCfg; one = true; }
+              else if (Choose(w565, &gCfg) || Choose(wAny, &gCfg))
+                  {
+                  if (!Choose(pAny, &gCfgPb)) return "EGL: no pbuffer config for the emulation thread";
+                  }
+              else return "EGL: no OpenGL ES 2.0 window config (device without GLES2?)";
+              LogCfg(one ? "window+pbuffer" : "window", gCfg);
+              if (!one) LogCfg("pbuffer", gCfgPb);
 
-              gSurf = eglCreateWindowSurface(gDpy, gCfg, (EGLNativeWindowType)gWin, NULL);
+              gSurf = eglCreateWindowSurface(gDpy, gCfg, (EGLNativeWindowType)aWindow, NULL);
               if (gSurf == EGL_NO_SURFACE)
                   {
                   plat_log("[EGL] eglCreateWindowSurface failed: 0x%x", (unsigned)eglGetError());
-                  plat_fatal("EGL: eglCreateWindowSurface failed (see crash.log)");
+                  return "EGL: eglCreateWindowSurface failed";
                   }
-
               plat_log("[EGL] window surface created");
-              const EGLint ctxAttr[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
-              gCtx = eglCreateContext(gDpy, gCfg, EGL_NO_CONTEXT, ctxAttr);
-              if (gCtx == EGL_NO_CONTEXT) plat_fatal("EGL: eglCreateContext (ES 2.0) failed");
 
-              plat_log("[EGL] context created, making current ...");
-              if (!eglMakeCurrent(gDpy, gSurf, gSurf, gCtx))
+              const EGLint ctxAttr[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+              gCtxUi = eglCreateContext(gDpy, gCfg, EGL_NO_CONTEXT, ctxAttr);
+              if (gCtxUi == EGL_NO_CONTEXT) return "EGL: eglCreateContext (ES 2.0) failed";
+              if (!eglMakeCurrent(gDpy, gSurf, gSurf, gCtxUi))
                   {
-                  plat_log("[EGL] eglMakeCurrent failed: 0x%x", (unsigned)eglGetError());
-                  plat_fatal("EGL: eglMakeCurrent failed (see crash.log)");
+                  plat_log("[EGL] UI eglMakeCurrent failed: 0x%x", (unsigned)eglGetError());
+                  return "EGL: eglMakeCurrent failed on the UI thread";
                   }
               eglQuerySurface(gDpy, gSurf, EGL_WIDTH, &gW);
               eglQuerySurface(gDpy, gSurf, EGL_HEIGHT, &gH);
-              EGLBoolean si = eglSwapInterval(gDpy, 0);       // never block on the compositor's vsync (frameclock throttles)
-              plat_log("[EGL] ready: EGL %d.%d, surface %dx%d, swapInterval(0)=%d", (int)maj, (int)min, (int)gW, (int)gH, (int)si);
-              gCurrent = 1;
+              EGLBoolean si = eglSwapInterval(gDpy, 0);          // frameclock throttles the game; never wait for the compositor
+              plat_log("[EGL] UI context current, surface %dx%d, swapInterval(0)=%d", (int)gW, (int)gH, (int)si);
+
+              const EGLint pbAttr[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
+              gPb = eglCreatePbufferSurface(gDpy, gCfgPb, pbAttr);
+              if (gPb == EGL_NO_SURFACE)
+                  plat_log("[EGL] eglCreatePbufferSurface failed: 0x%x (the emulation thread will try a surfaceless context)", (unsigned)eglGetError());
+              else
+                  plat_log("[EGL] pbuffer surface created");
+              gCtxEmu = eglCreateContext(gDpy, gCfgPb, gCtxUi, ctxAttr);     // shares textures / programs with the UI context
+              if (gCtxEmu == EGL_NO_CONTEXT)
+                  {
+                  plat_log("[EGL] shared eglCreateContext failed: 0x%x", (unsigned)eglGetError());
+                  return "EGL: cannot create the shared context for the emulation thread";
+                  }
+              plat_log("[EGL] shared context for the emulation thread created");
+              gUiReady = 1;
+              return NULL;
+              }
+
+          // Emulation thread: binds its shared context (to the pbuffer). Cheap afterwards.
+          extern "C" void plat_gl_make_current(void)
+              {
+              if (gEmuCurrent) return;
+              eglBindAPI(EGL_OPENGL_ES_API);
+              plat_log("[EGL] emulation thread: making the shared context current (%s) ...", gPb == EGL_NO_SURFACE ? "surfaceless" : "pbuffer");
+              if (!eglMakeCurrent(gDpy, gPb, gPb, gCtxEmu))
+                  {
+                  plat_log("[EGL] emulation eglMakeCurrent failed: 0x%x", (unsigned)eglGetError());
+                  plat_fatal("EGL: eglMakeCurrent failed on the emulation thread (see crash.log)");
+                  }
+              gEmuCurrent = 1;
+              plat_log("[EGL] emulation context current");
               }
 
           extern "C" void plat_gl_screen(int *fbo, int *w, int *h)
@@ -1262,9 +1297,10 @@ jobs:
               *h = gH;
               }
 
+          // UI thread only.
           extern "C" int PSym_GlSwap(void)
               {
-              if (!gCurrent) return 0;
+              if (!gUiReady) return 0;
               if (!eglSwapBuffers(gDpy, gSurf))
                   {
                   static int logged;
@@ -1300,6 +1336,7 @@ jobs:
           static void CrashExcHandler(TExcType aType)
               {
               plat_log("[EXC] exception type=%d cp=%s last_call=0x%08x", (int)aType, plat_get_cp(), plat_last_call());
+              plat_dump_state();
               User::Panic(_L("CrashExc"), (TInt)aType);
               }
 
@@ -1408,24 +1445,43 @@ jobs:
           const char *plat_get_cp(void) { return g_cp; }
           unsigned plat_last_call(void) { return (unsigned)g_last_call_addr; }
 
+          static const char *volatile g_ui_cp = "ui: idle";
+          static volatile unsigned g_ui_ticks;
+          void plat_ui_cp(const char *s) { g_ui_cp = s; }
+          void dispatch_dump_ring(void);
+          void gpu_log_stats(void);
+
+          /* Everything we know about where the game / renderer / UI are right now (watchdog stall + CPU exception). */
+          void plat_dump_state(void)
+          {
+              plat_log("[STATE] emu cp=%s | ui cp=%s ui_ticks=%u | last_call=0x%08X frames=%d paused=%d", g_cp, g_ui_cp, g_ui_ticks,
+                       (unsigned)g_last_call_addr, (int)g_present_calls, (int)g_paused);
+              dispatch_dump_ring();
+              gpu_log_stats();
+          }
+
           static void *wd_main(void *arg)
           {
               (void)arg;
-              int64_t last_frames = -1; unsigned last_call = 0xFFFFFFFFu, tick = 0, still = 0;
+              int64_t last_frames = -1; unsigned last_call = 0xFFFFFFFFu, tick = 0, still = 0, last_ui = 0xFFFFFFFFu, ui_still = 0;
               const uint64_t t0 = plat_time_ns();
               for (;;) {
                   PSym_SleepUs(2000000);
                   tick++;
                   const int64_t fr = g_present_calls;
-                  const unsigned lc = (unsigned)g_last_call_addr, secs = (unsigned)((plat_time_ns() - t0) / 1000000000ull);
+                  const unsigned lc = (unsigned)g_last_call_addr, ut = g_ui_ticks, secs = (unsigned)((plat_time_ns() - t0) / 1000000000ull);
                   still = (fr != last_frames || lc != last_call) ? 0 : still + 1;
-                  last_frames = fr; last_call = lc;
+                  ui_still = (ut != last_ui) ? 0 : ui_still + 1;
+                  last_frames = fr; last_call = lc; last_ui = ut;
                   if (still >= 1) {
                       if (still <= 5 || (still % 15) == 0)
-                          plat_log("[WD] t=%us STALL x%u: frames=%d last_call=0x%08X cp=%s paused=%d err=%d", secs, still, (int)fr, lc, g_cp, (int)g_paused, (int)g_has_err);
+                          plat_log("[WD] t=%us EMU STALL x%u: frames=%d last_call=0x%08X cp=%s paused=%d err=%d", secs, still, (int)fr, lc, g_cp, (int)g_paused, (int)g_has_err);
+                      if (still == 1 || still == 6) plat_dump_state();
                   } else if (tick <= 15 || (tick % 30) == 0) {
-                      plat_log("[WD] t=%us ok: frames=%d last_call=0x%08X cp=%s", secs, (int)fr, lc, g_cp);
+                      plat_log("[WD] t=%us ok: frames=%d last_call=0x%08X cp=%s ui_ticks=%u", secs, (int)fr, lc, g_cp, ut);
                   }
+                  if (ui_still >= 3 && (ui_still == 3 || (ui_still % 15) == 0))
+                      plat_log("[WD] t=%us UI thread: no ticks for %us, ui cp=%s (normal only in the menu / background)", secs, ui_still * 2, g_ui_cp);
                   if (tick == 1 || tick == 5 || (tick % 30) == 0) PSym_LogHeap("watchdog");
               }
               return NULL;
@@ -1455,16 +1511,32 @@ jobs:
 
           /* The GLES2 backend keeps VRAM on the GPU: draw the display rectangle and swap. */
           void gpu_present(int dx, int dy, int dw, int dh, bool rgb24, bool enabled);
+          int  gpu_ui_present(void);          /* UI thread: draw the last published frame into the window, 1 = something to swap */
 
           void plat_present(const uint16_t *vram, int dx, int dy, int dw, int dh, bool rgb24, bool enabled)
           {
               static int n;
               (void)vram;
               while (g_paused && !g_has_err) PSym_SleepUs(10000);
-              gpu_present(dx, dy, dw, dh, rgb24, enabled);
-              if (n < 3) plat_log("[EGL] swap #%d ...", n + 1);
+              gpu_present(dx, dy, dw, dh, rgb24, enabled);      /* emulation thread: only publishes the frame (no EGL window calls) */
+              if (n < 3) plat_log("[PRESENT] frame #%d published to the UI thread", n + 1);
+              n++;
+          }
+
+          /* UI thread (called from the container's tick): draw the newest published frame and swap. */
+          void PSym_UiPresent(void)
+          {
+              static int n, first;
+              if (!g_started || g_has_err) return;
+              g_ui_ticks++;
+              if (!first) { first = 1; plat_log("[UI] first tick"); PSym_LogHeap("ui first tick"); }
+              plat_ui_cp("ui: gpu_ui_present");
+              if (!gpu_ui_present()) { plat_ui_cp("ui: idle"); return; }
+              if (n < 3) plat_log("[UI] swap #%d ...", n + 1);
+              plat_ui_cp("ui: eglSwapBuffers");
               int ok = PSym_GlSwap();
-              if (n < 3) plat_log("[EGL] swap #%d returned %d", n + 1, ok);
+              plat_ui_cp("ui: idle");
+              if (n < 3) plat_log("[UI] swap #%d returned %d", n + 1, ok);
               n++;
           }
 
@@ -1608,6 +1680,9 @@ jobs:
 
           /* Crash diagnostics: exception handler for the calling thread (C++), breadcrumbs (psx_sym.c). */
           void PSym_InstallExcHandler(void);
+          void PSym_UiPresent(void);                      /* UI thread: show the newest emulated frame (draw + eglSwapBuffers) */
+          void plat_ui_cp(const char *stage);             /* UI-thread breadcrumb */
+          void plat_dump_state(void);                     /* [STATE] cp's + last dispatched functions + GPU counters */
           void PSym_LogHeap(const char *tag);            /* [HEAP] size / max / free / biggest free block of the calling thread's heap */
           void plat_cp(const char *stage);
           const char *plat_get_cp(void);
@@ -1903,6 +1978,104 @@ jobs:
               s += "\n/* GLES2-COMPAT applied */\n"
               return s
 
+          # ---------------------------------------------------------------- UI-thread display (Symbian: the emulation thread must not touch the window)
+          def apply_ui_present(s):
+              if "gpu_ui_present" in s:
+                  return s
+              a = s.index("void gpu_present(int dx, int dy, int dw, int dh, bool rgb24, bool enabled)\n{")
+              c0 = s.index("    int fbo = 0, sw = 0, sh = 0;\n", a)
+              c1 = s.index("    uint64_t t_end = plat_time_ns();", c0)
+              body = s[c0:c1]
+              assert "glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);" in body and "glUseProgram(pd.id);" in body, "present body shape"
+              ui = r"""/* Display hand-off (Symbian): the emulation thread only renders VRAM into tex_a and publishes the display rectangle; the UI
+           * thread, which owns the EGL window surface, draws tex_a (shared between the two contexts) into the window and swaps. */
+          static volatile int pres_dx, pres_dy, pres_dw, pres_dh;
+          static volatile bool pres_rgb24, pres_en;
+          static volatile unsigned pres_seq;
+
+          void gpu_log_stats(void)
+          {
+              plat_log("[GPU] stats: frames=%u published=%u draws=%u tris=%u syncs=%u uploads=%u reads=%u fills=%u copies=%u ready=%d",
+                       st_frames, pres_seq, st_draws, st_tris, st_syncs, st_uploads, st_reads, st_fills, st_copies, (int)gl_ready);
+          }
+
+          int gpu_ui_present(void)
+          {
+              static unsigned seen;
+              static int logged;
+              const unsigned seq = pres_seq;
+              if (seq == seen || !pd.id || !tex_a) return 0;
+              seen = seq;
+              int dx = pres_dx, dy = pres_dy, dw = pres_dw, dh = pres_dh;
+              const bool rgb24 = pres_rgb24, enabled = pres_en;
+              int fbo = 0, sw = 0, sh = 0;
+              plat_gl_screen(&fbo, &sw, &sh);
+              plat_ui_cp("ui: bind + clear");
+              glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)fbo);
+              glViewport(0, 0, sw, sh);
+              glDisable(GL_SCISSOR_TEST);
+              glDisable(GL_BLEND);
+              glClearColor(0, 0, 0, 1);
+              glClear(GL_COLOR_BUFFER_BIT);
+              plat_ui_cp("ui: draw display quad");
+
+              if (enabled && dw > 0 && dh > 0 && sw > 0 && sh > 0) {
+                  if (dw > VRAM_W) dw = VRAM_W;
+                  if (dh > VRAM_H) dh = VRAM_H;
+                  dx &= VRAM_W - 1; dy &= VRAM_H - 1;
+                  float vw = (float)sw, vh = (float)sh, fx, fy;          /* fit 4:3 inside the view */
+                  if (vw / vh > 4.0f / 3.0f) { fy = 1.0f; fx = (vh * 4.0f / 3.0f) / vw; }
+                  else { fx = 1.0f; fy = (vw * 3.0f / 4.0f) / vh; }
+                  float quad[16] = { -fx, -fy, 0, 1,   fx, -fy, 1, 1,   -fx, fy, 0, 0,   fx, fy, 1, 0 };
+                  glUseProgram(pd.id);
+                  glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex_a);
+                  glUniform1i(pd.vram, 0);
+                  glUniform4f(pd.rect, (float)dx, (float)dy, (float)dw, (float)dh);
+                  glUniform1f(pd.rgb24, rgb24 ? 1.0f : 0.0f);
+                  glBindBuffer(GL_ARRAY_BUFFER, 0);
+                  glEnableVertexAttribArray(0); glDisableVertexAttribArray(1); glEnableVertexAttribArray(2); glDisableVertexAttribArray(3);
+                  glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, quad);
+                  glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 16, quad + 2);
+                  glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+              }
+              if (logged < 3) {
+                  logged++;
+                  plat_log("[UI] display pass #%d: rect=(%d,%d %dx%d) enabled=%d rgb24=%d screen=%dx%d glError=0x%x",
+                           logged, dx, dy, dw, dh, enabled ? 1 : 0, rgb24 ? 1 : 0, sw, sh, (unsigned)glGetError());
+              }
+              plat_ui_cp("ui: drawn");
+              return 1;
+          }
+
+          """
+              pub = ("    glFlush();                               /* make this frame visible to the UI thread's (shared) context */\n"
+                     "    pres_dx = dx; pres_dy = dy; pres_dw = dw; pres_dh = dh; pres_rgb24 = rgb24; pres_en = enabled;\n"
+                     "    pres_seq++;\n"
+                     "    if (st_frames < 5 || (st_frames % 600) == 0) {\n"
+                     "        GLenum e = glGetError();\n"
+                     "        plat_log(\"[GPU] present #%u: published seq=%u glError=0x%x draws=%u tris=%u uploads=%u fills=%u copies=%u\", st_frames + 1, pres_seq, (unsigned)e, st_draws, st_tris, st_uploads, st_fills, st_copies);\n"
+                     "    }\n\n")
+              s = s[:a] + ui + s[a:c0] + pub + s[c1:]
+              for old, new in (
+                  ("void plat_gl_screen(int *fbo, int *w, int *h);\n",
+                   "void plat_gl_screen(int *fbo, int *w, int *h);\nvoid plat_cp(const char *stage);        /* breadcrumbs for crash.log (psx_sym.c) */\nvoid plat_ui_cp(const char *stage);\n"),
+                  ("    GLuint v = compile_shader(GL_VERTEX_SHADER, vs, name);\n",
+                   "    plat_log(\"[GPU] building program %s ...\", name);\n    plat_cp(name);\n    GLuint v = compile_shader(GL_VERTEX_SHADER, vs, name);\n"),
+                  ("    make_tex(&tex_b, GL_NEAREST, scr_a);\n",
+                   "    make_tex(&tex_b, GL_NEAREST, scr_a);\n    plat_log(\"[GPU] init: VRAM textures tex_a=%u tex_b=%u glError=0x%x\", (unsigned)tex_a, (unsigned)tex_b, (unsigned)glGetError());\n"),
+                  ("    glBindFramebuffer(GL_FRAMEBUFFER, fbo_a);\n\n    plat_log(\"[GPU] init: building shaders\");\n",
+                   "    glBindFramebuffer(GL_FRAMEBUFFER, fbo_a);\n    plat_log(\"[GPU] init: FBOs complete (fbo_a=%u fbo_b=%u) glError=0x%x\", (unsigned)fbo_a, (unsigned)fbo_b, (unsigned)glGetError());\n\n    plat_log(\"[GPU] init: building shaders\");\n"),
+                  ("    glUseProgram(pf.id); glUniform1i(pf.vram, 0);      /* never change */\n",
+                   "    plat_log(\"[GPU] init: shaders built, glError=0x%x\", (unsigned)glGetError());\n    glUseProgram(pf.id); glUniform1i(pf.vram, 0);      /* never change */\n"),
+                  ("    gl_ready = true;\n    plat_log(\"[GPU] GLES2 renderer ready",
+                   "    plat_log(\"[GPU] init: initial clear done, glError=0x%x\", (unsigned)glGetError());\n    gl_ready = true;\n    plat_log(\"[GPU] GLES2 renderer ready"),
+                  ("    plat_gl_make_current();          /* creates the EAGL context on the emulation thread */\n    gl_init();\n",
+                   "    plat_cp(\"gpu_init: make_current\");\n    plat_gl_make_current();          /* creates the EAGL context on the emulation thread */\n    plat_cp(\"gpu_init: gl_init\");\n    gl_init();\n    plat_cp(\"gpu_init: done\");\n"),
+              ):
+                  assert s.count(old) == 1, "gpu log anchor: " + old[:50]
+                  s = s.replace(old, new, 1)
+              return s
+
           # ---------------------------------------------------------------- psx.h
           p = N + "/src/psx.h"
           s = rd(p)
@@ -1996,6 +2169,7 @@ jobs:
               s = s.replace(old, new, 1)
               assert "glCopyTexSubImage2D(GL_TEXTURE_2D" not in s
           s = apply_gles2_compat(s)
+          s = apply_ui_present(s)
           wr(p, s)
 
           # ---------------------------------------------------------------- dispatch.c: stage breadcrumbs + first-frame log
@@ -2005,6 +2179,15 @@ jobs:
               a = "#include <pthread.h>\n"
               assert a in s, "dispatch.c include anchor"
               s = s.replace(a, a + "extern void plat_cp(const char *stage);   /* Symbian crash breadcrumbs (psx_sym.c) */\n", 1)
+              a2 = "volatile uint32_t g_last_call_addr;\n"
+              assert s.count(a2) == 1, "dispatch.c g_last_call_addr anchor"
+              s = s.replace(a2, a2 + "volatile uint32_t g_call_ring[16];   /* last 16 dispatched function addresses (crash diagnostics) */\n", 1)
+              a3 = "    g_last_call_addr = addr;\n"
+              assert s.count(a3) == 1, "dispatch.c call anchor"
+              s = s.replace(a3, a3 + "    g_call_ring[g_call_count & 15u] = addr;\n", 1)
+              s += ("\nvoid dispatch_dump_ring(void)\n{\n    char buf[16 * 9 + 4]; int n = 0;\n    const uint32_t i0 = (uint32_t)(g_call_count & 15u);\n"
+                    "    for (uint32_t k = 0; k < 16; k++) n += snprintf(buf + n, sizeof buf - (size_t)n, \"%08X \", (unsigned)g_call_ring[(i0 + k) & 15u]);\n"
+                    "    LOG(\"[CALLS] last 16 dispatched functions (oldest -> newest): %s| total calls=%u\", buf, (unsigned)g_call_count);\n}\n")
               old = ("    plat_present(g_vram, x, y, w, h, rgb24, en);\n    frameclock_throttle();\n    libcd_tick();\n"
                      "    cd_advance_streaming();\n    bios_refresh_pad();\n    libpad_refresh();\n    irq_deliver(0, &g_cpu);\n}")
               assert s.count(old) == 1, "dispatch.c present anchor"
