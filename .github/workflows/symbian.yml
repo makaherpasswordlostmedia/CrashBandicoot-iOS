@@ -31,6 +31,16 @@ on:
           - "-O2"
           - "-Os"
           - "-O3"
+      runner:
+        description: "macOS runner label for the Symbian build (try another one if the job is never picked up)"
+        required: true
+        default: "macos-15"
+        type: choice
+        options:
+          - "macos-15"
+          - "macos-14"
+          - "macos-latest"
+          - "macos-26"
 
 permissions:
   contents: read
@@ -2295,7 +2305,7 @@ jobs:
   build-sis:
     name: Build crashrecomp.sisx
     needs: sources
-    runs-on: ${{ vars.MACOS_RUNNER || 'macos-latest' }}
+    runs-on: ${{ inputs.runner || vars.MACOS_RUNNER || 'macos-latest' }}
     timeout-minutes: 360
     steps:
       - uses: actions/download-artifact@v4
