@@ -1196,7 +1196,7 @@ jobs:
           static EGLSurface gSurf = EGL_NO_SURFACE, gPb = EGL_NO_SURFACE;
           static EGLContext gCtxUi = EGL_NO_CONTEXT, gCtxEmu = EGL_NO_CONTEXT;
           static EGLConfig gCfg, gCfgPb;
-          static volatile int gEmuCurrent = 0, gUiReady = 0;
+          static volatile int gEmuCurrent = 0, gUiReady = 0, gSingle = 0;
           static int gW = 640, gH = 360;
 
           static EGLBoolean Choose(const EGLint* aAttr, EGLConfig* aOut)
@@ -1278,7 +1278,13 @@ jobs:
               if (gCtxEmu == EGL_NO_CONTEXT)
                   {
                   plat_log("[EGL] shared eglCreateContext failed: 0x%x", (unsigned)eglGetError());
-                  return "EGL: cannot create the shared context for the emulation thread";
+                  // Emulators (EKA2L1) cannot share contexts between threads: single-context mode. The emulation thread takes the
+                  // window context and presents itself; the UI thread stops touching GL.
+                  eglMakeCurrent(gDpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+                  gSingle = 1;
+                  plat_log("[EGL] SINGLE-CONTEXT mode: the emulation thread owns the window context and swaps");
+                  gUiReady = 1;
+                  return NULL;
                   }
               plat_log("[EGL] shared context for the emulation thread created");
               gUiReady = 1;
@@ -1291,7 +1297,7 @@ jobs:
               if (gEmuCurrent) return;
               eglBindAPI(EGL_OPENGL_ES_API);
               plat_log("[EGL] emulation thread: making the shared context current (%s) ...", gPb == EGL_NO_SURFACE ? "surfaceless" : "pbuffer");
-              if (!eglMakeCurrent(gDpy, gPb, gPb, gCtxEmu))
+              if (gSingle ? !eglMakeCurrent(gDpy, gSurf, gSurf, gCtxUi) : !eglMakeCurrent(gDpy, gPb, gPb, gCtxEmu))
                   {
                   plat_log("[EGL] emulation eglMakeCurrent failed: 0x%x", (unsigned)eglGetError());
                   plat_fatal("EGL: eglMakeCurrent failed on the emulation thread (see crash.log)");
@@ -1307,7 +1313,9 @@ jobs:
               *h = gH;
               }
 
-          // UI thread only.
+          extern "C" int PSym_GlSingle(void) { return gSingle; }
+
+          // UI thread only (emulation thread in single-context mode).
           extern "C" int PSym_GlSwap(void)
               {
               if (!gUiReady) return 0;
@@ -1540,6 +1548,7 @@ jobs:
           {
               static int n, first;
               if (!g_started || g_has_err) return;
+              if (PSym_GlSingle()) return;           /* single-context mode: the emulation thread presents */
               g_ui_ticks++;
               if (!first) { first = 1; plat_log("[UI] first tick"); PSym_LogHeap("ui first tick"); }
               plat_ui_cp("ui: gpu_ui_present");
@@ -1691,6 +1700,7 @@ jobs:
            * and returns NULL on success or an error text. The context is made current on the emulation thread. */
           const char *PSym_GlInit(void *rwindow);
           int  PSym_GlSwap(void);
+          int  PSym_GlSingle(void);                  /* 1 = no shared EGL context (emulator): the emulation thread presents */
 
           /* 44.1 kHz stereo PCM16: frames * 2 samples. */
           void PSym_MixAudio(short *dst, int frames);
@@ -1727,6 +1737,7 @@ jobs:
           void plat_gl_make_current(void) {}
           void plat_gl_screen(int *fbo, int *w, int *h) { *fbo = 0; *w = 640; *h = 360; }
           int PSym_GlSwap(void) { return 1; }
+          int PSym_GlSingle(void) { return 0; }
           const char *PSym_GlInit(void *w) { (void)w; return 0; }
 
           int main(int argc, char **argv)
@@ -2308,6 +2319,19 @@ jobs:
           static unsigned dx_quota[3][3][2], dx_seen[3][3][2], dx_seen_tw, dx_seen_semi, dx_seen_mask;
           static DxStat dx_stat[3][3][2];
 
+          /* DX diagnostics only run when a file gpudiag.txt exists next to the .cue (same switch as the older heavy diagnostics) */
+          static int dx_flag(void)
+          {
+              static int v = -1;
+              if (v < 0) {
+                  static const char *const paths[] = { "E:/crashbandicoot/gpudiag.txt", "E:/CrashBandicoot/gpudiag.txt", "C:/crashbandicoot/gpudiag.txt", "gpudiag.txt" };
+                  v = 0;
+                  for (unsigned i = 0; i < sizeof paths / sizeof *paths && !v; i++) { FILE *f = fopen(paths[i], "rb"); if (f) { fclose(f); v = 1; } }
+                  plat_log("[DX] diagnostics %s (create gpudiag.txt next to the .cue file to enable selftest + probes)", v ? "ENABLED" : "off");
+              }
+              return v;
+          }
+
           static inline int dx_abs(int a) { return a < 0 ? -a : a; }
           static inline uint16_t dx_word(int x, int y) { return dx_vram[(size_t)(y & (VRAM_H - 1)) * VRAM_W + (x & (VRAM_W - 1))]; }
 
@@ -2515,6 +2539,7 @@ jobs:
 
           static void dx_frame_end(unsigned frame)
           {
+              if (!dx_flag()) return;
               if (dx_active) {
                   dx_summary(frame);
                   dx_active = 0; dx_pend.on = 0;
@@ -2560,7 +2585,9 @@ jobs:
               dx_clear_area(AX, AY, AW, AH);
               Vert pv[3]; GVert g[3];
               for (int i = 0; i < 3; i++) { pv[i].x = C->x[i]; pv[i].y = C->y[i]; pv[i].r = C->c[i][0]; pv[i].g = C->c[i][1]; pv[i].b = C->c[i][2]; pv[i].u = C->u[i]; pv[i].v = C->v[i]; g[i] = mkv(&pv[i]); }
+              plat_log("[DX] case '%s': drawing ...", C->name);
               submit(g, 3, 0, true, false, C->raw != 0, C->dither != 0, clut);
+              plat_log("[DX] case '%s': glReadPixels ...", C->name);
               read_rect_rgba(AX, AY, AW, AH, img);
 
               DxPrim P; memset(&P, 0, sizeof P);
@@ -2631,6 +2658,7 @@ jobs:
                       if (mode == 2) { g[i].u = 65471.0f; g[i].v = 40000.0f; }
                       else { g[i].u = i == 1 ? 255.0f : 0.0f; g[i].v = i == 2 ? 255.0f : 0.0f; }
                   }
+                  plat_log("[DX] interp test %d/%d ...", sh * 3 + mode + 1, 9);
                   dx_clear_area(AX, AY, AW, AH);
                   bind_vram_target();
                   glDisable(GL_BLEND);
@@ -2678,6 +2706,7 @@ jobs:
           {
               if (dx_selftest_done) return;
               dx_selftest_done = 1;
+              if (!dx_flag()) return;
               if (!dx_alloc()) { plat_log("[DX] selftest: out of memory"); return; }
               uint8_t *img = (uint8_t *)malloc((size_t)400 * 256 * 4);
               uint8_t *save = (uint8_t *)malloc((size_t)VRAM_W * VRAM_H * 4);
@@ -2696,7 +2725,9 @@ jobs:
               const bool s_dith = dither_on, s_sm = set_mask, s_cm = check_mask;
               const unsigned s_stat[7] = { st_draws, st_tris, st_syncs, st_uploads, st_reads, st_fills, st_copies };
               unsigned s_fr[FR_N]; memcpy(s_fr, st_fr, sizeof s_fr);
+              plat_log("[DX] saving VRAM (glReadPixels 1024x512) ...");
               read_rect_rgba(0, 0, VRAM_W, VRAM_H, save);
+              plat_log("[DX] VRAM saved, uploading reference textures ...");
               set_mask = check_mask = false;
               memset(dx_vram, 0, (size_t)VRAM_W * VRAM_H * 2);
               /* reference VRAM: 4-bit page (512,0) 64w, 8-bit page (576,0) 128w, 15-bit page (704,0) 256w, CLUT rows (512,300) and (512,301) */
@@ -2721,7 +2752,9 @@ jobs:
                   { "4bit  triangle > VRAM",     0, 1, 0, 0, 0, 0, 0, 0, { -300, 500, -300 },{ 260, 260, 700 }, { 0, 250, 0 }, { 0, 0, 250 }, { {128,128,128}, {128,128,128}, {128,128,128} } },
               };
               for (unsigned i = 0; i < sizeof CASES / sizeof CASES[0]; i++) dx_run_case(&CASES[i], img);
+              plat_log("[DX] interpolation tests ...");
               dx_interp_tests(img);
+              plat_log("[DX] restoring VRAM ...");
               /* restore */
               dx_clear_area(0, 0, VRAM_W, VRAM_H);
               upload_piece(0, 0, VRAM_W, VRAM_H, save);
@@ -2737,6 +2770,19 @@ jobs:
           }
           '''
               s += "\n/* DIAG2 applied */\n"
+              return s
+
+          # ---------------------------------------------------------------- single-context mode (emulators cannot share EGL contexts)
+          def apply_single_ctx(s):
+              if "PSym_GlSingle" in s:
+                  return s
+              old = "    pres_seq++;\n"
+              assert s.count(old) == 1, "single-ctx anchor: %d" % s.count(old)
+              s = s.replace(old, old + "    if (PSym_GlSingle()) {                   /* no shared context (EKA2L1): this thread owns the window, present here */\n"
+                                        "        gpu_ui_present();\n        gl_invalidate();\n        PSym_GlSwap();\n    }\n", 1)
+              old = "static volatile int pres_dx, pres_dy, pres_dw, pres_dh;\n"
+              assert s.count(old) == 1, "single-ctx proto anchor"
+              s = s.replace(old, "int PSym_GlSingle(void);\nint PSym_GlSwap(void);\n" + old, 1)
               return s
 
           # ---------------------------------------------------------------- UI-thread display (Symbian: the emulation thread must not touch the window)
@@ -3010,6 +3056,7 @@ jobs:
           s = apply_tex_diag(s)
           s = apply_perf_tex(s)
           s = apply_diag2(s)
+          s = apply_single_ctx(s)
           wr(p, s)
 
           # ---------------------------------------------------------------- dispatch.c: stage breadcrumbs + first-frame log
