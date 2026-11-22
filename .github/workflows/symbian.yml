@@ -1258,15 +1258,9 @@ jobs:
               const EGLint ctxAttr[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
               gCtxUi = eglCreateContext(gDpy, gCfg, EGL_NO_CONTEXT, ctxAttr);
               if (gCtxUi == EGL_NO_CONTEXT) return "EGL: eglCreateContext (ES 2.0) failed";
-              if (!eglMakeCurrent(gDpy, gSurf, gSurf, gCtxUi))
-                  {
-                  plat_log("[EGL] UI eglMakeCurrent failed: 0x%x", (unsigned)eglGetError());
-                  return "EGL: eglMakeCurrent failed on the UI thread";
-                  }
               eglQuerySurface(gDpy, gSurf, EGL_WIDTH, &gW);
               eglQuerySurface(gDpy, gSurf, EGL_HEIGHT, &gH);
-              EGLBoolean si = eglSwapInterval(gDpy, 0);          // frameclock throttles the game; never wait for the compositor
-              plat_log("[EGL] UI context current, surface %dx%d, swapInterval(0)=%d", (int)gW, (int)gH, (int)si);
+              plat_log("[EGL] surface %dx%d (UI context is made current only after the shared context exists)", (int)gW, (int)gH);
 
               const EGLint pbAttr[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
               gPb = eglCreatePbufferSurface(gDpy, gCfgPb, pbAttr);
@@ -1278,15 +1272,21 @@ jobs:
               if (gCtxEmu == EGL_NO_CONTEXT)
                   {
                   plat_log("[EGL] shared eglCreateContext failed: 0x%x", (unsigned)eglGetError());
-                  // Emulators (EKA2L1) cannot share contexts between threads: single-context mode. The emulation thread takes the
-                  // window context and presents itself; the UI thread stops touching GL.
-                  eglMakeCurrent(gDpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+                  // Emulators (EKA2L1) cannot share contexts: single-context mode, like the older working design. Nothing was made current on
+                  // the UI thread; the emulation thread binds the window context and presents itself, the UI thread stays out of GL.
                   gSingle = 1;
                   plat_log("[EGL] SINGLE-CONTEXT mode: the emulation thread owns the window context and swaps");
                   gUiReady = 1;
                   return NULL;
                   }
               plat_log("[EGL] shared context for the emulation thread created");
+              if (!eglMakeCurrent(gDpy, gSurf, gSurf, gCtxUi))
+                  {
+                  plat_log("[EGL] UI eglMakeCurrent failed: 0x%x", (unsigned)eglGetError());
+                  return "EGL: eglMakeCurrent failed on the UI thread";
+                  }
+              EGLBoolean si = eglSwapInterval(gDpy, 0);          // frameclock throttles the game; never wait for the compositor
+              plat_log("[EGL] UI context current, swapInterval(0)=%d", (int)si);
               gUiReady = 1;
               return NULL;
               }
@@ -2282,7 +2282,13 @@ jobs:
                   "static void dx_pre(const GVert *v, int n, bool tex, bool semi, bool raw, bool dither, int depth, int clutx, int cluty, const Key *kb);\n"
                   "static void dx_post(void);\n"
                   "static void dx_frame_end(unsigned frame);\n"
-                  "static void dx_selftest_once(void);\n\n"
+                  "static void dx_selftest_once(void);\n"
+                  "/* EKA2L1 (Symbian emulator): glReadPixels based diagnostics hang or are unimplemented there, so they are skipped */\n"
+                  "static int dx_emu(void)\n{\n    static int v = -1;\n"
+                  "    if (v < 0) {\n        const char *r = (const char *)glGetString(GL_RENDERER);\n"
+                  "        v = (r && strstr(r, \"EKA2L1\")) ? 1 : 0;\n"
+                  "        if (v) plat_log(\"[DX] EKA2L1 emulator detected: glReadPixels diagnostics (selftest, probes, VRAM dumps) are disabled\");\n"
+                  "    }\n    return v;\n}\n\n"
                   "/* Queue n (<= 6) vertices. tex/semi/raw/dither describe the primitive, prim 0=triangles 1=lines. */\n", "fwd")
               rep("    GVert tv[6];\n    memcpy(tv, v, (size_t)n * sizeof(GVert));\n",
                   "    dx_pre(v, n, tex, semi, raw, dither, depth, clutx, cluty, &kb);\n"
@@ -2292,7 +2298,7 @@ jobs:
               rep("{\n    uint64_t t_begin = plat_time_ns();\n    flush_batch();\n    const uint64_t t_fb",
                   "{\n    dx_selftest_once();\n    uint64_t t_begin = plat_time_ns();\n    flush_batch();\n    const uint64_t t_fb", "selftest hook")
               rep("    if (st_frames == 150 || st_frames == 600 || st_frames == 1500) diag_vram(st_frames);\n",
-                  "    if (st_frames == 150 || st_frames == 600 || st_frames == 1500) diag_vram(st_frames);\n    dx_frame_end(st_frames);\n", "frame hook")
+                  "    if (!dx_emu() && (st_frames == 150 || st_frames == 600 || st_frames == 1500)) diag_vram(st_frames);\n    dx_frame_end(st_frames);\n", "frame hook")
 
               s += r'''
           /* ====================================================================== DIAG2
@@ -2327,6 +2333,7 @@ jobs:
                   static const char *const paths[] = { "E:/crashbandicoot/gpudiag.txt", "E:/CrashBandicoot/gpudiag.txt", "C:/crashbandicoot/gpudiag.txt", "gpudiag.txt" };
                   v = 0;
                   for (unsigned i = 0; i < sizeof paths / sizeof *paths && !v; i++) { FILE *f = fopen(paths[i], "rb"); if (f) { fclose(f); v = 1; } }
+                  if (v && dx_emu()) v = 0;
                   plat_log("[DX] diagnostics %s (create gpudiag.txt next to the .cue file to enable selftest + probes)", v ? "ENABLED" : "off");
               }
               return v;
