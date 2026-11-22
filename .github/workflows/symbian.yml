@@ -1460,6 +1460,7 @@ jobs:
           void plat_ui_cp(const char *s) { g_ui_cp = s; }
           void dispatch_dump_ring(void);
           void gpu_log_stats(void);
+          void disc_log_stats(void);
 
           /* Everything we know about where the game / renderer / UI are right now (watchdog stall + CPU exception). */
           void plat_dump_state(void)
@@ -1468,6 +1469,7 @@ jobs:
                        (unsigned)g_last_call_addr, (int)g_present_calls, (int)g_paused);
               dispatch_dump_ring();
               gpu_log_stats();
+              disc_log_stats();
           }
 
           static void *wd_main(void *arg)
@@ -1544,8 +1546,14 @@ jobs:
               if (!gpu_ui_present()) { plat_ui_cp("ui: idle"); return; }
               if (n < 3) plat_log("[UI] swap #%d ...", n + 1);
               plat_ui_cp("ui: eglSwapBuffers");
+              const uint64_t ts = plat_time_ns();
               int ok = PSym_GlSwap();
+              const uint64_t dts = plat_time_ns() - ts;
               plat_ui_cp("ui: idle");
+              {
+                  static int slow;
+                  if (dts > 100000000ull && slow++ < 40) plat_log("[SLOW] eglSwapBuffers took %u ms (ui_ticks=%u)", (unsigned)(dts / 1000000ull), g_ui_ticks);
+              }
               if (n < 3) plat_log("[UI] swap #%d returned %d", n + 1, ok);
               n++;
           }
@@ -1607,6 +1615,8 @@ jobs:
               g_has_err = 1;
               return -1;
           }
+
+          void plat_dump_path(char *out, unsigned n, const char *name) { snprintf(out, n, "%s/%s", g_base, name); }
 
           int PSym_Start(const char *basedir)
           {
@@ -1988,6 +1998,747 @@ jobs:
               s += "\n/* GLES2-COMPAT applied */\n"
               return s
 
+
+          # ---------------------------------------------------------------- fewer forced flushes: 32x32 occupancy grid per bucket
+          def apply_bucket_grid(s):
+              if "BKGRID" in s:
+                  return s
+              def rep(old, new, what):
+                  nonlocal s
+                  assert s.count(old) == 1, "bucket grid anchor (%s): count=%d" % (what, s.count(old))
+                  s = s.replace(old, new, 1)
+              rep("typedef struct { Key k; int n; int x0, y0, x1, y1; GVert v[BUCKV]; } Bucket;",
+                  "typedef struct { Key k; int n; int x0, y0, x1, y1; uint32_t cells[16]; GVert v[BUCKV]; } Bucket;   /* BKGRID */",
+                  "Bucket")
+              rep("/* Copy n vertices (already carrying tp/cl) into the bucket for key k.",
+                  "/* BKGRID: 32x32-pixel cell occupancy (32 x 16 cells = 512 bits). Conservative: a primitive marks every cell its\n"
+                  " * bounding box touches, so two buckets whose cell sets are disjoint can never overlap and may be reordered. */\n"
+                  "static void bk_cells(uint32_t *m, int x0, int y0, int x1, int y1)\n"
+                  "{\n"
+                  "    for (int i = 0; i < 16; i++) m[i] = 0;\n"
+                  "    int cx0 = imax(x0 >> 5, 0), cx1 = imin(x1 >> 5, 31), cy0 = imax(y0 >> 5, 0), cy1 = imin(y1 >> 5, 15);\n"
+                  "    for (int cy = cy0; cy <= cy1; cy++) {\n"
+                  "        uint32_t mask = 0;\n"
+                  "        for (int cx = cx0; cx <= cx1; cx++) mask |= 1u << cx;\n"
+                  "        m[cy] |= mask;\n"
+                  "    }\n"
+                  "}\n"
+                  "static bool bk_hit(const uint32_t *a, const uint32_t *b)\n"
+                  "{\n"
+                  "    for (int i = 0; i < 16; i++) if (a[i] & b[i]) return true;\n"
+                  "    return false;\n"
+                  "}\n\n"
+                  "/* Copy n vertices (already carrying tp/cl) into the bucket for key k.", "helpers")
+              rep("    int i;\n    for (i = 0; i < nbk; i++)\n        if (memcmp(&bk[i].k, k, sizeof *k) == 0) break;\n",
+                  "    int i;\n    uint32_t pm[16];\n    bk_cells(pm, x0, y0, x1, y1);\n"
+                  "    for (i = 0; i < nbk; i++)\n        if (memcmp(&bk[i].k, k, sizeof *k) == 0) break;\n", "pm")
+              rep("                if (x0 < bk[j].x1 && x1 > bk[j].x0 && y0 < bk[j].y1 && y1 > bk[j].y0) { st_fr[FR_PASS]++; bad = true; break; }",
+                  "                if (bk_hit(pm, bk[j].cells)) { st_fr[FR_PASS]++; bad = true; break; }", "hit")
+              rep("        bk[i].x0 = x0; bk[i].y0 = y0; bk[i].x1 = x1; bk[i].y1 = y1;\n",
+                  "        bk[i].x0 = x0; bk[i].y0 = y0; bk[i].x1 = x1; bk[i].y1 = y1;\n        memcpy(bk[i].cells, pm, sizeof pm);\n", "init")
+              rep("        if (y1 > bk[i].y1) bk[i].y1 = y1;\n    }\n",
+                  "        if (y1 > bk[i].y1) bk[i].y1 = y1;\n        for (int q = 0; q < 16; q++) bk[i].cells[q] |= pm[q];\n    }\n", "grow")
+              return s
+
+
+          # ---------------------------------------------------------------- texture diagnostics (logs + VRAM dumps)
+          def apply_tex_diag(s):
+              if "TEXDIAG" in s:
+                  return s
+              def rep(old, new, what):
+                  nonlocal s
+                  assert s.count(old) == 1, "texdiag anchor (%s): count=%d" % (what, s.count(old))
+                  s = s.replace(old, new, 1)
+              rep('    plat_log("[GPU] GL_RENDERER=%s", (const char *)glGetString(GL_RENDERER));\n',
+                  '    plat_log("[GPU] GL_RENDERER=%s", (const char *)glGetString(GL_RENDERER));\n'
+                  '    {   /* TEXDIAG */\n'
+                  '        const char *e = (const char *)glGetString(GL_EXTENSIONS); size_t el = e ? strlen(e) : 0;\n'
+                  '        GLint iv[4] = {0, 0, 0, 0};\n'
+                  '        plat_log("[GPU] GL_VERSION=%s | VENDOR=%s | GLSL=%s", (const char *)glGetString(GL_VERSION), (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION));\n'
+                  '        for (size_t o = 0; o < el && o < 1600; o += 180) plat_log("[GPU] EXT[%u] %.180s", (unsigned)(o / 180), e + o);\n'
+                  '        glGetIntegerv(GL_MAX_TEXTURE_SIZE, iv); glGetIntegerv(GL_MAX_VARYING_VECTORS, iv + 1);\n'
+                  '        glGetIntegerv(GL_MAX_FRAGMENT_UNIFORM_VECTORS, iv + 2); glGetIntegerv(GL_MAX_VERTEX_ATTRIBS, iv + 3);\n'
+                  '        plat_log("[GPU] limits: maxTex=%d varyings=%d fragUniforms=%d vattribs=%d", iv[0], iv[1], iv[2], iv[3]);\n'
+                  '        GLint r[2] = {0, 0}, pp = 0;\n'
+                  '        glGetShaderPrecisionFormat(GL_FRAGMENT_SHADER, GL_MEDIUM_FLOAT, r, &pp);\n'
+                  '        plat_log("[GPU] fragment mediump: range=2^%d precision=%d bits", (int)r[1], (int)pp);\n'
+                  '    }\n', "gl info")
+              # dump + stale-snapshot check
+              rep("static void upload_piece(int x, int y, int w, int h, const void *px)\n",
+                  "extern void plat_dump_path(char *out, unsigned n, const char *name);\n"
+                  "/* TEXDIAG: at a few frames write VRAM (render target) as 16-bit words to vram_<frame>.bin and compare it with the\n"
+                  " * sampling snapshot (tex_b): stale snapshot = wrong textures. */\n"
+                  "static void diag_vram(unsigned frame)\n"
+                  "{\n"
+                  "    read_rect_rgba(0, 0, VRAM_W, VRAM_H, scr_b);\n"
+                  "    glBindFramebuffer(GL_FRAMEBUFFER, fbo_b);\n"
+                  "    glPixelStorei(GL_PACK_ALIGNMENT, 4);\n"
+                  "    glReadPixels(0, 0, VRAM_W, VRAM_H, GL_RGBA, GL_UNSIGNED_BYTE, scr_a);\n"
+                  "    gl_invalidate();\n"
+                  "    uint16_t *w = (uint16_t *)scr_c;\n"
+                  "    unsigned diff = 0, outside = 0, ax0 = 9999, ay0 = 9999, ax1 = 0, ay1 = 0, zero = 0;\n"
+                  "    for (int y = 0; y < VRAM_H; y++) for (int x = 0; x < VRAM_W; x++) {\n"
+                  "        const uint8_t *a = scr_b + ((size_t)y * VRAM_W + x) * 4, *b = scr_a + ((size_t)y * VRAM_W + x) * 4;\n"
+                  "        w[(size_t)y * VRAM_W + x] = (uint16_t)((a[0] >> 3) | ((a[1] >> 3) << 5) | ((a[2] >> 3) << 10) | ((a[3] >= 128) << 15));\n"
+                  "        if (!(a[0] | a[1] | a[2] | a[3])) zero++;\n"
+                  "        if (memcmp(a, b, 4)) {\n"
+                  "            diff++;\n"
+                  "            if (x >= 640 || y >= 480) outside++;\n"
+                  "            if ((unsigned)x < ax0) ax0 = x; if ((unsigned)x > ax1) ax1 = x;\n"
+                  "            if ((unsigned)y < ay0) ay0 = y; if ((unsigned)y > ay1) ay1 = y;\n"
+                  "        }\n"
+                  "    }\n"
+                  "    plat_log(\"[TEXDIAG] frame %u: VRAM zero-words=%u, target!=snapshot words=%u (outside fb area=%u) bbox=(%u,%u)-(%u,%u)\", frame, zero, diff, outside, ax0, ay0, ax1, ay1);\n"
+                  "    char path[460]; char nm[32]; snprintf(nm, sizeof nm, \"vram_%u.bin\", frame);\n"
+                  "    plat_dump_path(path, sizeof path, nm);\n"
+                  "    FILE *f = fopen(path, \"wb\");\n"
+                  "    if (f) { size_t n = fwrite(w, 2, (size_t)VRAM_W * VRAM_H, f); fclose(f); plat_log(\"[TEXDIAG] wrote %s (%u words)\", nm, (unsigned)n); }\n"
+                  "    else plat_log(\"[TEXDIAG] cannot write %s\", nm);\n"
+                  "}\n\n"
+                  "static void upload_piece(int x, int y, int w, int h, const void *px)\n", "dump fn")
+              rep("    st_frames++;\n",
+                  "    st_frames++;\n"
+                  "    if (st_frames == 150 || st_frames == 600 || st_frames == 1500) diag_vram(st_frames);\n", "hook")
+              # per-primitive parameters of the first textured prims
+              rep("    for (int i = 0; i < n; i++) { tv[i].tpw = tpw; tv[i].clw = clw; }\n",
+                  "    for (int i = 0; i < n; i++) { tv[i].tpw = tpw; tv[i].clw = clw; }\n"
+                  "    if (tex) {   /* TEXDIAG */\n"
+                  "        static unsigned np; np++;\n"
+                  "        if (np <= 40 || (np % 20000) == 0)\n"
+                  "            plat_log(\"[TEXDIAG] prim#%u n=%d depth=%d raw=%d semi=%d dither=%d tp=(%d,%d) clut=(%d,%d) uv0=(%.1f,%.1f) uv1=(%.1f,%.1f) uv2=(%.1f,%.1f) xy0=(%.0f,%.0f) tpw=%.0f clw=%.0f\",\n"
+                  "                     np, n, (int)depth, raw ? 1 : 0, semi ? 1 : 0, dither ? 1 : 0, (int)tp_x, (int)tp_y, (int)clutx, (int)cluty,\n"
+                  "                     v[0].u, v[0].v, v[1].u, v[1].v, v[n > 2 ? 2 : 1].u, v[n > 2 ? 2 : 1].v, v[0].x, v[0].y, tpw, clw);\n"
+                  "    }\n", "prim log")
+              return s
+
+          # ---------------------------------------------------------------- texture robustness + fragment-shader cost (VideoCore III)
+          def apply_perf_tex(s):
+              if "PERFTEX" in s:
+                  return s
+              def rep(old, new, what):
+                  nonlocal s
+                  assert s.count(old) == 1, "perftex anchor (%s): count=%d" % (what, s.count(old))
+                  s = s.replace(old, new, 1)
+
+              # ---- 1. per-primitive state as 4 small bytes (each <= 63 / 31) instead of two floats up to 65471.
+              #         The state is a varying: every GPU interpolates it, and a 16-bit value needs a ~2^-17 accurate interpolator
+              #         to survive floor(x + 0.5). Values <= 63 only need 2^-8. -------------------------------------------------
+              rep("typedef struct { float x, y; uint8_t r, g, b, a; float u, v; float tpw, clw; } GVert;   /* 28 bytes, GLES2-COMPAT: float attribs only */",
+                  "typedef struct { float x, y; uint8_t r, g, b, a; float u, v; uint8_t pk[4]; } GVert;   /* 24 bytes, PERFTEX: pk = texpage/CLUT/flags as small bytes */", "GVert")
+              rep("    glVertexAttribPointer(3, 2, GL_FLOAT, GL_FALSE, sizeof(GVert), &p->tpw);\n",
+                  "    glVertexAttribPointer(3, 4, GL_UNSIGNED_BYTE, GL_FALSE, sizeof(GVert), p->pk);\n", "attrib ptr")
+              rep('"attribute vec2 a_pos; attribute vec4 a_col; attribute vec2 a_uv; attribute vec2 a_pk;\\n"',
+                  '"attribute vec2 a_pos; attribute vec4 a_col; attribute vec2 a_uv; attribute vec4 a_pk;\\n"', "VS attr")
+              rep('"varying vec4 v_col; varying vec2 v_uv; varying vec2 v_pk;\\n"\n    "void main(){ v_col',
+                  '"varying vec4 v_col; varying vec2 v_uv; varying vec4 v_pk;\\n"\n    "void main(){ v_col', "VS varying")
+              rep('"varying vec4 v_col; varying vec2 v_uv; varying vec2 v_pk;\\n"\n    "uniform sampler2D u_vram;\\n"',
+                  '"varying vec4 v_col; varying vec2 v_uv; varying vec4 v_pk;\\n"\n    "uniform sampler2D u_vram;\\n"', "FS varying")
+              # pk.x = texpage x/64 | y/256 << 4 ; pk.y = depth | raw << 2 | dither << 3 | clutY bit 8 << 4 ; pk.z = clut x/16 ; pk.w = clut y & 255
+              rep('    "  float clw = floor(v_pk.y + 0.5);\\n"\n'
+                  '    "  float c1 = floor(clw * 0.015625);\\n"\n'
+                  '    "  float u_dither = mod(floor(c1 * 0.001953125), 2.0);\\n";',
+                  '    "  vec4 pk = floor(v_pk + 0.5);\\n"\n'
+                  '    "  float u_dither = mod(floor(pk.y * 0.125), 2.0);\\n";', "MAIN_A")
+              rep('static const char FS_TEX_VARS[] =\n'
+                  '    "  float tpw = floor(v_pk.x + 0.5);\\n"\n'
+                  '    "  float t1 = floor(tpw * 0.0625); float t2 = floor(t1 * 0.5);\\n"\n'
+                  '    "  vec2 u_tp = vec2(mod(tpw, 16.0) * 64.0, mod(t1, 2.0) * 256.0);\\n"\n'
+                  '    "  float u_depth = mod(t2, 4.0); float u_raw = floor(t2 * 0.25);\\n"\n'
+                  '    "  vec2 u_clut = vec2(mod(clw, 64.0) * 16.0, mod(c1, 512.0));\\n";',
+                  'static const char FS_TEX_VARS[] =\n'
+                  '    "  vec2 u_tp = vec2(mod(pk.x, 16.0) * 64.0, floor(pk.x * 0.0625) * 256.0);\\n"\n'
+                  '    "  float u_depth = mod(pk.y, 4.0); float u_raw = mod(floor(pk.y * 0.25), 2.0);\\n"\n'
+                  '    "  vec2 u_clut = vec2(pk.z * 16.0, pk.w + floor(pk.y * 0.0625) * 256.0);\\n";', "TEX_VARS")
+              rep("    for (int i = 0; i < n; i++) { tv[i].tpw = tpw; tv[i].clw = clw; }\n",
+                  "    {   /* PERFTEX */\n"
+                  "        const uint8_t pk0 = (uint8_t)(tex ? ((tp_x >> 6) | ((tp_y >> 8) << 4)) : 0);\n"
+                  "        const uint8_t pk1 = (uint8_t)(depth | ((raw ? 1 : 0) << 2) | ((dither ? 1 : 0) << 3) | (((cluty >> 8) & 1) << 4));\n"
+                  "        const uint8_t pk2 = (uint8_t)((clutx >> 4) & 63);\n"
+                  "        const uint8_t pk3 = (uint8_t)(cluty & 255);\n"
+                  "        for (int i = 0; i < n; i++) { tv[i].pk[0] = pk0; tv[i].pk[1] = pk1; tv[i].pk[2] = pk2; tv[i].pk[3] = pk3; }\n"
+                  "    }\n", "submit pack")
+
+              # ---- 2. fragment shader: no per-pixel work for features the primitive does not use ------------------------------
+              #   * texture window (4 x band() = ~300 ALU ops when both sides of an `if` are executed): own program, selected by the
+              #     bucket key (Key.twin already splits buckets)
+              #   * colour depth: three varying-dependent branches (up to 5 texture reads when predicated) -> one arithmetic path,
+              #     always exactly 2 reads
+              a = s.index("static const char FS_TEX_DECL[] =")
+              b = s.index("static const char FS_MAIN_A[] =")
+              new_decl = r'''static const char FS_TEX_DECL[] =
+              "uniform float u_pass;\n"
+              "vec4 fetch(vec2 p){ p = mod(p, vec2(1024.0, 512.0));\n"
+              "  return texture2D(u_vram, (p + 0.5) * vec2(0.0009765625, 0.001953125)); }\n"
+              "vec4 bits(vec4 t){ return vec4(floor((t.rgb * 255.0 + 0.5) * 0.125), step(0.5, t.a)); }\n"
+              "float word(vec4 b){ return b.r + b.g * 32.0 + b.b * 1024.0 + b.a * 32768.0; }\n";
+
+          /* only in the texture-window program */
+          static const char FS_TW_DECL[] =
+              "uniform vec2 u_twand; uniform vec2 u_twor;\n"
+              "float bit1(float a, float b, float p){ return mod(floor(a / p), 2.0) * mod(floor(b / p), 2.0) * p; }\n"
+              "float band(float a, float b){\n"
+              "  return bit1(a, b, 1.0) + bit1(a, b, 2.0) + bit1(a, b, 4.0) + bit1(a, b, 8.0)\n"
+              "       + bit1(a, b, 16.0) + bit1(a, b, 32.0) + bit1(a, b, 64.0) + bit1(a, b, 128.0); }\n"
+              "float twin(float x, float a, float o){ float t = band(x, a); return t + o - band(t, o); }\n";
+
+          '''
+              s = s[:a] + new_decl + s[b:]
+
+              a = s.index("static const char FS_TEX_BODY[] =")
+              b = s.index("static const char FS_FLAT_BODY[] =")
+              new_body = r'''static const char FS_TEX_UV[] =
+              "  vec2 uv = floor(v_uv + 0.004);\n"
+              "  float u = mod(uv.x, 256.0); float v = mod(uv.y, 256.0);\n";
+
+          static const char FS_TEX_TWAPPLY[] =
+              "  u = twin(u, u_twand.x, u_twor.x); v = twin(v, u_twand.y, u_twor.y);\n";
+
+          /* d0/d1/d2 = depth 0 (4 bit), 1 (8 bit), 2 (15 bit); all selections are exact 0/1 blends of small integers */
+          static const char FS_TEX_DECODE[] =
+              "  float d0 = 1.0 - step(0.5, u_depth);\n"
+              "  float d2 = step(1.5, u_depth);\n"
+              "  float d1 = 1.0 - d0 - d2;\n"
+              "  float ipw = d0 * 0.25 + d1 * 0.5 + d2;\n"
+              "  float xo = floor(u * ipw);\n"
+              "  float sub = u - xo * (4.0 * d0 + 2.0 * d1 + d2);\n"
+              "  vec2 wa = vec2(u_tp.x + xo, u_tp.y + v);\n"
+              "  float wd = word(bits(fetch(wa)));\n"
+              "  float s0 = step(0.5, sub); float s1 = step(1.5, sub); float s2 = step(2.5, sub);\n"
+              "  float inv0 = 1.0 - s0 * 0.9375 - s1 * 0.05859375 - s2 * 0.003662109375;\n"
+              "  float inv1 = 1.0 - s0 * 0.99609375;\n"
+              "  float inv = d0 * inv0 + d1 * inv1 + d2;\n"
+              "  float idx = mod(floor(wd * inv), d0 * 16.0 + d1 * 256.0 + d2 * 65536.0);\n"
+              "  vec2 fa = mix(vec2(u_clut.x + idx, u_clut.y), wa, d2);\n"
+              "  vec4 tk = bits(fetch(fa));\n"
+              "  if (tk.r + tk.g + tk.b + tk.a < 0.5) discard;\n"
+              "  if (u_pass > 0.5 && u_pass < 1.5 && tk.a > 0.5) discard;\n"
+              "  if (u_pass > 1.5 && tk.a < 0.5) discard;\n"
+              "  alpha = max(alpha, tk.a);\n"
+              "  vec3 m = tk.rgb * 8.0;\n"
+              "  if (u_raw < 0.5) m = floor(m * c8 * 0.0078125);\n"
+              "  o = min(floor(clamp(m + d, 0.0, 255.0) * 0.125), 31.0);\n";
+
+          '''
+              s = s[:a] + new_body + s[b:]
+
+              rep("static char FS_FLAT_SRC[3072], FS_TEX_SRC[6144];",
+                  "static char FS_FLAT_SRC[3072], FS_TEX_SRC[6144], FS_TEXTW_SRC[8192];   /* PERFTEX: + texture-window variant */", "src buffers")
+              a = s.index("    int b = snprintf(FS_TEX_SRC")
+              b = s.index("    plat_log(\"[GPU] fragment shader sources:")
+              new_build = (
+                  '    int b = snprintf(FS_TEX_SRC, sizeof FS_TEX_SRC, "%s%s%s%s%s%s%s%s",\n'
+                  '                     FS_HEAD, FS_TEX_DECL, FS_MAIN_A, FS_TEX_VARS, FS_MAIN_B, FS_TEX_UV, FS_TEX_DECODE, FS_MAIN_END);\n'
+                  '    int c = snprintf(FS_TEXTW_SRC, sizeof FS_TEXTW_SRC, "%s%s%s%s%s%s%s%s%s",\n'
+                  '                     FS_HEAD, FS_TEX_DECL, FS_TW_DECL, FS_MAIN_A, FS_TEX_VARS, FS_MAIN_B, FS_TEX_UV, FS_TEX_TWAPPLY, FS_TEX_DECODE);\n'
+                  '    c += snprintf(FS_TEXTW_SRC + c, sizeof FS_TEXTW_SRC - (size_t)c, "%s", FS_MAIN_END);\n'
+                  '    if (a < 0 || a >= (int)sizeof FS_FLAT_SRC || b < 0 || b >= (int)sizeof FS_TEX_SRC || c < 0 || c >= (int)sizeof FS_TEXTW_SRC)\n'
+                  '        plat_fatal("GLES2: fragment shader source buffer too small");\n'
+                  '    plat_log("[GPU] fragment shader sources: flat %d, textured %d, textured+window %d bytes", a, b, c);\n')
+              # the old tail (size check + fatal + log) goes away together with the old call
+              old_tail_end = s.index("}\n", s.index("    plat_log(\"[GPU] fragment shader sources:"))
+              s = s[:a] + new_build + s[old_tail_end:]
+
+              rep("static Prog pf, pt, pd, pc;           /* flat, textured, display, vram-copy */",
+                  "static Prog pf, pt, ptw, pd, pc;      /* flat, textured, textured+texture-window, display, vram-copy */", "Prog decl")
+              rep('    build_prog(&pt, VS_MAIN, FS_TEX_SRC, "textured");\n',
+                  '    build_prog(&pt, VS_MAIN, FS_TEX_SRC, "textured");\n    build_prog(&ptw, VS_MAIN, FS_TEXTW_SRC, "textured-window");\n', "build ptw")
+              rep("    glUseProgram(pt.id); glUniform1i(pt.vram, 0);\n",
+                  "    glUseProgram(pt.id); glUniform1i(pt.vram, 0);\n    glUseProgram(ptw.id); glUniform1i(ptw.vram, 0);\n", "init ptw")
+              rep("    Prog *P = k->tex ? &pt : &pf;\n",
+                  "    Prog *P = k->tex ? (k->twin ? &ptw : &pt) : &pf;\n", "select prog")
+              rep("        u1f(P, 3, P->twin, k->twin ? 1.0f : 0.0f);\n"
+                  "        u2f(P, 4, P->twand, (float)k->twax, (float)k->tway);\n"
+                  "        u2f(P, 6, P->twor, (float)k->twox, (float)k->twoy);\n",
+                  "        if (k->twin) {\n"
+                  "            u2f(P, 4, P->twand, (float)k->twax, (float)k->tway);\n"
+                  "            u2f(P, 6, P->twor, (float)k->twox, (float)k->twoy);\n"
+                  "        }\n", "twin uniforms")
+              s += "\n/* PERFTEX applied */\n"
+              return s
+
+          # ---------------------------------------------------------------- DX diagnostics: GPU output vs CPU reference
+          def apply_diag2(s):
+              if "DIAG2" in s:
+                  return s
+              def rep(old, new, what):
+                  nonlocal s
+                  assert s.count(old) == 1, "diag2 anchor (%s): count=%d" % (what, s.count(old))
+                  s = s.replace(old, new, 1)
+
+              # forward declarations, right before submit()
+              rep("/* Queue n (<= 6) vertices. tex/semi/raw/dither describe the primitive, prim 0=triangles 1=lines. */\n",
+                  "/* DIAG2 hooks (defined at the end of the file) */\n"
+                  "static void dx_pre(const GVert *v, int n, bool tex, bool semi, bool raw, bool dither, int depth, int clutx, int cluty, const Key *kb);\n"
+                  "static void dx_post(void);\n"
+                  "static void dx_frame_end(unsigned frame);\n"
+                  "static void dx_selftest_once(void);\n\n"
+                  "/* Queue n (<= 6) vertices. tex/semi/raw/dither describe the primitive, prim 0=triangles 1=lines. */\n", "fwd")
+              rep("    GVert tv[6];\n    memcpy(tv, v, (size_t)n * sizeof(GVert));\n",
+                  "    dx_pre(v, n, tex, semi, raw, dither, depth, clutx, cluty, &kb);\n"
+                  "    GVert tv[6];\n    memcpy(tv, v, (size_t)n * sizeof(GVert));\n", "pre hook")
+              rep("        bucket_queue(&k, tv, n, bx0, by0, bx1, by1);\n    }\n    dirty_add(bx0, by0, bx1, by1);\n}\n",
+                  "        bucket_queue(&k, tv, n, bx0, by0, bx1, by1);\n    }\n    dirty_add(bx0, by0, bx1, by1);\n    dx_post();\n}\n", "post hook")
+              rep("{\n    uint64_t t_begin = plat_time_ns();\n    flush_batch();\n    const uint64_t t_fb",
+                  "{\n    dx_selftest_once();\n    uint64_t t_begin = plat_time_ns();\n    flush_batch();\n    const uint64_t t_fb", "selftest hook")
+              rep("    if (st_frames == 150 || st_frames == 600 || st_frames == 1500) diag_vram(st_frames);\n",
+                  "    if (st_frames == 150 || st_frames == 600 || st_frames == 1500) diag_vram(st_frames);\n    dx_frame_end(st_frames);\n", "frame hook")
+
+              s += r'''
+          /* ====================================================================== DIAG2
+           * Compares what the GPU drew with a CPU reference, and says WHERE they differ. grep the log for "[DX]".
+           *   1. dx_selftest_once(): at the first present, draws synthetic textured triangles (4/8/15 bit, texture window,
+           *      gouraud, triangle bigger than the VRAM) with a known random VRAM, reads the pixels back and checks every pixel
+           *      against the CPU. Also measures how accurately THIS GPU interpolates the per-primitive bytes and the UVs.
+           *      VRAM and GPU state are saved and restored.
+           *   2. probes: in the frame after present #150 and then every 1200 frames, up to 6 real textured triangles per
+           *      (depth, extent, size) class are checked at up to 4 pixels each (pixel before / after the draw vs. CPU texel).
+           * Categories: UV-OFF-BY-ONE (a neighbouring texel matches), DISCARDED (opaque texel expected, nothing drawn),
+           * OPAQUE-WHERE-TRANSPARENT, WRONG-COLOUR. For failures it also tells whether another colour depth / raw mode would match. */
+          static inline double dx_floor(double x) { long long i = (long long)x; return (double)(x < (double)i ? i - 1 : i); }
+          static inline double dx_sqrt(double x) { if (x <= 0.0) return 0.0; double r = x > 1.0 ? x * 0.5 : 1.0; for (int i = 0; i < 40; i++) r = 0.5 * (r + x / r); return r; }
+          typedef struct { int depth, tpx, tpy, clx, cly, raw, twin, twa[2], two[2], tol; } DxPrim;
+          typedef struct { unsigned n, ok, uvnb, disc, wopq, other, skip; } DxStat;
+          enum { DX_OK, DX_UVNB, DX_DISC, DX_WOPQ, DX_OTHER };
+          static const char *const dx_cname[5] = { "ok", "UV-OFF-BY-ONE", "DISCARDED", "OPAQUE-WHERE-TRANSPARENT", "WRONG-COLOUR" };
+
+          static uint16_t *dx_vram;           /* CPU copy of VRAM words (reference) */
+          static uint8_t *dx_rgba;            /* 1024*512*4 scratch */
+          static int dx_active, dx_selftest_done;
+          static unsigned dx_np, dx_fail_logged;
+          static unsigned dx_quota[3][3][2], dx_seen[3][3][2], dx_seen_tw, dx_seen_semi, dx_seen_mask;
+          static DxStat dx_stat[3][3][2];
+
+          static inline int dx_abs(int a) { return a < 0 ? -a : a; }
+          static inline uint16_t dx_word(int x, int y) { return dx_vram[(size_t)(y & (VRAM_H - 1)) * VRAM_W + (x & (VRAM_W - 1))]; }
+
+          static int dx_alloc(void)
+          {
+              if (!dx_vram) dx_vram = (uint16_t *)calloc((size_t)VRAM_W * VRAM_H, 2);
+              if (!dx_rgba) dx_rgba = (uint8_t *)malloc((size_t)VRAM_W * VRAM_H * 4);
+              return dx_vram && dx_rgba;
+          }
+
+          static uint16_t dx_texel(const DxPrim *P, int u, int v)
+          {
+              u &= 255; v &= 255;
+              if (P->twin) { u = (u & P->twa[0]) | P->two[0]; v = (v & P->twa[1]) | P->two[1]; }
+              if (P->depth == 0) { uint16_t w = dx_word(P->tpx + (u >> 2), P->tpy + v); return dx_word(P->clx + ((w >> ((u & 3) * 4)) & 15), P->cly); }
+              if (P->depth == 1) { uint16_t w = dx_word(P->tpx + (u >> 1), P->tpy + v); return dx_word(P->clx + ((w >> ((u & 1) * 8)) & 255), P->cly); }
+              return dx_word(P->tpx + u, P->tpy + v);
+          }
+
+          static int dx_color(uint16_t w, int raw, const int c8[3], int o[3])      /* 0 = transparent texel */
+          {
+              if (w == 0) return 0;
+              for (int i = 0; i < 3; i++) {
+                  int m = ((w >> (5 * i)) & 31) * 8;
+                  if (!raw) m = (m * c8[i]) >> 7;
+                  if (m > 255) m = 255;
+                  o[i] = imin(m >> 3, 31);
+              }
+              return 1;
+          }
+
+          static bool dx_same_rgb(const uint8_t *a, const uint8_t *b) { return a[0] == b[0] && a[1] == b[1] && a[2] == b[2]; }
+
+          static bool dx_match(const DxPrim *P, int u, int v, const int c8[3], const uint8_t *pre, const uint8_t *post)
+          {
+              int o[3];
+              if (!dx_color(dx_texel(P, u, v), P->raw, c8, o)) return dx_same_rgb(pre, post);
+              for (int i = 0; i < 3; i++) if (dx_abs((post[i] >> 3) - o[i]) > P->tol) return false;
+              return true;
+          }
+
+          static int dx_classify(const DxPrim *P, int u, int v, const int c8[3], const uint8_t *pre, const uint8_t *post, int *du, int *dv)
+          {
+              if (dx_match(P, u, v, c8, pre, post)) return DX_OK;
+              const bool same = dx_same_rgb(pre, post);
+              for (int b = -1; b <= 1; b++) for (int a = -1; a <= 1; a++) {
+                  if (!a && !b) continue;
+                  if (same && dx_texel(P, u + a, v + b) == 0) continue;     /* ambiguous with DISCARDED */
+                  if (dx_match(P, u + a, v + b, c8, pre, post)) { *du = a; *dv = b; return DX_UVNB; }
+              }
+              if (same) return DX_DISC;
+              if (dx_texel(P, u, v) == 0) return DX_WOPQ;
+              return DX_OTHER;
+          }
+
+          static void dx_count(DxStat *st, int cat) { st->n++; if (cat == DX_OK) st->ok++; else if (cat == DX_UVNB) st->uvnb++; else if (cat == DX_DISC) st->disc++; else if (cat == DX_WOPQ) st->wopq++; else st->other++; }
+
+          static void dx_log_fail(const char *tag, int cat, const DxPrim *P, int ix, int iy, double u, double v, int uq, int vq,
+                                  const int c8[3], const uint8_t *pre, const uint8_t *post, int du, int dv, int ext, int big)
+          {
+              const uint16_t w = dx_texel(P, uq, vq);
+              int o[3] = { 0, 0, 0 };
+              const int op = dx_color(w, P->raw, c8, o);
+              char alt[96]; alt[0] = 0;
+              for (int ad = 0; ad < 3; ad++) if (ad != P->depth) {
+                  DxPrim Q = *P; Q.depth = ad;
+                  if (dx_match(&Q, uq, vq, c8, pre, post)) { size_t l = strlen(alt); snprintf(alt + l, sizeof alt - l, " ALT-DEPTH=%d-MATCHES", ad); }
+              }
+              { DxPrim Q = *P; Q.raw = !P->raw;
+                if (dx_match(&Q, uq, vq, c8, pre, post)) { size_t l = strlen(alt); snprintf(alt + l, sizeof alt - l, " ALT-RAW-MATCHES"); } }
+              char nb[24]; nb[0] = 0;
+              if (cat == DX_UVNB) snprintf(nb, sizeof nb, " nb=(%d,%d)", du, dv);
+              plat_log("[DX] %s %s px=(%d,%d) uv=(%.3f,%.3f)->(%d,%d)%s depth=%d tp=(%d,%d) clut=(%d,%d) raw=%d tw=%d texel=%04X(%s) exp=%d,%d,%d got=%d,%d,%d pre=%d,%d,%d%s ext=%d big=%d",
+                       tag, dx_cname[cat], ix, iy, u, v, uq, vq, nb, P->depth, P->tpx, P->tpy, P->clx, P->cly, P->raw, P->twin, (unsigned)w,
+                       op ? "opaque" : "transparent", o[0], o[1], o[2], post[0] >> 3, post[1] >> 3, post[2] >> 3, pre[0] >> 3, pre[1] >> 3, pre[2] >> 3, alt, ext, big);
+          }
+
+          /* ---- triangle helpers (double precision, pixel centres, vertices already at x+0.5 / y+0.5) ---------------------- */
+          typedef struct { double x[3], y[3], a2, len[3]; } DxTri;
+          static int dx_tri_init(DxTri *T, const GVert *v)
+          {
+              for (int i = 0; i < 3; i++) { T->x[i] = v[i].x; T->y[i] = v[i].y; }
+              T->a2 = (T->x[1] - T->x[0]) * (T->y[2] - T->y[0]) - (T->y[1] - T->y[0]) * (T->x[2] - T->x[0]);
+              if (T->a2 > -1e-3 && T->a2 < 1e-3) return 0;
+              for (int i = 0; i < 3; i++) {
+                  const int j = (i + 1) % 3, k = (i + 2) % 3;
+                  const double dx = T->x[k] - T->x[j], dy = T->y[k] - T->y[j];
+                  T->len[i] = dx_sqrt(dx * dx + dy * dy);
+              }
+              return 1;
+          }
+          static void dx_bary(const DxTri *T, double px, double py, double l[3], double dist[3])
+          {
+              for (int i = 0; i < 3; i++) {
+                  const int j = (i + 1) % 3, k = (i + 2) % 3;
+                  const double a = (T->x[j] - px) * (T->y[k] - py) - (T->y[j] - py) * (T->x[k] - px);
+                  l[i] = a / T->a2;
+                  dist[i] = l[i] * (T->a2 < 0 ? -T->a2 : T->a2) / T->len[i];
+              }
+          }
+          static bool dx_inside_sure(const double d[3]) { return d[0] >= 0.75 && d[1] >= 0.75 && d[2] >= 0.75; }
+          static bool dx_outside_sure(const double d[3]) { return d[0] <= -0.75 || d[1] <= -0.75 || d[2] <= -0.75; }
+          static bool dx_ambiguous_uv(double u) { double t = u + 0.004; double r = dx_floor(t + 0.5); double e = t - r; return (e < 0 ? -e : e) < 0.003; }
+
+          /* ---- in-game probes -------------------------------------------------------------------------------------------- */
+          #define DX_MAXPT 4
+          static struct {
+              int on, n, depth, ext, big; unsigned id;
+              int px[DX_MAXPT], py[DX_MAXPT], c8[DX_MAXPT][3]; double u[DX_MAXPT], v[DX_MAXPT];
+              uint8_t pre[DX_MAXPT][4]; DxPrim P;
+          } dx_pend;
+
+          static void dx_pre(const GVert *v, int n, bool tex, bool semi, bool raw, bool dither, int depth, int clutx, int cluty, const Key *kb)
+          {
+              dx_pend.on = 0;
+              if (!dx_active || !tex || n < 3 || depth < 0 || depth > 2) return;
+              if (semi) { dx_seen_semi++; return; }
+              if (check_mask) { dx_seen_mask++; return; }
+              float fx0 = v[0].x, fx1 = fx0, fy0 = v[0].y, fy1 = fy0;
+              for (int i = 1; i < n; i++) { if (v[i].x < fx0) fx0 = v[i].x; if (v[i].x > fx1) fx1 = v[i].x; if (v[i].y < fy0) fy0 = v[i].y; if (v[i].y > fy1) fy1 = v[i].y; }
+              const int big = (fx1 - fx0) * (fy1 - fy0) > 4096.0f ? 1 : 0;
+              int ext = 0;
+              if (fx0 - 0.5f < draw_left || fy0 - 0.5f < draw_top || fx1 - 0.5f > draw_right + 1 || fy1 - 0.5f > draw_bottom + 1) ext = 1;
+              if (fx0 - 0.5f < 0 || fy0 - 0.5f < 0 || fx1 - 0.5f > VRAM_W || fy1 - 0.5f > VRAM_H) ext = 2;
+              dx_np++; dx_seen[depth][ext][big]++; if (kb->twin) dx_seen_tw++;
+              if (dx_quota[depth][ext][big] >= 6) return;
+              DxTri T;
+              if (!dx_tri_init(&T, v)) return;
+              static const double W[DX_MAXPT][3] = { { 0.3334, 0.3333, 0.3333 }, { 0.6, 0.2, 0.2 }, { 0.2, 0.6, 0.2 }, { 0.2, 0.2, 0.6 } };
+              int np = 0;
+              for (int q = 0; q < DX_MAXPT; q++) {
+                  const double fx = W[q][0] * T.x[0] + W[q][1] * T.x[1] + W[q][2] * T.x[2];
+                  const double fy = W[q][0] * T.y[0] + W[q][1] * T.y[1] + W[q][2] * T.y[2];
+                  const int ix = (int)dx_floor(fx), iy = (int)dx_floor(fy);
+                  double l[3], d[3];
+                  dx_bary(&T, ix + 0.5, iy + 0.5, l, d);
+                  if (!dx_inside_sure(d)) continue;
+                  if (ix < draw_left || ix > draw_right || iy < draw_top || iy > draw_bottom || ix < 0 || iy < 0 || ix >= VRAM_W || iy >= VRAM_H) continue;
+                  const double u = l[0] * v[0].u + l[1] * v[1].u + l[2] * v[2].u, vv = l[0] * v[0].v + l[1] * v[1].v + l[2] * v[2].v;
+                  if (dx_ambiguous_uv(u) || dx_ambiguous_uv(vv)) continue;
+                  dx_pend.px[np] = ix; dx_pend.py[np] = iy; dx_pend.u[np] = u; dx_pend.v[np] = vv;
+                  dx_pend.c8[np][0] = (int)dx_floor(l[0] * v[0].r + l[1] * v[1].r + l[2] * v[2].r + 0.5);
+                  dx_pend.c8[np][1] = (int)dx_floor(l[0] * v[0].g + l[1] * v[1].g + l[2] * v[2].g + 0.5);
+                  dx_pend.c8[np][2] = (int)dx_floor(l[0] * v[0].b + l[1] * v[1].b + l[2] * v[2].b + 0.5);
+                  np++;
+              }
+              if (!np) return;
+              dx_pend.P.depth = depth; dx_pend.P.tpx = tp_x; dx_pend.P.tpy = tp_y; dx_pend.P.clx = clutx; dx_pend.P.cly = cluty; dx_pend.P.raw = raw ? 1 : 0;
+              dx_pend.P.twin = kb->twin; dx_pend.P.twa[0] = kb->twax; dx_pend.P.twa[1] = kb->tway; dx_pend.P.two[0] = kb->twox; dx_pend.P.two[1] = kb->twoy;
+              const int gour = (v[0].r != v[1].r || v[0].g != v[1].g || v[0].b != v[1].b || v[0].r != v[2].r || v[0].g != v[2].g || v[0].b != v[2].b);
+              dx_pend.P.tol = (dither ? 1 : 0) + ((gour && !raw) ? 1 : 0);
+              dx_pend.depth = depth; dx_pend.ext = ext; dx_pend.big = big; dx_pend.id = dx_np; dx_pend.n = np;
+              for (int i = 0; i < np; i++) read_rect_rgba(dx_pend.px[i], dx_pend.py[i], 1, 1, dx_pend.pre[i]);    /* flushes first */
+              dx_pend.on = 1;
+          }
+
+          static void dx_post(void)
+          {
+              if (!dx_pend.on) return;
+              dx_pend.on = 0;
+              dx_quota[dx_pend.depth][dx_pend.ext][dx_pend.big]++;
+              for (int i = 0; i < dx_pend.n; i++) {
+                  uint8_t post[4];
+                  read_rect_rgba(dx_pend.px[i], dx_pend.py[i], 1, 1, post);                                            /* flushes the primitive */
+                  const int uq = (int)dx_floor(dx_pend.u[i] + 0.004), vq = (int)dx_floor(dx_pend.v[i] + 0.004);
+                  int du = 0, dv = 0;
+                  const int cat = dx_classify(&dx_pend.P, uq, vq, dx_pend.c8[i], dx_pend.pre[i], post, &du, &dv);
+                  dx_count(&dx_stat[dx_pend.depth][dx_pend.ext][dx_pend.big], cat);
+                  if (cat != DX_OK && dx_fail_logged < 48) {
+                      dx_fail_logged++;
+                      char tag[24]; snprintf(tag, sizeof tag, "FAIL prim#%u", dx_pend.id);
+                      dx_log_fail(tag, cat, &dx_pend.P, dx_pend.px[i], dx_pend.py[i], dx_pend.u[i], dx_pend.v[i], uq, vq, dx_pend.c8[i], dx_pend.pre[i], post, du, dv, dx_pend.ext, dx_pend.big);
+                  }
+              }
+          }
+
+          static void dx_snapshot(void)
+          {
+              if (!dx_alloc()) return;
+              read_rect_rgba(0, 0, VRAM_W, VRAM_H, dx_rgba);
+              for (size_t i = 0; i < (size_t)VRAM_W * VRAM_H; i++) {
+                  const uint8_t *p = dx_rgba + i * 4;
+                  dx_vram[i] = (uint16_t)((p[0] >> 3) | ((p[1] >> 3) << 5) | ((p[2] >> 3) << 10) | (p[3] >= 128 ? 0x8000 : 0));
+              }
+          }
+
+          static void dx_summary(unsigned frame)
+          {
+              unsigned tn = 0, tok = 0, tnb = 0, tdisc = 0, twopq = 0, toth = 0;
+              plat_log("[DX] ---- probe summary, frame %u: %u textured prims seen (texture-window %u, semi-transparent %u and mask-check %u not probed) ----",
+                       frame, dx_np, dx_seen_tw, dx_seen_semi, dx_seen_mask);
+              for (int d = 0; d < 3; d++) for (int e = 0; e < 3; e++) for (int b = 0; b < 2; b++) {
+                  const DxStat *st = &dx_stat[d][e][b];
+                  if (!dx_seen[d][e][b]) continue;
+                  plat_log("[DX]   depth=%d(%s) extent=%d(%s) size=%s: prims=%u probed-px=%u ok=%u uv-off-by-one=%u discarded=%u opaque-on-transparent=%u wrong-colour=%u",
+                           d, d == 0 ? "4bit" : d == 1 ? "8bit" : "15bit", e, e == 0 ? "inside-draw-area" : e == 1 ? "crosses-draw-area" : "crosses-VRAM", b ? "big" : "small",
+                           dx_seen[d][e][b], st->n, st->ok, st->uvnb, st->disc, st->wopq, st->other);
+                  tn += st->n; tok += st->ok; tnb += st->uvnb; tdisc += st->disc; twopq += st->wopq; toth += st->other;
+              }
+              if (!tn) plat_log("[DX] VERDICT: no textured pixel could be probed this frame");
+              else if (tok == tn) plat_log("[DX] VERDICT: all %u probed pixels match the CPU reference -> shader, pk bytes and VRAM sampling are right; look at geometry / ordering instead", tn);
+              else plat_log("[DX] VERDICT: %u of %u probed pixels differ: uv-off-by-one=%u discarded=%u opaque-on-transparent=%u wrong-colour=%u  (discarded => CLUT/texpage decode or stale snapshot; uv-off-by-one => UV interpolation; wrong-colour => modulation/decode)",
+                            tn - tok, tn, tnb, tdisc, twopq, toth);
+          }
+
+          static void dx_frame_end(unsigned frame)
+          {
+              if (dx_active) {
+                  dx_summary(frame);
+                  dx_active = 0; dx_pend.on = 0;
+              }
+              if (frame == 150 || (frame % 1200) == 0) {
+                  if (!dx_alloc()) return;
+                  dx_snapshot();
+                  memset(dx_quota, 0, sizeof dx_quota); memset(dx_seen, 0, sizeof dx_seen); memset(dx_stat, 0, sizeof dx_stat);
+                  dx_np = 0; dx_fail_logged = 0; dx_seen_tw = dx_seen_semi = dx_seen_mask = 0;
+                  dx_active = 1;
+                  plat_log("[DX] probing textured primitives in the next frame (VRAM reference taken at present #%u)", frame);
+              }
+          }
+
+          /* ---- start-up self test ----------------------------------------------------------------------------------------- */
+          static unsigned dx_lcg = 12345u;
+          static uint16_t dx_rand16(void) { dx_lcg = dx_lcg * 1664525u + 1013904223u; return (uint16_t)(dx_lcg >> 16); }
+
+          typedef struct {
+              const char *name; int depth, raw, dither, twin, mx, my, ox, oy;
+              int x[3], y[3], u[3], v[3], c[3][3];
+          } DxCase;
+
+          static void dx_clear_area(int x, int y, int w, int h)
+          {
+              bind_vram_target();
+              glDisable(GL_BLEND);
+              glScissor(x, y, w, h);
+              glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+              glClear(GL_COLOR_BUFFER_BIT);
+              gl_invalidate();
+          }
+
+          static void dx_run_case(const DxCase *C, uint8_t *img)
+          {
+              const int AX = 0, AY = 256, AW = 400, AH = 256;
+              draw_left = AX; draw_top = AY; draw_right = AX + AW - 1; draw_bottom = AY + AH - 1; draw_ofs_x = draw_ofs_y = 0;
+              tp_depth = C->depth; tp_x = C->depth == 0 ? 512 : C->depth == 1 ? 576 : 704; tp_y = 0; blend_mode = 0;
+              dither_on = C->dither != 0; tw_mask_x = C->mx; tw_mask_y = C->my; tw_off_x = C->ox; tw_off_y = C->oy;
+              set_mask = check_mask = false;
+              const int clx = 512, cly = C->depth == 0 ? 300 : 301;
+              const int clut = (clx >> 4) | (cly << 6);
+              dx_clear_area(AX, AY, AW, AH);
+              Vert pv[3]; GVert g[3];
+              for (int i = 0; i < 3; i++) { pv[i].x = C->x[i]; pv[i].y = C->y[i]; pv[i].r = C->c[i][0]; pv[i].g = C->c[i][1]; pv[i].b = C->c[i][2]; pv[i].u = C->u[i]; pv[i].v = C->v[i]; g[i] = mkv(&pv[i]); }
+              submit(g, 3, 0, true, false, C->raw != 0, C->dither != 0, clut);
+              read_rect_rgba(AX, AY, AW, AH, img);
+
+              DxPrim P; memset(&P, 0, sizeof P);
+              P.depth = C->depth; P.tpx = tp_x; P.tpy = tp_y; P.clx = clx; P.cly = cly; P.raw = C->raw;
+              if (C->mx || C->my) { P.twin = 1; P.twa[0] = (~(C->mx * 8)) & 0xFF; P.two[0] = ((C->ox & C->mx) * 8) & 0xFF; P.twa[1] = (~(C->my * 8)) & 0xFF; P.two[1] = ((C->oy & C->my) * 8) & 0xFF; }
+              const int gour = !C->raw && (C->c[0][0] != C->c[1][0] || C->c[0][1] != C->c[1][1] || C->c[0][2] != C->c[1][2]);
+              P.tol = (C->dither ? 1 : 0) + (gour ? 1 : 0);
+              DxTri T; DxStat st; memset(&st, 0, sizeof st);
+              unsigned stray = 0, logged = 0;
+              if (!dx_tri_init(&T, g)) return;
+              for (int iy = AY; iy < AY + AH; iy += 2) for (int ix = AX; ix < AX + AW; ix += 2) {
+                  double l[3], d[3];
+                  dx_bary(&T, ix + 0.5, iy + 0.5, l, d);
+                  const uint8_t *post = img + ((size_t)(iy - AY) * AW + (ix - AX)) * 4;
+                  static const uint8_t zero[4] = { 0, 0, 0, 0 };
+                  if (dx_outside_sure(d)) { if (post[0] | post[1] | post[2]) stray++; continue; }
+                  if (!dx_inside_sure(d)) continue;
+                  const double u = l[0] * C->u[0] + l[1] * C->u[1] + l[2] * C->u[2], v = l[0] * C->v[0] + l[1] * C->v[1] + l[2] * C->v[2];
+                  if (dx_ambiguous_uv(u) || dx_ambiguous_uv(v)) { st.skip++; continue; }
+                  int c8[3];
+                  for (int k = 0; k < 3; k++) c8[k] = (int)dx_floor(l[0] * C->c[0][k] + l[1] * C->c[1][k] + l[2] * C->c[2][k] + 0.5);
+                  const int uq = (int)dx_floor(u + 0.004), vq = (int)dx_floor(v + 0.004);
+                  int du = 0, dv = 0;
+                  const int cat = dx_classify(&P, uq, vq, c8, zero, post, &du, &dv);
+                  dx_count(&st, cat);
+                  if (cat != DX_OK && logged < 6) { logged++; dx_log_fail("SELFTEST-FAIL", cat, &P, ix, iy, u, v, uq, vq, c8, zero, post, du, dv, 0, 0); }
+              }
+              plat_log("[DX] SELFTEST %-26s checked=%u ok=%u uv-off-by-one=%u discarded=%u opaque-on-transparent=%u wrong-colour=%u stray-outside=%u (skipped-ambiguous=%u)%s",
+                       C->name, st.n, st.ok, st.uvnb, st.disc, st.wopq, st.other, stray, st.skip, (st.ok == st.n && !stray) ? "  PASS" : "  <-- FAIL");
+          }
+
+          static const char DX_FS[] =
+              "precision highp float;\n"
+              "varying vec4 v_col; varying vec2 v_uv; varying vec4 v_pk;\n"
+              "uniform float u_mode;\n"
+              "void main(){\n"
+              "  if (u_mode < 0.5) gl_FragColor = vec4(v_pk.x / 255.0, v_pk.w / 255.0, fract((v_pk.x - 31.0) * 8.0 + 0.5), 1.0);\n"
+              "  else if (u_mode < 1.5) gl_FragColor = vec4(fract((v_uv.x + 0.5) * 16.0), fract((v_uv.y + 0.5) * 16.0), 0.0, 1.0);\n"
+              "  else gl_FragColor = vec4(clamp((v_uv.x - 65471.0) * 4.0 + 0.5, 0.0, 1.0), clamp((v_uv.y - 40000.0) / 32.0 + 0.5, 0.0, 1.0), 0.0, 1.0);\n"
+              "}\n";
+
+          static void dx_interp_tests(uint8_t *img)
+          {
+              GLuint vs = glCreateShader(GL_VERTEX_SHADER), fs = glCreateShader(GL_FRAGMENT_SHADER);
+              const char *vsrc[1] = { VS_MAIN }, *fsrc[1] = { DX_FS };
+              glShaderSource(vs, 1, vsrc, NULL); glCompileShader(vs);
+              glShaderSource(fs, 1, fsrc, NULL); glCompileShader(fs);
+              GLint ok1 = 0, ok2 = 0;
+              glGetShaderiv(vs, GL_COMPILE_STATUS, &ok1); glGetShaderiv(fs, GL_COMPILE_STATUS, &ok2);
+              if (!ok1 || !ok2) { char lg[512]; lg[0] = 0; glGetShaderInfoLog(fs, sizeof lg, NULL, lg); plat_log("[DX] interpolation test shader did not compile (skipped): %s", lg); return; }
+              GLuint pr = glCreateProgram();
+              glAttachShader(pr, vs); glAttachShader(pr, fs);
+              glBindAttribLocation(pr, 0, "a_pos"); glBindAttribLocation(pr, 1, "a_col"); glBindAttribLocation(pr, 2, "a_uv"); glBindAttribLocation(pr, 3, "a_pk");
+              glLinkProgram(pr);
+              GLint lk = 0; glGetProgramiv(pr, GL_LINK_STATUS, &lk);
+              if (!lk) { plat_log("[DX] interpolation test program did not link (skipped)"); return; }
+              const GLint umode = glGetUniformLocation(pr, "u_mode");
+              static const int SH[3][3][2] = { { {10, 260}, {42, 260}, {10, 292} }, { {60, 270}, {300, 270}, {60, 500} }, { {-300, 260}, {700, 260}, {-300, 900} } };
+              static const char *const shn[3] = { "small 32px", "medium 240px", "huge, outside VRAM" };
+              static const uint8_t PK[4] = { 31, 30, 63, 255 };
+              const int AX = 0, AY = 256, AW = 400, AH = 256;
+              draw_left = AX; draw_top = AY; draw_right = AX + AW - 1; draw_bottom = AY + AH - 1;
+              for (int sh = 0; sh < 3; sh++) for (int mode = 0; mode < 3; mode++) {
+                  GVert g[3];
+                  for (int i = 0; i < 3; i++) {
+                      memset(&g[i], 0, sizeof g[i]);
+                      g[i].x = (float)SH[sh][i][0] + 0.5f; g[i].y = (float)SH[sh][i][1] + 0.5f; g[i].a = 255; memcpy(g[i].pk, PK, 4);
+                      if (mode == 2) { g[i].u = 65471.0f; g[i].v = 40000.0f; }
+                      else { g[i].u = i == 1 ? 255.0f : 0.0f; g[i].v = i == 2 ? 255.0f : 0.0f; }
+                  }
+                  dx_clear_area(AX, AY, AW, AH);
+                  bind_vram_target();
+                  glDisable(GL_BLEND);
+                  glUseProgram(pr); glUniform1f(umode, (float)mode);
+                  glScissor(AX, AY, AW, AH);
+                  set_attribs(g);
+                  glDrawArrays(GL_TRIANGLES, 0, 3);
+                  gl_invalidate();
+                  read_rect_rgba(AX, AY, AW, AH, img);
+                  DxTri T; if (!dx_tri_init(&T, g)) continue;
+                  double e0 = 0, e1 = 0; unsigned n = 0, bad = 0, sat = 0;
+                  for (int iy = AY; iy < AY + AH; iy += 3) for (int ix = AX; ix < AX + AW; ix += 3) {
+                      double l[3], d[3];
+                      dx_bary(&T, ix + 0.5, iy + 0.5, l, d);
+                      if (!dx_inside_sure(d)) continue;
+                      const uint8_t *p = img + ((size_t)(iy - AY) * AW + (ix - AX)) * 4;
+                      double a = 0, b = 0;
+                      if (mode == 0) { a = (p[0] != 31) + (p[1] != 255); b = ((p[2] - 127.5) / 255.0) / 8.0; if (a > 0) bad++; }
+                      else if (mode == 1) {
+                          const double u = l[1] * 255.0, v = l[2] * 255.0;
+                          for (int k = 0; k < 2; k++) {
+                              const double x = k ? v : u; double ex = x + 0.5; ex = (ex * 16.0) - dx_floor(ex * 16.0);
+                              double dd = p[k] / 255.0 - ex; if (dd > 0.5) dd -= 1.0; if (dd < -0.5) dd += 1.0;
+                              if (k) b = dd / 16.0; else a = dd / 16.0;
+                          }
+                      } else {
+                          a = ((p[0] / 255.0) - 0.5) / 4.0; b = ((p[1] / 255.0) - 0.5) * 32.0;
+                          if (p[0] == 0 || p[0] == 255 || p[1] == 0 || p[1] == 255) sat++;
+                      }
+                      if (a < 0) a = -a; if (b < 0) b = -b;
+                      if (a > e0) e0 = a; if (b > e1) e1 = b;
+                      if (mode == 1 && (a > 0.004 || b > 0.004)) bad++;
+                      if (mode == 2 && (a > 0.4 || b > 0.4)) bad++;
+                      n++;
+                  }
+                  if (mode == 0) plat_log("[DX] INTERP pk bytes (31,30,63,255)   %-18s px=%u wrong-byte-px=%u max-error-of-pk.x=%.5f%s", shn[sh], n, bad, e1, bad ? "  <-- per-primitive state is corrupted by interpolation" : "");
+                  else if (mode == 1) plat_log("[DX] INTERP uv 0..255 gradient     %-18s px=%u max-error u=%.5f v=%.5f texel, px-with-error>0.004: %u", shn[sh], n, e0, e1, bad);
+                  else plat_log("[DX] INTERP constant u=65471 v=40000 %-14s px=%u max-error u=%.4f v=%.4f (saturated px %u, >0.4 err px %u)%s", shn[sh], n, e0, e1, sat, bad,
+                                (e0 > 0.4 || e1 > 0.4 || sat) ? "  <-- 16-bit constants do NOT survive interpolation here (old packing was broken)" : "  (16-bit constants are fine here)");
+              }
+              glDeleteProgram(pr);
+          }
+
+          static void dx_selftest_once(void)
+          {
+              if (dx_selftest_done) return;
+              dx_selftest_done = 1;
+              if (!dx_alloc()) { plat_log("[DX] selftest: out of memory"); return; }
+              uint8_t *img = (uint8_t *)malloc((size_t)400 * 256 * 4);
+              uint8_t *save = (uint8_t *)malloc((size_t)VRAM_W * VRAM_H * 4);
+              uint16_t *tmp = (uint16_t *)malloc((size_t)256 * 256 * 2);
+              if (!img || !save || !tmp) { plat_log("[DX] selftest: out of memory"); free(img); free(save); free(tmp); return; }
+              plat_log("[DX] ================ selftest begin ================");
+              { GLint r[2], p = 0; r[0] = r[1] = 0;
+                glGetShaderPrecisionFormat(GL_VERTEX_SHADER, GL_HIGH_FLOAT, r, &p);   plat_log("[DX] vertex   highp float: range=2^%d precision=%d", (int)r[1], (int)p);
+                glGetShaderPrecisionFormat(GL_FRAGMENT_SHADER, GL_HIGH_FLOAT, r, &p); plat_log("[DX] fragment highp float: range=2^%d precision=%d", (int)r[1], (int)p);
+                glGetShaderPrecisionFormat(GL_FRAGMENT_SHADER, GL_MEDIUM_FLOAT, r, &p); plat_log("[DX] fragment mediump float: range=2^%d precision=%d", (int)r[1], (int)p); }
+              flush_batch();
+              const uint64_t t0 = plat_time_ns();
+              /* save everything we touch */
+              const int s_dl = draw_left, s_dt = draw_top, s_dr = draw_right, s_db = draw_bottom, s_ox = draw_ofs_x, s_oy = draw_ofs_y;
+              const int s_tx = tp_x, s_ty = tp_y, s_td = tp_depth, s_bm = blend_mode, s_mx = tw_mask_x, s_my = tw_mask_y, s_ax = tw_off_x, s_ay = tw_off_y;
+              const bool s_dith = dither_on, s_sm = set_mask, s_cm = check_mask;
+              const unsigned s_stat[7] = { st_draws, st_tris, st_syncs, st_uploads, st_reads, st_fills, st_copies };
+              unsigned s_fr[FR_N]; memcpy(s_fr, st_fr, sizeof s_fr);
+              read_rect_rgba(0, 0, VRAM_W, VRAM_H, save);
+              set_mask = check_mask = false;
+              memset(dx_vram, 0, (size_t)VRAM_W * VRAM_H * 2);
+              /* reference VRAM: 4-bit page (512,0) 64w, 8-bit page (576,0) 128w, 15-bit page (704,0) 256w, CLUT rows (512,300) and (512,301) */
+              struct { int x, y, w, h; } R[5] = { { 512, 0, 64, 256 }, { 576, 0, 128, 256 }, { 704, 0, 256, 256 }, { 512, 300, 16, 1 }, { 512, 301, 256, 1 } };
+              for (int r = 0; r < 5; r++) {
+                  for (int i = 0; i < R[r].w * R[r].h; i++) {
+                      uint16_t w = dx_rand16();
+                      if (r >= 3 && (i % 7) == 3) w = 0;                    /* transparent palette entries */
+                      else if (r >= 3 && w == 0) w = 0x0421;
+                      else if (r < 3 && (dx_rand16() & 15) == 0 && r == 2) w = 0;
+                      tmp[i] = w;
+                      dx_vram[(size_t)(R[r].y + i / R[r].w) * VRAM_W + R[r].x + i % R[r].w] = w;
+                  }
+                  upload_words(R[r].x, R[r].y, R[r].w, R[r].h, tmp);
+              }
+              static const DxCase CASES[] = {
+                  { "4bit  small 1:1 raw",       0, 1, 0, 0, 0, 0, 0, 0, { 10, 58, 10 },   { 266, 266, 314 }, { 0, 48, 0 },   { 0, 0, 48 },   { {128,128,128}, {128,128,128}, {128,128,128} } },
+                  { "8bit  half scale dither",   1, 0, 1, 0, 0, 0, 0, 0, { 70, 250, 70 },  { 266, 266, 446 }, { 0, 90, 0 },   { 0, 0, 90 },   { {128,128,128}, {128,128,128}, {128,128,128} } },
+                  { "15bit big 0.67 scale",      2, 1, 0, 0, 0, 0, 0, 0, { 0, 380, 0 },    { 260, 260, 500 }, { 0, 255, 0 },  { 0, 0, 255 },  { {128,128,128}, {128,128,128}, {128,128,128} } },
+                  { "4bit  texture window",      0, 1, 0, 1, 3, 3, 1, 2, { 260, 380, 260 },{ 266, 266, 386 }, { 0, 200, 0 },  { 0, 0, 200 },  { {128,128,128}, {128,128,128}, {128,128,128} } },
+                  { "8bit  gouraud modulated",   1, 0, 0, 0, 0, 0, 0, 0, { 200, 390, 200 },{ 300, 300, 500 }, { 0, 120, 0 },  { 0, 0, 120 },  { {255,128,64}, {64,255,128}, {128,64,255} } },
+                  { "4bit  triangle > VRAM",     0, 1, 0, 0, 0, 0, 0, 0, { -300, 500, -300 },{ 260, 260, 700 }, { 0, 250, 0 }, { 0, 0, 250 }, { {128,128,128}, {128,128,128}, {128,128,128} } },
+              };
+              for (unsigned i = 0; i < sizeof CASES / sizeof CASES[0]; i++) dx_run_case(&CASES[i], img);
+              dx_interp_tests(img);
+              /* restore */
+              dx_clear_area(0, 0, VRAM_W, VRAM_H);
+              upload_piece(0, 0, VRAM_W, VRAM_H, save);
+              dirty.valid = false;
+              draw_left = s_dl; draw_top = s_dt; draw_right = s_dr; draw_bottom = s_db; draw_ofs_x = s_ox; draw_ofs_y = s_oy;
+              tp_x = s_tx; tp_y = s_ty; tp_depth = s_td; blend_mode = s_bm; tw_mask_x = s_mx; tw_mask_y = s_my; tw_off_x = s_ax; tw_off_y = s_ay;
+              dither_on = s_dith; set_mask = s_sm; check_mask = s_cm;
+              st_draws = s_stat[0]; st_tris = s_stat[1]; st_syncs = s_stat[2]; st_uploads = s_stat[3]; st_reads = s_stat[4]; st_fills = s_stat[5]; st_copies = s_stat[6];
+              memcpy(st_fr, s_fr, sizeof s_fr);
+              gl_invalidate();
+              plat_log("[DX] ================ selftest end (%u ms) ================", (unsigned)((plat_time_ns() - t0) / 1000000ull));
+              free(img); free(save); free(tmp);
+          }
+          '''
+              s += "\n/* DIAG2 applied */\n"
+              return s
+
           # ---------------------------------------------------------------- UI-thread display (Symbian: the emulation thread must not touch the window)
           def apply_ui_present(s):
               if "gpu_ui_present" in s:
@@ -2003,6 +2754,14 @@ jobs:
           static volatile bool pres_rgb24, pres_en;
           static volatile unsigned pres_seq;
 
+          static void slow_present(uint64_t t0, uint64_t t1, uint64_t t2)
+          {
+              static int logged;
+              if ((t1 - t0 > 100000000ull || t2 - t1 > 100000000ull) && logged++ < 40)
+                  plat_log("[SLOW] present #%u: flush_batch %u ms, glFlush %u ms (draws=%u tris=%u uploads=%u fills=%u)", st_frames + 1,
+                           (unsigned)((t1 - t0) / 1000000ull), (unsigned)((t2 - t1) / 1000000ull), st_draws, st_tris, st_uploads, st_fills);
+          }
+
           void gpu_log_stats(void)
           {
               plat_log("[GPU] stats: frames=%u published=%u draws=%u tris=%u syncs=%u uploads=%u reads=%u fills=%u copies=%u ready=%d",
@@ -2016,6 +2775,7 @@ jobs:
               const unsigned seq = pres_seq;
               if (seq == seen || !pd.id || !tex_a) return 0;
               seen = seq;
+              const uint64_t t_ui0 = plat_time_ns();
               int dx = pres_dx, dy = pres_dy, dw = pres_dw, dh = pres_dh;
               const bool rgb24 = pres_rgb24, enabled = pres_en;
               int fbo = 0, sw = 0, sh = 0;
@@ -2054,6 +2814,11 @@ jobs:
                            logged, dx, dy, dw, dh, enabled ? 1 : 0, rgb24 ? 1 : 0, sw, sh, (unsigned)glGetError());
               }
               plat_ui_cp("ui: drawn");
+              {
+                  static int slow;
+                  const uint64_t dt = plat_time_ns() - t_ui0;
+                  if (dt > 100000000ull && slow++ < 40) plat_log("[SLOW] ui display pass took %u ms", (unsigned)(dt / 1000000ull));
+              }
               return 1;
           }
 
@@ -2067,6 +2832,15 @@ jobs:
                      "    }\n\n")
               s = s[:a] + ui + s[a:c0] + pub + s[c1:]
               for old, new in (
+                  ("    uint64_t t_begin = plat_time_ns();\n    flush_batch();\n    glFlush();",
+                   "    uint64_t t_begin = plat_time_ns();\n    flush_batch();\n    const uint64_t t_fb = plat_time_ns();\n    glFlush();\n    slow_present(t_begin, t_fb, plat_time_ns());"),
+                  ("static void upload_words(int x, int y, int w, int h, const uint16_t *src)\n{",
+                   "static void upload_words_impl(int x, int y, int w, int h, const uint16_t *src);\n"
+                   "static void upload_words(int x, int y, int w, int h, const uint16_t *src)\n{\n"
+                   "    const uint64_t t0 = plat_time_ns();\n    upload_words_impl(x, y, w, h, src);\n    const uint64_t dt = plat_time_ns() - t0;\n"
+                   "    static int logged;\n    if (dt > 100000000ull && logged++ < 20)\n"
+                   "        plat_log(\"[SLOW] VRAM upload %dx%d at (%d,%d) took %u ms\", w, h, x, y, (unsigned)(dt / 1000000ull));\n}\n\n"
+                   "static void upload_words_impl(int x, int y, int w, int h, const uint16_t *src)\n{"),
                   ("void plat_gl_screen(int *fbo, int *w, int *h);\n",
                    "void plat_gl_screen(int *fbo, int *w, int *h);\nvoid plat_cp(const char *stage);        /* breadcrumbs for crash.log (psx_sym.c) */\nvoid plat_ui_cp(const char *stage);\n"),
                   ("    GLuint v = compile_shader(GL_VERTEX_SHADER, vs, name);\n",
@@ -2109,11 +2883,63 @@ jobs:
               assert old in s, "disc.c pread"
               s = s.replace(old, "    ssize_t n = z3_pread(t->fd, out, (size_t)want, (off_t)pos);")
               anchor = "void disc_read_sector_data("
-              helper = ("static pthread_mutex_t g_disc_mx = PTHREAD_MUTEX_INITIALIZER;\n"
-                        "static ssize_t z3_pread(int fd, void *buf, size_t n, off_t pos)\n{\n"
-                        "    ssize_t r = -1;\n    pthread_mutex_lock(&g_disc_mx);\n"
-                        "    if (lseek(fd, pos, SEEK_SET) == pos) r = read(fd, buf, n);\n"
-                        "    pthread_mutex_unlock(&g_disc_mx);\n    return r;\n}\n\n")
+              helper = r"""/* Symbian file I/O costs several ms per call: read 128 KB blocks and serve the 2048-byte sectors from a 2-slot cache
+           * (one slot for the data stream, one for the XA audio stream). */
+          #define Z3_RC_SLOTS 2
+          #define Z3_RC_SIZE (128 * 1024)
+          static pthread_mutex_t g_disc_mx = PTHREAD_MUTEX_INITIALIZER;
+          static struct { uint8_t *buf; int fd; off_t pos; size_t len; } g_rc[Z3_RC_SLOTS];
+          static int g_rc_next;
+          static unsigned g_dr_calls, g_dr_misses, g_dr_slow;
+          static uint64_t g_dr_ns, g_dr_bytes;
+
+          void disc_log_stats(void)
+          {
+              plat_log("[DISC] sector reads=%u cache-misses=%u block bytes=%u read time=%u ms slow(>100ms)=%u", g_dr_calls, g_dr_misses,
+             (unsigned)g_dr_bytes, (unsigned)(g_dr_ns / 1000000ull), g_dr_slow);
+          }
+
+          static ssize_t z3_pread(int fd, void *buf, size_t n, off_t pos)
+          {
+              ssize_t r = -1;
+              pthread_mutex_lock(&g_disc_mx);
+              g_dr_calls++;
+              for (int i = 0; i < Z3_RC_SLOTS && r < 0; i++)
+                  if (g_rc[i].buf && g_rc[i].fd == fd && pos >= g_rc[i].pos && (size_t)(pos - g_rc[i].pos) + n <= g_rc[i].len) {
+            memcpy(buf, g_rc[i].buf + (size_t)(pos - g_rc[i].pos), n);
+            r = (ssize_t)n;
+                  }
+              if (r < 0) {
+                  const uint64_t t0 = plat_time_ns();
+                  const int sl = g_rc_next;
+                  g_dr_misses++;
+                  if (n <= Z3_RC_SIZE / 2) {
+            if (!g_rc[sl].buf) g_rc[sl].buf = (uint8_t *)malloc(Z3_RC_SIZE);
+            g_rc[sl].fd = -1;
+            if (g_rc[sl].buf && lseek(fd, pos, SEEK_SET) == pos) {
+                ssize_t got = read(fd, g_rc[sl].buf, Z3_RC_SIZE);
+                if (got > 0) {
+                    size_t c = (size_t)got < n ? (size_t)got : n;
+                    memcpy(buf, g_rc[sl].buf, c);
+                    r = (ssize_t)c;
+                    g_dr_bytes += (uint64_t)got;
+                    if ((size_t)got >= n) { g_rc[sl].fd = fd; g_rc[sl].pos = pos; g_rc[sl].len = (size_t)got; g_rc_next = (sl + 1) % Z3_RC_SLOTS; }
+                }
+            }
+                  }
+                  if (r < 0 && lseek(fd, pos, SEEK_SET) == pos) r = read(fd, buf, n);   /* big request or cache failure: plain read */
+                  const uint64_t dt = plat_time_ns() - t0;
+                  g_dr_ns += dt;
+                  if (dt > 100000000ull) {
+            g_dr_slow++;
+            if (g_dr_slow <= 20) plat_log("[SLOW] disc read: %u bytes at %u KB took %u ms", (unsigned)n, (unsigned)(pos / 1024), (unsigned)(dt / 1000000ull));
+                  }
+              }
+              pthread_mutex_unlock(&g_disc_mx);
+              return r;
+          }
+
+          """
               assert anchor in s
               s = s.replace(anchor, helper + anchor, 1)
               wr(p, s)
@@ -2180,6 +3006,10 @@ jobs:
               assert "glCopyTexSubImage2D(GL_TEXTURE_2D" not in s
           s = apply_gles2_compat(s)
           s = apply_ui_present(s)
+          s = apply_bucket_grid(s)
+          s = apply_tex_diag(s)
+          s = apply_perf_tex(s)
+          s = apply_diag2(s)
           wr(p, s)
 
           # ---------------------------------------------------------------- dispatch.c: stage breadcrumbs + first-frame log
